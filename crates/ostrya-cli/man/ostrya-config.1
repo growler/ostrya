@@ -170,6 +170,7 @@ With \fB\%maybe\fR, a write continues if the file system cannot seal the object.
 With \fB\%maybe\fR, ostrya first seals a probe file in \fB\%tmp/\fR one time for each open of the repository.
 If the probe fails, the writes of that open seal no object.
 With \fB\%yes\fR, the write fails.
+With \fB\%yes\fR, the lookup of a composefs image commit also requires a sealed \fB\%/root.cfs\fR.
 If the key is absent and \fB\%composefs\fR is \fB\%maybe\fR or \fB\%yes\fR, the default is \fB\%maybe\fR.
 .TP
 \fB\%composefs\fR (default no)

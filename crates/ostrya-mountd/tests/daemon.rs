@@ -30,11 +30,12 @@
 //!   refused with the class `repository`.
 //! - Op 1 mounts the image of the attachment `composefs`, of the supplement
 //!   `composefs`, and of the attachment of a commit that also has a bad
-//!   supplement. A bad attachment next to a valid supplement, and a commit
-//!   with neither, are refused with the class `repository`. Op 2 mounts the
-//!   commit with neither.
-//! - The refusal of an image commit whose `/root.cfs` is not the key of the
-//!   commit names the commit and the image commit, and neither digest.
+//!   supplement. A partial attachment next to a valid supplement, and a
+//!   commit with neither, are refused with the class `repository`. Op 2
+//!   mounts the commit with neither.
+//! - The refusal of a supplement image commit whose `/root.cfs` is not the
+//!   key of the commit names the commit and the image commit, and neither
+//!   digest.
 //! - Each mount of the daemon has `nosuid` and `nodev`. A setuid file in a
 //!   read-only and in a read-write mount does not change the user id of a
 //!   process that runs it, and a device node in the image does not open.
@@ -59,7 +60,8 @@ use std::time::{Duration, Instant};
 
 use common::{
     ChildGuard, Fixture, HELLO, Named, OWN_NAMESPACES, Unmount, commit_named, file_object_path,
-    fixture_root, image_commit_of, key_dict, mounts_at, require_root, wait_for_path, write_source,
+    fixture_root, image_commit_of, key_dict, mounts_at, require_root, root_cfs_of, wait_for_path,
+    write_source,
 };
 use ostrya::{
     COMPOSEFS_RELATION, Checksum, CommitOptions, ComposefsOptions, CreateOptions, Repo, RepoMode,
@@ -763,8 +765,9 @@ fn a_symlink_in_the_repository_is_refused() {
     assert_no_temp_dirs(&fx);
 }
 
-/// The refusal of an image commit whose `/root.cfs` does not match the key
-/// of the commit names the commit and the image commit, and neither digest.
+/// The refusal of a supplement image commit whose `/root.cfs` does not match
+/// the key of the commit names the commit and the image commit, and neither
+/// digest.
 #[test]
 fn the_refusal_of_a_changed_image_names_no_digest() {
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -775,7 +778,11 @@ fn the_refusal_of_a_changed_image_names_no_digest() {
     let fx = Fixture::new("mismatch");
     let sock = fx.scratch.path().join("mountd.sock");
     let _daemon = fx.standalone(&sock, None, 60);
-    let (image, image_file) = image_commit_of(&fx.repo, &fx.commit);
+    let (commit, image) = ostrya_rt::block_on(async {
+        let (repo, root) = fixture_root(&fx).await;
+        commit_named(&repo, &root, "changed supplement", Named::Supplement).await
+    });
+    let image_file = root_cfs_of(&fx.repo, &image);
     // The change writes in place, so the object keeps its xattrs.
     let path = file_object_path(&fx.repo, &image_file);
     let mut file = std::fs::OpenOptions::new()
@@ -793,7 +800,7 @@ fn the_refusal_of_a_changed_image_names_no_digest() {
     drop(file);
     let (expected, actual) = ostrya_rt::block_on(async {
         let repo = Repo::open(&fx.repo).await.unwrap();
-        match repo.open_composefs_image(&fx.commit).await {
+        match repo.open_composefs_image(&commit).await {
             Err(ostrya::Error::InvalidComposefsImage { defect, .. }) => match *defect {
                 ostrya::ComposefsImageDefect::DigestMismatch { expected, actual } => {
                     (expected, actual)
@@ -804,14 +811,16 @@ fn the_refusal_of_a_changed_image_names_no_digest() {
         }
     });
     let target = fx.target("mnt");
-    let req = ClientRequest::new(&fx, &target, false, Access::ReadOnly);
+    let mut req = ClientRequest::new(&fx, &target, false, Access::ReadOnly);
+    req.commit = commit;
     let outcome = fx.client(&sock, &req, true);
     assert!(
         outcome.starts_with(&format!("refused {}", HelperCode::Repository)),
         "{outcome}"
     );
-    assert!(outcome.contains(&fx.commit.to_hex()), "{outcome}");
+    assert!(outcome.contains(&commit.to_hex()), "{outcome}");
     assert!(outcome.contains(&image.to_hex()), "{outcome}");
+    assert!(outcome.contains("supplement composefs"), "{outcome}");
     assert!(outcome.contains("does not match the key"), "{outcome}");
     for digest in [expected, actual] {
         let hex = Checksum::from_bytes(digest).to_hex();
@@ -903,7 +912,7 @@ fn op_1_mounts_the_image_of_a_supplement_and_of_both() {
 }
 
 /// Op 1 refuses a commit whose attachment `composefs` names an image commit
-/// with an image that is not the key, also if a valid supplement exists. The
+/// that the repository marks partial, also if a valid supplement exists. The
 /// text names the attachment.
 #[test]
 fn op_1_refuses_a_bad_attachment_next_to_a_valid_supplement() {
@@ -936,6 +945,11 @@ fn op_1_refuses_a_bad_attachment_next_to_a_valid_supplement() {
         txn.commit().await.unwrap();
         commit
     });
+    std::fs::write(
+        fx.repo.join(format!("state/{dev_image}.commitpartial")),
+        b"",
+    )
+    .unwrap();
     let target = fx.target("mnt");
     let mut req = ClientRequest::new(&fx, &target, false, Access::ReadOnly);
     req.commit = commit;
@@ -944,7 +958,7 @@ fn op_1_refuses_a_bad_attachment_next_to_a_valid_supplement() {
         outcome,
         format!(
             "refused {}: composefs image of commit {commit}: attachment composefs names \
-             commit {dev_image}, whose /root.cfs does not match the key of the commit",
+             commit {dev_image}, which is partial",
             HelperCode::Repository
         )
     );

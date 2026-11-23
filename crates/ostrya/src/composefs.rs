@@ -45,22 +45,28 @@
 //!
 //! 1. Stage the tree. Call [`Transaction::write_composefs_commit`] with the
 //!    hook. The call returns the checksum of the image commit and the
-//!    fs-verity digest of the image.
-//! 2. In [`CommitOptions::attachments`], name the image commit as
+//!    fs-verity digest of the labeled image.
+//! 2. Call [`Transaction::composefs_digest`] for the tree. The call returns
+//!    the fs-verity digest of the image with no hook.
+//! 3. In [`CommitOptions::attachments`], name the image commit as
 //!    [`COMPOSEFS_RELATION`].
-//! 3. In [`CommitOptions::metadata`], put the digest under
-//!    [`COMPOSEFS_DIGEST_KEY`] as an `ay` value.
-//! 4. Write the commit of the tree with these options and
+//! 4. In [`CommitOptions::metadata`], put the digest of step 2 under
+//!    [`COMPOSEFS_DIGEST_KEY`] as an `ay` value, or put no key.
+//! 5. Write the commit of the tree with these options and
 //!    [`Transaction::write_commit`].
-//! 5. Commit the transaction.
+//! 6. Commit the transaction.
 //!
-//! The image commit carries no [`COMPOSEFS_DIGEST_KEY`]. The lookup trusts
-//! the key of the commit of the tree. [`Repo::open_composefs_image`] builds no
-//! image to check the key. It compares the key with the fs-verity digest of
-//! `/root.cfs`. [`Repo::add_composefs_supplement`] builds the image with no
-//! hook. If it builds the image of a commit whose key records the digest of a
-//! labeled image, it refuses the commit with
-//! [`Error::ComposefsDigestMismatch`].
+//! The key records the digest of the image with no hook. The digest of a
+//! labeled image never goes under the key. The image commit carries no
+//! [`COMPOSEFS_DIGEST_KEY`].
+//!
+//! A labeled image is an attachment alone. [`Repo::open_composefs_image`]
+//! does not read the key for an attachment and does not compare it with the
+//! image. The checksum chain from the commit of the tree to `/root.cfs` binds
+//! the image to the commit. For a supplement, the lookup compares the key
+//! with the fs-verity digest of `/root.cfs`, so a labeled supplement fails
+//! the lookup. [`Repo::add_composefs_supplement`] builds the image with no
+//! hook.
 //!
 //! ```no_run
 //! # async fn run(
@@ -89,7 +95,8 @@
 //! }
 //!
 //! let hook: ComposefsEntryFn<'_> = &label;
-//! let (image, digest) = txn.write_composefs_commit(&root, Some(hook)).await?;
+//! let (image, _labeled) = txn.write_composefs_commit(&root, Some(hook)).await?;
+//! let digest = txn.composefs_digest(&root).await?;
 //! let mut metadata = DictBuilder::new();
 //! metadata.insert_bytes(COMPOSEFS_DIGEST_KEY, &digest);
 //! let opts = CommitOptions {
@@ -142,10 +149,10 @@ const INJECTED_DIR_MODE: u32 = 0o040755;
 /// image of the commit.
 ///
 /// The value is the 32-byte digest as an `ay`.
-/// [`Repo::commit_add_composefs_metadata`] writes the key with the digest of
-/// the image with no hook, and [`Transaction::composefs_digest`] gives that
-/// digest. For an image with a hook, the caller writes the key with the digest
-/// that [`Transaction::write_composefs_commit`] returns. The module
+/// The key records the digest of the image with no hook.
+/// [`Repo::commit_add_composefs_metadata`] writes the key with this digest,
+/// and [`Transaction::composefs_digest`] gives it. A commit with a labeled
+/// image also records this digest, or carries no key. The module
 /// documentation, "Labeled images", gives the steps.
 pub const COMPOSEFS_DIGEST_KEY: &str = "ostree.composefs.digest.v0";
 /// The GVariant type of the digest value, a 32-byte `ay`.

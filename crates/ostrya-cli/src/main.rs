@@ -5283,12 +5283,17 @@ struct ComposefsImageArgs {
     /// supplement `composefs` of REV.
     ///
     /// The command refuses a commit that names an image commit as the
-    /// attachment `composefs`. If the supplement `composefs` names a valid
-    /// image commit, the command does nothing. Else the command builds the
-    /// image of the tree, writes the image commit, and sets the supplement
-    /// `composefs` of REV to it. This replaces an entry that names another
-    /// image commit, an image commit that the repository does not hold or
-    /// holds partial, or an image commit whose tree has a defect.
+    /// attachment `composefs`. It also refuses a commit that carries no
+    /// `ostree.composefs.digest.v0`, because the lookup of the image refuses
+    /// the supplement of such a commit. The options
+    /// `--generate-composefs-metadata` and `--generate-composefs` of
+    /// `commit` write a commit with the key. If the supplement `composefs`
+    /// names a valid image commit, the command does nothing. Else the
+    /// command builds the image of the tree, writes the image commit, and
+    /// sets the supplement `composefs` of REV to it. This replaces an entry
+    /// that names another image commit, an image commit that the repository
+    /// does not hold or holds partial, or an image commit whose tree has a
+    /// defect.
     ///
     /// The command does not write again an object that the repository
     /// already holds. If the entry names the image commit that the build
@@ -5296,10 +5301,20 @@ struct ComposefsImageArgs {
     /// command writes the same entry and exits 0, and the changed object
     /// stays. A changed object is a defect that `fsck` reports.
     ///
-    /// If REV carries `ostree.composefs.digest.v0` and the fs-verity digest
-    /// of the built image is not the value of the key, the command refuses
-    /// REV and names both digests. If REV has no key, the command makes no
-    /// check. A refusal writes no object and no supplement. The command
+    /// With `[ex-integrity] fsverity=yes`, the command also checks the
+    /// fs-verity seal of `/root.cfs`. If the supplement names an image commit
+    /// whose `/root.cfs` has no seal, the command hashes the file. If the
+    /// digest is the value of `ostree.composefs.digest.v0`, the build gives
+    /// the same object, so the command refuses REV. Else it replaces the
+    /// entry. After the build, the command refuses REV if the repository
+    /// holds the `/root.cfs` of the built image commit with no seal, also a
+    /// changed object. Such an object can come from a write before the
+    /// repository set `fsverity=yes`. In `archive` mode, the seal checks do
+    /// not apply.
+    ///
+    /// If the fs-verity digest of the built image is not the value of
+    /// `ostree.composefs.digest.v0`, the command refuses REV and names both
+    /// digests. A refusal writes no object and no supplement. The command
     /// works in each repository mode. It does not refuse a partial commit,
     /// and the build fails if an object of the tree is absent.
     ///
@@ -7918,10 +7933,33 @@ fn format_transferred(bytes: u64) -> String {
 }
 
 /// Runs `composefs-image --add`.
+///
+/// The library refuses a commit with the attachment `composefs` and then a
+/// commit with no `ostree.composefs.digest.v0`, both with
+/// [`Error::InvalidInput`]. If the commit has neither the attachment nor the
+/// key, an [`Error::InvalidInput`] of the call is the refusal of the key. The
+/// command then gives a text that names the options of `commit` that write
+/// the key.
 async fn composefs_image(repo: Repo, args: ComposefsImageArgs) -> Result<()> {
     let commit = resolve(&repo, &args.add).await?;
-    repo.add_composefs_supplement(&commit).await?;
-    Ok(())
+    let Err(e) = repo.add_composefs_supplement(&commit).await else {
+        return Ok(());
+    };
+    if matches!(e, Error::InvalidInput(_)) {
+        let (parsed, _) = repo.load_commit(&commit).await?;
+        let attached = parsed
+            .related
+            .iter()
+            .any(|(name, _)| name == COMPOSEFS_RELATION);
+        if !attached && parsed.metadata.dict_get(COMPOSEFS_DIGEST_KEY).is_none() {
+            return Err(Error::InvalidInput(format!(
+                "commit {commit} carries no {COMPOSEFS_DIGEST_KEY}; a supplement is not written \
+                 (commit --generate-composefs-metadata or --generate-composefs writes a commit \
+                 that carries the key)"
+            )));
+        }
+    }
+    Err(e)
 }
 
 /// Copies the commits of the refs of `args` onto the volume at the mount

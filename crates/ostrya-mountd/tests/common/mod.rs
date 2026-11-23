@@ -389,8 +389,8 @@ pub async fn commit_tree(repo: &Repo, base: &Path) -> Checksum {
 /// device, and returns it.
 pub async fn commit_dev_tree(repo: &Repo, root: &ostrya::RepoTree, commit: &Checksum) -> Checksum {
     // The commit format holds no device node, so the test writes one into a
-    // copy of the image. The commit of that image has no key, so the daemon
-    // makes no check of the image.
+    // copy of the image. The commit names that image as its attachment and
+    // has no key, so the daemon does not compare the image with a key.
     let mut image = repo
         .export_composefs(commit, &ComposefsOptions::RECORDED, None)
         .await

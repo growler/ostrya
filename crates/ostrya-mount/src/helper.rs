@@ -118,13 +118,15 @@ impl Helper {
     /// The daemon finds the image commit that the commit names as the
     /// attachment `composefs` in field 2, or else as the supplement
     /// `composefs` in its detached metadata. It checks the image commit and
-    /// opens its `/root.cfs`. If the commit carries the key
-    /// `ostree.composefs.digest.v0`, the daemon compares the fs-verity digest
-    /// of `/root.cfs` with the key. It refuses an image whose size is 0 or not
-    /// a multiple of 4096 bytes. If the commit names no image commit, the
-    /// daemon refuses the request with [`HelperCode::Repository`]. It does not
-    /// build an image in place of an absent one, and it does not check a
-    /// signature of the commit.
+    /// opens its `/root.cfs`. For a supplement, the commit must carry the key
+    /// `ostree.composefs.digest.v0`, and the daemon compares the fs-verity
+    /// digest of `/root.cfs` with the key. For an attachment, the daemon does
+    /// not compare the key. Under `[ex-integrity] fsverity=yes`, the file
+    /// object of `/root.cfs` must be sealed with fs-verity. The daemon
+    /// refuses an image whose size is 0 or not a multiple of 4096 bytes. If
+    /// the commit names no image commit, the daemon refuses the request with
+    /// [`HelperCode::Repository`]. It does not build an image in place of an
+    /// absent one, and it does not check a signature of the commit.
     ///
     /// The daemon does not copy the image. If the file object of `/root.cfs`
     /// is not sealed with fs-verity, a process that can write it can change

@@ -25670,11 +25670,12 @@ fn commit_generate_composefs_refuses_a_partial_image_commit() {
     assert!(!repo.join("refs/heads/n").exists());
 }
 
-/// `composefs-image --add` writes the image commit of a commit without the
-/// key and names it as the supplement `composefs`, with no output. The
-/// command refuses a call without --add.
+/// `composefs-image --add` refuses a commit without the key in one line, and
+/// writes no object and no detached metadata. For a commit with the key, it
+/// writes the image commit and names it as the supplement `composefs`, with
+/// no output. The command refuses a call without --add.
 #[test]
-fn composefs_image_add_writes_the_supplement_of_a_commit_without_the_key() {
+fn composefs_image_add_refuses_a_commit_without_the_key() {
     let tmp = TmpDir::new("composefs-image-nokey");
     let base = tmp.path();
     build_fixture_source(base);
@@ -25686,11 +25687,39 @@ fn composefs_image_add_writes_the_supplement_of_a_commit_without_the_key() {
     )
     .ok()
     .stdout_trimmed();
+    let before = objects_and_commitmeta(&repo, &checksum);
+    assert!(before.1.is_none());
 
     let add = ostrya_repo(&repo, &["composefs-image", "--add", "p"]);
+    assert_eq!(add.status.code(), Some(1));
+    assert!(add.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&add.stderr),
+        format!(
+            "error: invalid input: commit {checksum} carries no ostree.composefs.digest.v0; a \
+             supplement is not written (commit --generate-composefs-metadata or \
+             --generate-composefs writes a commit that carries the key)\n"
+        )
+    );
+    assert_eq!(objects_and_commitmeta(&repo, &checksum), before);
+
+    let keyed = ostrya_repo(
+        &repo,
+        &[
+            "commit",
+            "-b",
+            "k",
+            FIXED_TIMESTAMP,
+            "--generate-composefs-metadata",
+            src.to_str().unwrap(),
+        ],
+    )
+    .ok()
+    .stdout_trimmed();
+    let add = ostrya_repo(&repo, &["composefs-image", "--add", "k"]);
     add.ok();
     assert!(add.stdout.is_empty() && add.stderr.is_empty());
-    let a = Checksum::from_hex(&checksum).unwrap();
+    let a = Checksum::from_hex(&keyed).unwrap();
     let relations = relations_of(&repo, &a);
     assert!(relations.attachments.is_empty());
     assert_eq!(relations.supplements.len(), 1);

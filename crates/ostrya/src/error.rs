@@ -660,10 +660,14 @@ pub enum Error {
         /// The fs-verity digest of the image.
         actual: [u8; 32],
     },
-    /// A composefs image commit that a commit names and that has a defect.
+    /// A composefs image commit that a commit names, with a defect of the
+    /// image commit or of the way that the commit names it.
     ///
     /// [`Repo::open_composefs_image`](crate::Repo::open_composefs_image)
     /// gives this error. It does not try the next source.
+    /// [`Repo::add_composefs_supplement`](crate::Repo::add_composefs_supplement)
+    /// gives it with
+    /// [`ComposefsImageDefect::NotSealed`](crate::ComposefsImageDefect::NotSealed).
     #[error(
         "composefs image of commit {commit}: {relation} {} names commit {image}, {defect}",
         crate::COMPOSEFS_RELATION

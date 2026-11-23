@@ -240,8 +240,9 @@ pub fn verity_of(repo: &Repo) -> (Verity, VerityPolicy) {
     }
 }
 
-/// Opens the image of the image commit that `commit` names, after the check
-/// of its digest against the key of the commit.
+/// Opens the image of the image commit that `commit` names, after the checks
+/// of the lookup. The lookup compares the digest of the image with the key of
+/// the commit for a supplement alone.
 pub async fn stored_image(repo: &Repo, commit: &Checksum) -> ComposefsImage {
     repo.open_composefs_image(commit).await.unwrap().unwrap()
 }

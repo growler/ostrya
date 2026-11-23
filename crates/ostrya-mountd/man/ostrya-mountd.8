@@ -110,11 +110,14 @@ commit names as the attachment \fBcomposefs\fR in field 2 of the commit
 object, or else as the supplement \fBcomposefs\fR in its detached
 metadata. The image commit must be in the repository with no partial
 marker, and its tree must hold the regular file \fB/root.cfs\fR and no
-other entry. If the commit carries the key
-\fBostree.composefs.digest.v0\fR, the fs-verity digest of
+other entry. For a supplement, the commit must carry the key
+\fBostree.composefs.digest.v0\fR, and the fs-verity digest of
 \fB/root.cfs\fR must be the value of the key. If the two are different,
 the reply names the commit, the field, and the image commit, and neither
-digest. The size of the image must be a positive multiple of 4096 bytes.
+digest. For an attachment, the daemon does not compare the key. If the
+repository sets \fB[ex\-integrity] fsverity=yes\fR, the file object of
+\fB/root.cfs\fR must be sealed with fs-verity. The size of the image must
+be a positive multiple of 4096 bytes.
 A defect of the selected image commit fails the request, and the daemon
 does not try the other field. If the commit names no image commit, the
 daemon refuses the request with the code \fBrepository\fR and the text
@@ -185,10 +188,13 @@ image commit exists in \fBstate\fR. The modes of these files, and of the
 directories between them and the repository directory, do not stop the
 read. This includes objects of other commits.
 .IP \(bu 2
-If the commit carries the key \fBostree.composefs.digest.v0\fR, the
-daemon mounts the image of an image commit only after its digest matches
-the key. The caller can write both the image commit and the commit, so
-the check does not limit the objects that an image can name. A refusal
+The daemon mounts the image of a supplement only if the commit carries
+the key \fBostree.composefs.digest.v0\fR and the digest of the image
+matches the key. For an attachment, the checksum chain from the commit to
+\fB/root.cfs\fR binds the image to the commit, and the daemon does not
+compare the key. The checks guard against damage and against a writer of
+the repository other than the caller. They do not guard against the
+caller, who can write both the image commit and the commit. A refusal
 tells the caller if the image commit exists.
 .IP \(bu 2
 Each mount of the daemon has \fBnosuid\fR and \fBnodev\fR. The top overlay

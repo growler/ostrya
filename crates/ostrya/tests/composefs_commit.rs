@@ -18,22 +18,28 @@
 //!   valid supplement exists. Two entries of the name in one field, and a
 //!   defective entry of field 2 or of `ostrya.related`, fail the lookup.
 //!   With a valid attachment, the lookup reads no `.commitmeta`.
-//! - The lookup reads the key only if the commit names an image commit.
+//! - The lookup reads and compares the key for a supplement alone. A
+//!   supplement of a commit with no key gives `NoKey` before any read of the
+//!   image commit, and a wrong key gives `DigestMismatch`. An attachment
+//!   with a wrong key, a malformed key, or no key gives its image.
 //! - A complete image commit with a missing dirtree or image object fails
 //!   the lookup with `ObjectNotFound`.
 //! - The lookup refuses an `archive` repository before any read. The write
 //!   of the image commit works in `archive` mode and writes no
 //!   `ostree.sizes`.
-//! - With no key, the lookup gives the file with no check.
+//! - With `[ex-integrity] fsverity=yes`, a `/root.cfs` with no seal gives
+//!   `NotSealed` for the attachment and for the supplement.
 //! - In a sealing repository, the returned descriptor is sealed and its
-//!   kernel digest is the key, and a wrong key gives `DigestMismatch`. These
-//!   tests skip if the file system has no fs-verity.
+//!   kernel digest is the key, and a wrong key of a supplement gives
+//!   `DigestMismatch`. These tests skip if the file system has no fs-verity.
 //! - `Repo::add_composefs_supplement` writes the image commit and the
 //!   supplement, writes nothing for a valid supplement, replaces a bad
 //!   supplement, completes a partial image commit, refuses a commit with the
-//!   attachment and a key that is not the digest of the image, makes no
-//!   check with no key, and works in an `archive` repository. In `archive`
-//!   mode, it replaces a supplement that names another image commit.
+//!   attachment, a commit with no key, and a key that is not the digest of
+//!   the image, and works in an `archive` repository. In `archive` mode, it
+//!   replaces a supplement that names another image commit. With
+//!   `fsverity=yes`, it refuses a supplement with no seal and writes
+//!   nothing, except in `archive` mode.
 //! - `CheckedAttachments::add` checks the new entry alone: an entry of the
 //!   first check that the repository marks partial after that check fails
 //!   neither the add nor the write of the commit. The add keeps the entries
@@ -41,8 +47,9 @@
 //! - With a hook, the image file is the image that
 //!   `Repo::export_composefs_to` writes for the tree with the same hook, and
 //!   the call returns its digest. A commit that names the image commit as
-//!   the attachment and carries that digest as the key gives the image. A
-//!   key with the digest of the image with no hook gives `DigestMismatch`.
+//!   the attachment and carries the digest of the image with no hook as the
+//!   key, or no key, gives the image. The same image commit as a supplement
+//!   gives `DigestMismatch`.
 
 mod common;
 
@@ -314,6 +321,26 @@ fn write_raw_detached(repo: &Repo, commit: &Checksum, meta: &Value) {
     std::fs::write(path, bytes).unwrap();
 }
 
+/// Sets `[ex-integrity] fsverity=yes` in the `config` of `repo`, and opens
+/// the repository again. The objects that `repo` wrote before keep the seal
+/// state that they had.
+async fn require_verity(repo: Repo) -> Repo {
+    set_fsverity(repo, "yes").await
+}
+
+/// Sets `[ex-integrity] fsverity` to `value` in the `config` of `repo`, with
+/// no check of the value, and opens the repository again.
+async fn set_fsverity(repo: Repo, value: &str) -> Repo {
+    let root = repo.path().to_path_buf();
+    drop(repo);
+    let config = root.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    assert!(!text.contains("fsverity"), "{text}");
+    text.push_str(&format!("[ex-integrity]\nfsverity={value}\n"));
+    std::fs::write(&config, text).unwrap();
+    Repo::open(&root).await.unwrap()
+}
+
 /// Writes a commit of a tree with the one file `a`, `0:0 0100644`, in
 /// `repo`, with explicit objects, so that each repository mode stores the
 /// same tree. Returns the commit.
@@ -476,23 +503,26 @@ fn the_image_commit_holds_the_image_of_the_hook() {
 
 /// A transaction writes the image commit with a hook, and a commit of the
 /// same tree that names the image commit as the attachment and carries the
-/// returned digest as the key. The lookup gives the image of the hook. A
-/// commit with the key of the image with no hook fails the lookup.
+/// digest of the image with no hook as the key. The lookup gives the image
+/// of the hook. A commit with no key gives it too. A commit that names the
+/// labeled image commit as a supplement with the same key fails the lookup
+/// with `DigestMismatch`.
 #[test]
-fn the_lookup_accepts_the_key_of_the_image_of_the_hook() {
+fn the_lookup_gives_a_labeled_attachment_of_a_commit_with_the_rebuilt_key() {
     let scratch = TmpDir::new("cfs-commit-hook-lookup");
     let hook: ComposefsEntryFn<'_> = &label_entry;
     block_on(async {
         let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
         let root = root_of(&repo, &tree).await;
         let txn = repo.transaction().await.unwrap();
-        let (image, digest) = txn.write_composefs_commit(&root, Some(hook)).await.unwrap();
+        let (image, labeled) = txn.write_composefs_commit(&root, Some(hook)).await.unwrap();
+        let rebuilt = txn.composefs_digest(&root).await.unwrap();
         let commit = txn
             .write_commit(
                 ostrya::CommitOptions {
                     subject: Some("with labeled image".to_owned()),
                     timestamp: Some(0),
-                    metadata: Some(key_dict(&digest)),
+                    metadata: Some(key_dict(&rebuilt)),
                     attachments: vec![(COMPOSEFS_RELATION.to_owned(), image)],
                     ..ostrya::CommitOptions::default()
                 },
@@ -501,33 +531,40 @@ fn the_lookup_accepts_the_key_of_the_image_of_the_hook() {
             .await
             .unwrap();
         txn.commit().await.unwrap();
+        assert_eq!(rebuilt, recorded_export(&repo, &tree).await.fs_verity);
+        assert_ne!(rebuilt, labeled);
 
-        let found = repo.open_composefs_image(&commit).await.unwrap().unwrap();
-        assert_eq!(found.source, ComposefsImageSource::Attachment);
-        assert_eq!(found.commit, image);
         let stored = raw_object(&repo, &image_object(&repo, &image).await);
-        assert_eq!(found.size, stored.len() as u64);
-        assert_eq!(read_all(&found.file), stored);
-
-        let plain = recorded_export(&repo, &tree).await.fs_verity;
-        let unlabeled = store_named(
+        let no_key = store_named(
             &repo,
             &tree,
-            "key of the image with no hook",
-            Some(&plain),
+            "labeled image with no key",
+            None,
             &[(COMPOSEFS_RELATION, image.as_bytes())],
         )
         .await;
-        let err = repo.open_composefs_image(&unlabeled).await.unwrap_err();
+        for named in [commit, no_key] {
+            let found = repo.open_composefs_image(&named).await.unwrap().unwrap();
+            assert_eq!(found.source, ComposefsImageSource::Attachment);
+            assert_eq!(found.commit, image);
+            assert_eq!(found.size, stored.len() as u64);
+            assert_eq!(read_all(&found.file), stored);
+        }
+
+        let supplement = store_named(&repo, &tree, "labeled supplement", Some(&rebuilt), &[]).await;
+        repo.add_supplement(&supplement, COMPOSEFS_RELATION, &image)
+            .await
+            .unwrap();
+        let err = repo.open_composefs_image(&supplement).await.unwrap_err();
         assert_eq!(
             invalid_image(err),
             (
-                unlabeled,
-                ComposefsImageSource::Attachment,
+                supplement,
+                ComposefsImageSource::Supplement,
                 image,
                 ComposefsImageDefect::DigestMismatch {
-                    expected: plain,
-                    actual: digest,
+                    expected: rebuilt,
+                    actual: labeled,
                 }
             )
         );
@@ -630,11 +667,15 @@ enum Fault {
     ExtraEntry,
     /// The key of the commit is not the digest of the image.
     WrongKey,
+    /// The commit carries no key.
+    NoKey,
 }
 
 /// The lookup refuses each defect of the image commit, for the attachment
 /// and for the supplement, with the commit, the source, the image commit,
-/// and the defect.
+/// and the defect. A wrong key and no key fail a supplement alone. With no
+/// key, the lookup refuses a supplement that names an absent image commit
+/// with `NoKey`, so it reads no part of the image commit.
 #[test]
 fn each_defect_of_the_image_commit_is_refused() {
     let scratch = TmpDir::new("cfs-commit-defects");
@@ -683,53 +724,75 @@ fn each_defect_of_the_image_commit_is_refused() {
         txn.commit().await.unwrap();
 
         let wrong = [0x11u8; 32];
+        let absent = Checksum::from_bytes([0x5a; 32]);
+        let both = [
+            ComposefsImageSource::Attachment,
+            ComposefsImageSource::Supplement,
+        ];
+        let supplement = [ComposefsImageSource::Supplement];
         let cases = [
             (
                 Fault::Absent,
-                Checksum::from_bytes([0x5a; 32]),
-                digest,
+                absent,
+                Some(digest),
                 ComposefsImageDefect::Absent,
+                &both[..],
             ),
-            (Fault::Partial, valid, digest, ComposefsImageDefect::Partial),
+            (
+                Fault::Partial,
+                valid,
+                Some(digest),
+                ComposefsImageDefect::Partial,
+                &both[..],
+            ),
             (
                 Fault::NoImageFile,
                 no_image,
-                digest,
+                Some(digest),
                 ComposefsImageDefect::NoImageFile,
+                &both[..],
             ),
             (
                 Fault::SymlinkImage,
                 symlink,
-                digest,
+                Some(digest),
                 ComposefsImageDefect::NotRegular,
+                &both[..],
             ),
             (
                 Fault::DirImage,
                 dir,
-                digest,
+                Some(digest),
                 ComposefsImageDefect::NotRegular,
+                &both[..],
             ),
             (
                 Fault::ExtraEntry,
                 extra,
-                digest,
+                Some(digest),
                 ComposefsImageDefect::ExtraEntry("extra".to_owned()),
+                &both[..],
             ),
             (
                 Fault::WrongKey,
                 valid,
-                wrong,
+                Some(wrong),
                 ComposefsImageDefect::DigestMismatch {
                     expected: wrong,
                     actual: digest,
                 },
+                &supplement[..],
+            ),
+            (
+                Fault::NoKey,
+                absent,
+                None,
+                ComposefsImageDefect::NoKey,
+                &supplement[..],
             ),
         ];
-        for source in [
-            ComposefsImageSource::Attachment,
-            ComposefsImageSource::Supplement,
-        ] {
-            for (fault, image, key, expected) in &cases {
+        for (fault, image, key, expected, sources) in &cases {
+            for &source in *sources {
                 let subject = format!("{fault:?} {source}");
                 let commit = match source {
                     ComposefsImageSource::Attachment => {
@@ -737,13 +800,13 @@ fn each_defect_of_the_image_commit_is_refused() {
                             &repo,
                             &tree,
                             &subject,
-                            Some(key),
+                            key.as_ref(),
                             &[(COMPOSEFS_RELATION, image.as_bytes())],
                         )
                         .await
                     }
                     ComposefsImageSource::Supplement => {
-                        let commit = store_named(&repo, &tree, &subject, Some(key), &[]).await;
+                        let commit = store_named(&repo, &tree, &subject, key.as_ref(), &[]).await;
                         repo.add_supplement(&commit, COMPOSEFS_RELATION, image)
                             .await
                             .unwrap();
@@ -797,6 +860,15 @@ fn each_defect_has_its_text() {
         (
             ComposefsImageDefect::ExtraEntry("etc".to_owned()),
             "whose tree holds the entry etc next to /root.cfs",
+        ),
+        (
+            ComposefsImageDefect::NoKey,
+            "and the commit carries no ostree.composefs.digest.v0",
+        ),
+        (
+            ComposefsImageDefect::NotSealed,
+            "whose /root.cfs has no fs-verity seal with SHA-256, 4096-byte blocks, no salt, \
+             and its full size",
         ),
     ];
     for (defect, text) in cases {
@@ -980,8 +1052,9 @@ fn the_image_commit_is_written_in_an_archive_repository() {
     });
 }
 
-/// A commit with no key gives the file of its image commit with no check of
-/// the content, also if the image is the image of another tree.
+/// A commit with no key gives the file of the image commit of its attachment
+/// with no check of the content, also if the image is the image of another
+/// tree.
 #[test]
 fn a_commit_with_no_key_gives_the_image_with_no_check() {
     let scratch = TmpDir::new("cfs-commit-no-key");
@@ -1089,10 +1162,11 @@ fn a_valid_attachment_does_not_read_the_supplements() {
     });
 }
 
-/// The lookup reads the key only if the commit names an image commit: a key
-/// of 31 bytes gives `None` with no entry, and `InvalidFormat` with one.
+/// The lookup reads the key only if the commit names a supplement: a key of
+/// 31 bytes gives `None` with no entry, the image with an attachment, and
+/// `InvalidFormat` with a supplement.
 #[test]
-fn a_malformed_key_fails_only_a_commit_that_names_an_image() {
+fn a_malformed_key_fails_only_a_commit_that_names_a_supplement() {
     let scratch = TmpDir::new("cfs-commit-bad-key");
     block_on(async {
         let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
@@ -1102,15 +1176,23 @@ fn a_malformed_key_fails_only_a_commit_that_names_an_image() {
         let unnamed = store_with_metadata(&repo, &tree, "no entry", short(), &[]).await;
         assert!(repo.open_composefs_image(&unnamed).await.unwrap().is_none());
 
-        let named = store_with_metadata(
+        let attached = store_with_metadata(
             &repo,
             &tree,
-            "with entry",
+            "with attachment",
             short(),
             &[(COMPOSEFS_RELATION, image.as_bytes())],
         )
         .await;
-        match repo.open_composefs_image(&named).await.unwrap_err() {
+        let found = repo.open_composefs_image(&attached).await.unwrap().unwrap();
+        assert_eq!(found.source, ComposefsImageSource::Attachment);
+        assert_eq!(found.commit, image);
+
+        let supplied = store_with_metadata(&repo, &tree, "with supplement", short(), &[]).await;
+        repo.add_supplement(&supplied, COMPOSEFS_RELATION, &image)
+            .await
+            .unwrap();
+        match repo.open_composefs_image(&supplied).await.unwrap_err() {
             Error::InvalidFormat(_) => {}
             other => panic!("expected InvalidFormat, got {other:?}"),
         }
@@ -1161,10 +1243,11 @@ fn a_defective_supplement_of_another_name_is_refused() {
     });
 }
 
-/// In a sealing repository, a key that is not the kernel digest of the
-/// sealed image gives `DigestMismatch` with the actual digest.
+/// In a sealing repository, a supplement of a commit whose key is the kernel
+/// digest of the sealed image gives the image. A key that is not the kernel
+/// digest gives `DigestMismatch` with the actual digest.
 #[test]
-fn a_wrong_key_of_a_sealed_image_is_refused() {
+fn a_wrong_key_of_a_sealed_supplement_is_refused() {
     let scratch = TmpDir::new("cfs-commit-sealed-wrong");
     if !verity_supported(scratch.path()) {
         eprintln!("skipping: the file system has no fs-verity");
@@ -1178,21 +1261,29 @@ fn a_wrong_key_of_a_sealed_image_is_refused() {
         )
         .await;
         let (image, digest) = write_image_commit(&repo, &tree).await;
+        let right = store_named(&repo, &tree, "sealed right key", Some(&digest), &[]).await;
+        repo.add_supplement(&right, COMPOSEFS_RELATION, &image)
+            .await
+            .unwrap();
+        let found = repo.open_composefs_image(&right).await.unwrap().unwrap();
+        assert_eq!(found.source, ComposefsImageSource::Supplement);
+        assert_eq!(found.commit, image);
+        assert_eq!(
+            ostrya_sys::measure_verity(found.file.as_fd()).unwrap(),
+            digest
+        );
+
         let wrong = [0x11u8; 32];
-        let commit = store_named(
-            &repo,
-            &tree,
-            "sealed wrong key",
-            Some(&wrong),
-            &[(COMPOSEFS_RELATION, image.as_bytes())],
-        )
-        .await;
+        let commit = store_named(&repo, &tree, "sealed wrong key", Some(&wrong), &[]).await;
+        repo.add_supplement(&commit, COMPOSEFS_RELATION, &image)
+            .await
+            .unwrap();
         let err = repo.open_composefs_image(&commit).await.unwrap_err();
         assert_eq!(
             invalid_image(err),
             (
                 commit,
-                ComposefsImageSource::Attachment,
+                ComposefsImageSource::Supplement,
                 image,
                 ComposefsImageDefect::DigestMismatch {
                     expected: wrong,
@@ -1200,6 +1291,86 @@ fn a_wrong_key_of_a_sealed_image_is_refused() {
                 }
             )
         );
+    });
+}
+
+/// A repository writes the image commit under `fsverity=no`, so `/root.cfs`
+/// has no seal, and the lookup gives the image of the attachment and of the
+/// supplement. After the repository sets `[ex-integrity] fsverity=yes`, the
+/// lookup refuses each source with `NotSealed`.
+#[test]
+fn an_unsealed_image_is_refused_under_fsverity_yes() {
+    let scratch = TmpDir::new("cfs-commit-not-sealed");
+    block_on(async {
+        let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
+        let (image, digest) = write_image_commit(&repo, &tree).await;
+        let attached = store_named(
+            &repo,
+            &tree,
+            "unsealed attachment",
+            Some(&digest),
+            &[(COMPOSEFS_RELATION, image.as_bytes())],
+        )
+        .await;
+        let supplied = store_named(&repo, &tree, "unsealed supplement", Some(&digest), &[]).await;
+        repo.add_supplement(&supplied, COMPOSEFS_RELATION, &image)
+            .await
+            .unwrap();
+        let cases = [
+            (attached, ComposefsImageSource::Attachment),
+            (supplied, ComposefsImageSource::Supplement),
+        ];
+        for (commit, source) in cases {
+            let found = repo.open_composefs_image(&commit).await.unwrap().unwrap();
+            assert_eq!((found.source, found.commit), (source, image));
+        }
+
+        let repo = require_verity(repo).await;
+        for (commit, source) in cases {
+            let err = repo.open_composefs_image(&commit).await.unwrap_err();
+            let text = err.to_string();
+            assert_eq!(
+                invalid_image(err),
+                (commit, source, image, ComposefsImageDefect::NotSealed),
+                "{source}"
+            );
+            assert_eq!(
+                text,
+                format!(
+                    "composefs image of commit {commit}: {source} composefs names commit \
+                     {image}, whose /root.cfs has no fs-verity seal with SHA-256, 4096-byte \
+                     blocks, no salt, and its full size"
+                )
+            );
+        }
+    });
+}
+
+/// With a malformed `[ex-integrity] fsverity` value, the lookup of a commit
+/// that names no image commit gives `None`, because the lookup reads the
+/// value only for an image commit. The lookup of a commit that names an
+/// image commit fails with `InvalidFormat`.
+#[test]
+fn a_malformed_fsverity_fails_only_a_commit_that_names_an_image() {
+    let scratch = TmpDir::new("cfs-commit-bad-fsverity");
+    block_on(async {
+        let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
+        let (image, digest) = write_image_commit(&repo, &tree).await;
+        let attached = store_named(
+            &repo,
+            &tree,
+            "attachment",
+            Some(&digest),
+            &[(COMPOSEFS_RELATION, image.as_bytes())],
+        )
+        .await;
+
+        let repo = set_fsverity(repo, "bogus").await;
+        assert!(repo.open_composefs_image(&tree).await.unwrap().is_none());
+        match repo.open_composefs_image(&attached).await.unwrap_err() {
+            Error::InvalidFormat(message) => assert!(message.contains("fsverity"), "{message}"),
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
     });
 }
 
@@ -1363,20 +1534,38 @@ fn the_add_writes_the_supplement_of_a_commit_with_the_key() {
     });
 }
 
-/// A commit with no key gets the image commit with no check.
+/// A commit with no key is refused with `InvalidInput`, also if it has a
+/// supplement, and the call writes no object and no supplement.
 #[test]
-fn the_add_makes_no_check_for_a_commit_with_no_key() {
+fn the_add_refuses_a_commit_with_no_key() {
     let scratch = TmpDir::new("cfs-add-no-key");
     block_on(async {
         let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
-        let commit = store_named(&repo, &tree, "no key", None, &[]).await;
-        let added = repo.add_composefs_supplement(&commit).await.unwrap();
-        let ComposefsSupplementAdd::Written { image, replaced } = added else {
-            panic!("expected Written, got {added:?}");
-        };
-        assert_eq!(replaced, None);
-        let found = repo.open_composefs_image(&commit).await.unwrap().unwrap();
-        assert_eq!(found.commit, image);
+        let bare = store_named(&repo, &tree, "no key", None, &[]).await;
+        let (image, _) = write_image_commit(&repo, &tree).await;
+        let supplied = store_named(&repo, &tree, "no key, supplement", None, &[]).await;
+        repo.add_supplement(&supplied, COMPOSEFS_RELATION, &image)
+            .await
+            .unwrap();
+
+        for commit in [bare, supplied] {
+            let objects = object_files(&repo);
+            let meta = commitmeta_bytes(&repo, &commit);
+            match repo.add_composefs_supplement(&commit).await.unwrap_err() {
+                Error::InvalidInput(message) => assert_eq!(
+                    message,
+                    format!(
+                        "commit {commit} carries no ostree.composefs.digest.v0; a supplement \
+                         is not written (Repo::commit_add_composefs_metadata stages a commit \
+                         that carries the key)"
+                    )
+                ),
+                other => panic!("expected InvalidInput, got {other:?}"),
+            }
+            assert_eq!(object_files(&repo), objects);
+            assert_eq!(commitmeta_bytes(&repo, &commit), meta);
+        }
+        assert!(commitmeta_bytes(&repo, &bare).is_none());
     });
 }
 
@@ -1439,6 +1628,234 @@ fn the_add_refuses_a_commit_with_the_attachment() {
         }
         assert_eq!(object_files(&repo), objects);
         assert!(commitmeta_bytes(&repo, &commit).is_none());
+    });
+}
+
+/// A commit with the attachment and no key gets the refusal of the
+/// attachment. A commit with neither gets the refusal of the key before the
+/// add reads the `.commitmeta`. A directory at the path of the `.commitmeta`
+/// fails the add of a commit with the key with `InvalidFormat`, and does not
+/// change the refusal of a commit with no key. The add writes nothing.
+#[test]
+fn the_add_refuses_the_attachment_then_the_missing_key_before_the_supplements() {
+    let scratch = TmpDir::new("cfs-add-order");
+    block_on(async {
+        let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
+        let (image, digest) = write_image_commit(&repo, &tree).await;
+        let attached = store_named(
+            &repo,
+            &tree,
+            "attachment, no key",
+            None,
+            &[(COMPOSEFS_RELATION, image.as_bytes())],
+        )
+        .await;
+        let keyed = store_named(&repo, &tree, "key, damaged", Some(&digest), &[]).await;
+        let bare = store_named(&repo, &tree, "no key, damaged", None, &[]).await;
+        for commit in [keyed, bare] {
+            let path = repo.path().join("objects").join(loose_path(
+                &commit,
+                ObjectType::CommitMeta,
+                repo.mode(),
+            ));
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let objects = object_files(&repo);
+
+        match repo.add_composefs_supplement(&attached).await.unwrap_err() {
+            Error::InvalidInput(message) => assert_eq!(
+                message,
+                format!(
+                    "commit {attached} names its composefs image commit {image} as an \
+                     attachment; a supplement is not written"
+                )
+            ),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        match repo.add_composefs_supplement(&keyed).await.unwrap_err() {
+            Error::InvalidFormat(message) => {
+                assert!(
+                    message.ends_with(".commitmeta is not a regular file"),
+                    "{message}"
+                )
+            }
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
+        match repo.add_composefs_supplement(&bare).await.unwrap_err() {
+            Error::InvalidInput(message) => assert_eq!(
+                message,
+                format!(
+                    "commit {bare} carries no ostree.composefs.digest.v0; a supplement \
+                     is not written (Repo::commit_add_composefs_metadata stages a commit \
+                     that carries the key)"
+                )
+            ),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        assert_eq!(object_files(&repo), objects);
+    });
+}
+
+/// The add writes the supplement of a commit under `fsverity=no`, so its
+/// `/root.cfs` has no seal. After the repository sets `[ex-integrity]
+/// fsverity=yes`, the add hashes the file, finds the digest of the key, and
+/// refuses the commit with `NotSealed`. It writes no object and no
+/// supplement. In an `archive` repository, the add applies no seal rule and
+/// finds the supplement valid.
+#[test]
+fn the_add_refuses_an_unsealed_supplement_under_fsverity_yes() {
+    let scratch = TmpDir::new("cfs-add-not-sealed");
+    block_on(async {
+        for mode in [RepoMode::BareUser, RepoMode::Archive] {
+            let base = scratch.path().join(format!("{mode:?}"));
+            std::fs::create_dir(&base).unwrap();
+            build_owned_source(&base.join("tree"));
+            let repo = new_repo(&base.join("repo"), mode, "").await;
+            let tree = commit_owned(&repo, &base.join("tree")).await;
+            let digest = recorded_export(&repo, &tree).await.fs_verity;
+            let commit = store_named(&repo, &tree, "unsealed", Some(&digest), &[]).await;
+            let added = repo.add_composefs_supplement(&commit).await.unwrap();
+            let ComposefsSupplementAdd::Written { image, .. } = added else {
+                panic!("expected Written, got {added:?}");
+            };
+
+            let repo = require_verity(repo).await;
+            let objects = object_files(&repo);
+            let meta = commitmeta_bytes(&repo, &commit);
+            let result = repo.add_composefs_supplement(&commit).await;
+            if mode == RepoMode::Archive {
+                assert_eq!(result.unwrap(), ComposefsSupplementAdd::Valid { image });
+            } else {
+                assert_eq!(
+                    invalid_image(result.unwrap_err()),
+                    (
+                        commit,
+                        ComposefsImageSource::Supplement,
+                        image,
+                        ComposefsImageDefect::NotSealed
+                    )
+                );
+            }
+            assert_eq!(object_files(&repo), objects, "{mode:?}");
+            assert_eq!(commitmeta_bytes(&repo, &commit), meta, "{mode:?}");
+        }
+    });
+}
+
+/// Under `[ex-integrity] fsverity=yes`, the add writes a sealed image
+/// commit, and a second call finds the supplement valid and writes nothing.
+#[test]
+fn the_add_finds_a_sealed_supplement_valid_under_fsverity_yes() {
+    let scratch = TmpDir::new("cfs-add-sealed");
+    if !verity_supported(scratch.path()) {
+        eprintln!("skipping: the file system has no fs-verity");
+        return;
+    }
+    block_on(async {
+        let (repo, tree) = setup(
+            &scratch,
+            RepoMode::BareUser,
+            "[ex-integrity]\nfsverity=yes\n",
+        )
+        .await;
+        let digest = recorded_export(&repo, &tree).await.fs_verity;
+        let commit = store_named(&repo, &tree, "sealed add", Some(&digest), &[]).await;
+        let added = repo.add_composefs_supplement(&commit).await.unwrap();
+        let ComposefsSupplementAdd::Written { image, replaced } = added else {
+            panic!("expected Written, got {added:?}");
+        };
+        assert_eq!(replaced, None);
+
+        let objects = object_files(&repo);
+        let meta = commitmeta_bytes(&repo, &commit);
+        assert_eq!(
+            repo.add_composefs_supplement(&commit).await.unwrap(),
+            ComposefsSupplementAdd::Valid { image }
+        );
+        assert_eq!(object_files(&repo), objects);
+        assert_eq!(commitmeta_bytes(&repo, &commit), meta);
+    });
+}
+
+/// A supplement names the image commit of another tree, written under
+/// `fsverity=no`, so its `/root.cfs` has no seal. After the repository sets
+/// `[ex-integrity] fsverity=yes`, the add hashes the file, finds a digest
+/// other than the key, and replaces the entry with the sealed image commit
+/// of the tree. The lookup then gives the new image.
+#[test]
+fn the_add_replaces_an_unsealed_supplement_of_another_image_under_fsverity_yes() {
+    let scratch = TmpDir::new("cfs-add-unsealed-other");
+    if !verity_supported(scratch.path()) {
+        eprintln!("skipping: the file system has no fs-verity");
+        return;
+    }
+    block_on(async {
+        let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
+        let digest = recorded_export(&repo, &tree).await.fs_verity;
+        let plain = plain_tree_commit(&repo).await;
+        let (wrong, _) = write_image_commit(&repo, &plain).await;
+        let commit = store_named(&repo, &tree, "unsealed other", Some(&digest), &[]).await;
+        repo.add_supplement(&commit, COMPOSEFS_RELATION, &wrong)
+            .await
+            .unwrap();
+
+        let repo = require_verity(repo).await;
+        let added = repo.add_composefs_supplement(&commit).await.unwrap();
+        let ComposefsSupplementAdd::Written { image, replaced } = added else {
+            panic!("expected Written, got {added:?}");
+        };
+        assert_eq!(replaced, Some(wrong));
+        assert_ne!(image, wrong);
+        assert_eq!(
+            supplements(&repo, &commit).await,
+            vec![(COMPOSEFS_RELATION.to_owned(), image)]
+        );
+        let found = repo.open_composefs_image(&commit).await.unwrap().unwrap();
+        assert_eq!(
+            (found.source, found.commit),
+            (ComposefsImageSource::Supplement, image)
+        );
+        assert_eq!(
+            ostrya_sys::measure_verity(found.file.as_fd()).unwrap(),
+            digest
+        );
+    });
+}
+
+/// The add writes the image commit of a tree under `fsverity=no`, so its
+/// `/root.cfs` has no seal. After the repository sets `[ex-integrity]
+/// fsverity=yes`, the add of a second commit of the same tree builds the
+/// same image commit. The transaction does not write the held object again,
+/// so the add refuses the built image commit with `NotSealed` and writes no
+/// object and no supplement.
+#[test]
+fn the_add_refuses_a_built_image_with_no_seal_under_fsverity_yes() {
+    let scratch = TmpDir::new("cfs-add-built-not-sealed");
+    block_on(async {
+        let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
+        let digest = recorded_export(&repo, &tree).await.fs_verity;
+        let first = store_named(&repo, &tree, "first", Some(&digest), &[]).await;
+        let added = repo.add_composefs_supplement(&first).await.unwrap();
+        let ComposefsSupplementAdd::Written { image, .. } = added else {
+            panic!("expected Written, got {added:?}");
+        };
+
+        let repo = require_verity(repo).await;
+        let second = store_named(&repo, &tree, "second", Some(&digest), &[]).await;
+        let objects = object_files(&repo);
+        let err = repo.add_composefs_supplement(&second).await.unwrap_err();
+        assert_eq!(
+            invalid_image(err),
+            (
+                second,
+                ComposefsImageSource::Supplement,
+                image,
+                ComposefsImageDefect::NotSealed
+            )
+        );
+        assert_eq!(object_files(&repo), objects);
+        assert!(commitmeta_bytes(&repo, &second).is_none());
+        assert!(repo.open_composefs_image(&second).await.unwrap().is_none());
     });
 }
 

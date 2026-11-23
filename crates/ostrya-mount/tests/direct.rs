@@ -549,8 +549,9 @@ const HOOK_VALUE: &[u8] = b"labeled by the hook";
 
 /// Commits `base/src` to `repo` at `timestamp`. The transaction writes the
 /// image commit of the tree with a hook that adds [`HOOK_XATTR`] to
-/// `/hello.txt`. The commit has the key with the digest of that image and
-/// names the image commit as the attachment `composefs`.
+/// `/hello.txt`. The commit has the key with the digest of the image of the
+/// tree with no hook and names the image commit as the attachment
+/// `composefs`.
 async fn commit_labeled(repo: &Repo, base: &Path, timestamp: u64) -> Checksum {
     let hook: ComposefsEntryFn<'_> = &|path, _, meta| {
         if path == Path::new("/hello.txt") {
@@ -566,7 +567,8 @@ async fn commit_labeled(repo: &Repo, base: &Path, timestamp: u64) -> Checksum {
         .await
         .unwrap();
     let root = txn.write_mtree(&mut mtree).await.unwrap();
-    let (image, digest) = txn.write_composefs_commit(&root, Some(hook)).await.unwrap();
+    let (image, _labeled) = txn.write_composefs_commit(&root, Some(hook)).await.unwrap();
+    let digest = txn.composefs_digest(&root).await.unwrap();
     let key = Value::Array(vec![Value::Tuple(vec![
         Value::Str(COMPOSEFS_DIGEST_KEY.to_owned()),
         Value::variant(Type::parse("ay").unwrap(), Value::Bytes(digest.to_vec())),

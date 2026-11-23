@@ -7179,24 +7179,36 @@ ostrya composefs-image [--repo=PATH] --add=REV
   composefs image commit"). The command refuses a commit that names an
   image commit as the attachment `composefs`, with `error: invalid input:
   commit CHECKSUM names its composefs image commit IMAGE as an attachment;
-  a supplement is not written` at exit 1. If the supplement `composefs`
-  names an image commit that passes the checks of the lookup, the command
-  writes nothing. Else it builds the image of the tree, writes the image
-  commit, and sets the supplement to it. This replaces an entry that names
-  another image commit, an image commit that the repository does not hold
-  or holds partial, or an image commit whose tree has a defect. The command
-  does not write again an object that the repository already holds. If the
-  entry names the image commit that the build gives, and the object of its
-  `/root.cfs` is changed on disk, the command writes the same entry and
-  exits 0, and the changed object stays. A changed object is a defect that
-  `fsck` reports. If the commit carries `ostree.composefs.digest.v0` and the
-  digest of the built image is not the value of the key, the command writes
-  one `error:` line that names both digests and exits 1. A commit with no
-  key gets no check. A refusal writes no object and no supplement. If the
-  repository held the image commit partial, the command removes its partial
-  marker. The command works in each repository mode, `archive` included. A
-  partial commit is not refused, and the build fails if an object of its
-  tree is absent. On success the command writes nothing.
+  a supplement is not written` at exit 1. It then refuses a commit that
+  carries no `ostree.composefs.digest.v0`, with `error: invalid input: commit
+  CHECKSUM carries no ostree.composefs.digest.v0; a supplement is not written
+  (commit --generate-composefs-metadata or --generate-composefs writes a
+  commit that carries the key)` at exit 1: the lookup refuses a supplement of
+  such a commit. If the supplement `composefs` names an image commit that
+  passes the checks of the lookup, the command writes nothing. Else it builds
+  the image of the tree, writes the image commit, and sets the supplement to
+  it. This replaces an entry that names another image commit, an image commit
+  that the repository does not hold or holds partial, or an image commit whose
+  tree has a defect. The command does not write again an object that the
+  repository already holds. If the entry names the image commit that the build
+  gives, and the object of its `/root.cfs` is changed on disk, the command
+  writes the same entry and exits 0, and the changed object stays. A changed
+  object is a defect that `fsck` reports. If the digest of the built image is
+  not the value of `ostree.composefs.digest.v0`, the command writes one
+  `error:` line that names both digests and exits 1. With `[ex-integrity]
+  fsverity=yes`, the command also checks the fs-verity seal of `/root.cfs`. If
+  the supplement names an image commit whose `/root.cfs` has no seal, the
+  command hashes the file. If the digest is the value of the key, the build
+  gives the same object, so the command writes one `error:` line and exits 1.
+  Else it replaces the entry. After the build, the command writes one `error:`
+  line and exits 1 if the repository holds the `/root.cfs` of the built image
+  commit with no seal, also a changed object. Such an object can come from a
+  write before the repository set `fsverity=yes`. A refusal writes no object
+  and no supplement. If the repository held the image commit partial, the
+  command removes its partial marker. The command works in each repository
+  mode, `archive` included. In `archive` mode, the seal checks do not apply. A
+  partial commit is not refused, and the build fails if an object of its tree
+  is absent. On success the command writes nothing.
 - No transfer copies a supplement. A pull with the default config copies
   the `.commitmeta` with the supplement `composefs` and not the image
   commit, so a lookup of the image fails on the absent image commit until
@@ -7225,7 +7237,8 @@ ostrya composefs-image [--repo=PATH] --add=REV
     signature.
 - `commit --generate-composefs-metadata --related=composefs=CHECKSUM` writes
   the attachment of the caller and makes no check of its image commit
-  against the key.
+  against the key. The lookup does not compare the key with an attachment
+  either.
 - `crates/ostrya/tests/composefs_commit.rs` and
   `crates/ostrya-cli/tests/cli.rs` hold the tests.
 

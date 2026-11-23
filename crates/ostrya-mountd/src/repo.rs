@@ -131,9 +131,10 @@ fn check_mode(mode: RepoMode) -> Result<(), Error> {
 /// The lookup and its checks are those of [`Repo::open_composefs_image`]. The
 /// call then refuses an image whose size is 0 or not a multiple of 4096
 /// bytes, because the loop device reads the image in blocks of 4096 bytes.
-/// The call does not copy the image. If the loose object of the image is not
-/// sealed with fs-verity, a process that can write the file can change it
-/// while it is mounted.
+/// The call does not copy the image. Under `[ex-integrity] fsverity=yes`, the
+/// lookup requires that the loose object of the image is sealed with
+/// fs-verity. Under another value, the object can have no seal, and a process
+/// that can write the file can then change it while it is mounted.
 ///
 /// Returns the descriptor of the image, the field that names the image
 /// commit, and the checksum of the image commit, or `None` if the commit

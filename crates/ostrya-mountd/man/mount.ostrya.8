@@ -122,10 +122,14 @@ helper mounts the image of the supplement \fBcomposefs\fR. If the commit
 has neither, the helper builds the image in a sealed memory file.
 .PP
 The image commit must be in the repository with no partial marker, and its
-tree must hold the regular file \fB/root.cfs\fR and no other entry. If the
-commit carries the key \fBostree.composefs.digest.v0\fR, the fs-verity
-digest of \fB/root.cfs\fR must be the value of the key. The size of the
-image must be a positive multiple of 4096 bytes. A defect of the selected
+tree must hold the regular file \fB/root.cfs\fR and no other entry. For a
+supplement, the commit must carry the key
+\fBostree.composefs.digest.v0\fR, and the fs-verity digest of
+\fB/root.cfs\fR must be the value of the key. For an attachment, the
+helper does not compare the key. If the repository sets
+\fB[ex\-integrity] fsverity=yes\fR, the file object of \fB/root.cfs\fR
+must be sealed with fs-verity. The size of the image must be a positive
+multiple of 4096 bytes. A defect of the selected
 image commit stops the mount, and the helper does not try the next
 source.
 .PP

@@ -791,6 +791,10 @@ impl RepoConfig {
     /// - `yes`: if a seal fails, the write fails with [`Error::Unsupported`].
     /// - `maybe`: the write ignores a seal that fails.
     ///
+    /// With `yes`, the image lookup of
+    /// [`Repo::open_composefs_image`](crate::Repo::open_composefs_image)
+    /// also requires a sealed `/root.cfs` in the image commit.
+    ///
     /// An explicit value applies as written. If the key is absent, the default
     /// is `No`. If the key is absent and [`composefs`](RepoConfig::composefs)
     /// is `Yes` or `Maybe`, the default is `Maybe`. The call reads `composefs`

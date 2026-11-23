@@ -1271,6 +1271,28 @@ mod tests {
         );
 
         assert_eq!(
+            failure_of(invalid(ostrya::ComposefsImageDefect::NoKey)),
+            Failure::new(
+                HelperCode::Repository,
+                format!(
+                    "composefs image of commit {commit}: supplement composefs names commit \
+                     {image}, and the commit carries no ostree.composefs.digest.v0"
+                ),
+            )
+        );
+        assert_eq!(
+            failure_of(invalid(ostrya::ComposefsImageDefect::NotSealed)),
+            Failure::new(
+                HelperCode::Repository,
+                format!(
+                    "composefs image of commit {commit}: supplement composefs names commit \
+                     {image}, whose /root.cfs has no fs-verity seal with SHA-256, 4096-byte \
+                     blocks, no salt, and its full size"
+                ),
+            )
+        );
+
+        assert_eq!(
             failure_of(repo::Error::NoImage { commit }),
             Failure::new(
                 HelperCode::Repository,

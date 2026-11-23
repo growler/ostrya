@@ -7563,14 +7563,31 @@ The writers:
   A, in one transaction:
   1. It refuses an A whose field 2 has the attachment `composefs`, with the
      text `commit A names its composefs image commit C as an attachment; a
-     supplement is not written`.
+     supplement is not written`. It then refuses an A that carries no key
+     `ostree.composefs.digest.v0`, with the text `commit A carries no
+     ostree.composefs.digest.v0; a supplement is not written (commit
+     --generate-composefs-metadata or --generate-composefs writes a commit
+     that carries the key)`. The lookup below refuses a supplement of such
+     an A.
   2. If A has the supplement `composefs` and its C passes the checks of the
      lookup below, the command writes nothing. In `archive` mode, the check
      of the digest inflates the `.filez` object of `root.cfs` and streams it
-     through the fs-verity hasher.
-  3. Else it builds the image of the tree of A. If A has the key and the
-     fs-verity digest of the image is not the value of the key, it refuses A
-     and names both digests. If A has no key, it makes no check.
+     through the fs-verity hasher, and the seal rule of the lookup does not
+     apply. If the check fails with the defect of a `/root.cfs` with no
+     seal, the command streams the file through the fs-verity hasher. If
+     the digest is the value of the key, the build gives the same object,
+     so the command fails with that defect and writes nothing. Else the
+     command replaces the entry as for each other defect. Such an object
+     can come from a write before the repository set `[ex-integrity]
+     fsverity=yes`.
+  3. Else it builds the image of the tree of A. If the fs-verity digest of
+     the image is not the value of the key, it refuses A and names both
+     digests. With `fsverity=yes`, the object of `root.cfs` of the built C
+     must have the seal of the lookup. The transaction does not write an
+     object that the repository already holds, so this object can be an
+     object with no seal. With no seal, the command fails with the defect
+     of a `/root.cfs` with no seal and writes nothing. This check does not
+     apply in `archive` mode.
   4. It writes C, sets the supplement `composefs` of A to C, and replaces an
      entry whose C fails a check. The write of the supplement keeps the
      other entries of `ostrya.related` and the other keys of the
@@ -7578,7 +7595,8 @@ The writers:
      repository already holds. If the entry names the C that the build
      gives, and the object of its `root.cfs` is changed on disk, the
      command writes the same entry, and the changed object stays. A changed
-     object is a defect that `fsck` reports.
+     object is a defect that `fsck` reports. With `fsverity=yes`, step 3
+     refuses such an object if it has no seal.
   5. If the repository marked C partial before the command, the command
      removes the partial marker after the transaction commits.
   On a refusal, the command writes no object and no supplement.
@@ -7591,11 +7609,15 @@ defect `which the repository does not hold` until `composefs-image --add`
 writes C again. With `keep-detached-related=false`, the pull drops
 `ostrya.related`, and A names no image commit.
 
-The key `ostree.composefs.digest.v0` of A records the fs-verity digest of the
-image that A mounts with. That image can hold labels or other metadata that a
-build of the tree of A with no entry hook does not give. The lookup trusts
-the key. The lookup builds no image to check the key of A. The lookup
-compares the key with the digest of `/root.cfs` alone.
+The key `ostree.composefs.digest.v0` of A is optional. It records the
+fs-verity digest of the image that an export of the tree of A writes with
+the verity digests of the files and no entry hook. The digest of an image
+with labels or other metadata of an entry hook never goes under the key, so
+such an image can only be the attachment of A. The lookup uses the key for a
+supplement alone, and compares it with the digest of `/root.cfs`. For an
+attachment, the lookup does not read the key: the checksum chain from A to
+C, the tree of C, and `/root.cfs` binds the image to A. The lookup builds no
+image to check the key of A.
 
 The lookup of the image of A:
 
@@ -7610,12 +7632,16 @@ The lookup of the image of A:
 4. Else the lookup reads the `.commitmeta` of A and each entry of
    `ostrya.related`, with the same rules. If the key has the entry
    `composefs`, C is that entry.
-5. Else A names no image commit, and the lookup gives no image.
-6. The lookup reads the key of A only if A names C. It does not check the
-   state of A, so a partial A gives its image.
+5. Else A names no image commit, and the lookup gives no image. It does not
+   read `[ex-integrity] fsverity`.
+6. The lookup reads the key of A only if A names C as a supplement. It does
+   not check the state of A, so a partial A gives its image.
 7. It checks C in this order. Each failure is an error that names A, the
    source, C, and the defect, and the lookup does not try the other source:
-   - The repository holds C. The text of the defect is
+   - For a supplement, A carries the key. The text of the defect is
+     `and the commit carries no ostree.composefs.digest.v0`. The lookup
+     reads no part of C before this check.
+   - The repository holds C:
      `which the repository does not hold`.
    - The repository does not mark C partial: `which is partial`.
    - The root directory holds the entry `root.cfs`:
@@ -7626,7 +7652,12 @@ The lookup of the image of A:
      `whose tree holds the entry NAME next to /root.cfs`.
    - The file object of `root.cfs` is not a symlink:
      `whose /root.cfs is not a regular file`.
-   - If A has the key, the fs-verity digest of `/root.cfs` is the value of
+   - If the repository sets `[ex-integrity] fsverity=yes`, the file object
+     of `root.cfs` is sealed with fs-verity with SHA-256, 4096-byte blocks,
+     no salt, and its full size, for both sources: `whose /root.cfs has no
+     fs-verity seal with SHA-256, 4096-byte blocks, no salt, and its full
+     size`.
+   - For a supplement, the fs-verity digest of `/root.cfs` is the value of
      the key: `whose /root.cfs has the fs-verity digest ACTUAL, and the
      commit records EXPECTED`.
 8. If the repository holds C complete and does not hold the root dirtree of
@@ -7638,14 +7669,14 @@ The full text of a refusal is
 `SOURCE` is `attachment` or `supplement`.
 
 The lookup does not check the owners, the modes, or the extended attributes
-of C. If A has no key, the lookup gives `/root.cfs` with no check of its
+of C. For an attachment, the lookup gives `/root.cfs` with no check of its
 content.
 
-The digest of `/root.cfs` comes from the kernel if the file is sealed with
-fs-verity with SHA-256, 4096-byte blocks, no salt, and its full size. Else the
-lookup streams the file through the fs-verity hasher in chunks of 128 KiB.
-The lookup measures the digest through the descriptor that it gives, at
-offset 0.
+For a supplement, the digest of `/root.cfs` comes from the kernel if the file
+is sealed with fs-verity with SHA-256, 4096-byte blocks, no salt, and its
+full size. Else the lookup streams the file through the fs-verity hasher in
+chunks of 128 KiB, one time. The lookup measures the digest through the
+descriptor that it gives, at offset 0.
 
 ## The mount daemon protocol
 
@@ -7774,23 +7805,27 @@ The checks of the daemon, in order:
    of `openat2`, `ENOSYS` included, fails the read: the daemon has no
    fallback to `openat`.
 7. For op 1, the daemon runs the lookup of "The composefs image commit".
-   The daemon checks no signature of the commit. Each failure is
-   `repository`:
+   The daemon checks no signature of the commit. The checks guard against
+   damage and against a writer of the repository other than the client.
+   They do not guard against the client, who can write both the commit and
+   the image commit. Each failure is `repository`:
    - If the commit names no image commit, the text is `commit <commit> has
      no attachment or supplement composefs`. The daemon does not build an
      image in place of the absent one.
-   - If the digest of `/root.cfs` is not the key, the text is `composefs
-     image of commit <commit>: <source> composefs names commit <image>,
-     whose /root.cfs does not match the key of the commit`. The text holds
-     neither digest.
+   - If the digest of the `/root.cfs` of a supplement is not the key, the
+     text is `composefs image of commit <commit>: supplement composefs
+     names commit <image>, whose /root.cfs does not match the key of the
+     commit`. The text holds neither digest.
    - Each other defect of the image commit gives the text of the lookup.
    - The size of the image must be more than 0 and a multiple of 4096
      bytes. Else the text is `the image of commit <image> has the size
      <size>, which is not a positive multiple of 4096 bytes`.
 
    The daemon gives the loose object of `root.cfs` to the loop device and
-   copies no byte of it. If the object is not sealed with fs-verity, a
-   process that can write it can change the image while it is mounted. The
+   copies no byte of it. With `[ex-integrity] fsverity=yes`, the lookup
+   requires a sealed object. With another value, if the object is not
+   sealed with fs-verity, a process that can write it can change the image
+   while it is mounted. The
    limit of the size of a built image does not apply to op 1.
 8. A built image larger than the limit of the daemon is `repository`. The
    daemon computes the size before it writes the image. The default limit

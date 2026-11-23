@@ -1831,6 +1831,10 @@ fn the_add_replaces_an_unsealed_supplement_of_another_image_under_fsverity_yes()
 #[test]
 fn the_add_refuses_a_built_image_with_no_seal_under_fsverity_yes() {
     let scratch = TmpDir::new("cfs-add-built-not-sealed");
+    if !verity_supported(scratch.path()) {
+        eprintln!("skipping: the file system has no fs-verity");
+        return;
+    }
     block_on(async {
         let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
         let digest = recorded_export(&repo, &tree).await.fs_verity;

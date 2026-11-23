@@ -1,3 +1,9 @@
+ostrya (0.15.0) UNRELEASED; urgency=medium
+
+  * New upstream release.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Mon, 23 Nov 2026 13:19:17 +0100
+
 ostrya (0.14.0) unstable; urgency=medium
 
   * pull takes the commit operands CHECKSUM, REF@CHECKSUM, and

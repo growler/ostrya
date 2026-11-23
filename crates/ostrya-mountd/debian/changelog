@@ -1,3 +1,9 @@
+ostrya-mountd (0.15.0) UNRELEASED; urgency=medium
+
+  * New upstream release.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Mon, 23 Nov 2026 13:19:17 +0100
+
 ostrya-mountd (0.14.0) unstable; urgency=medium
 
   * The mount helper mount.ostrya runs for "mount -t ostrya". For root

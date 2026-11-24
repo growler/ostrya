@@ -1,3 +1,9 @@
+ostrya (0.16.0) UNRELEASED; urgency=medium
+
+  * New upstream release.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Tue, 24 Nov 2026 09:03:31 +0100
+
 ostrya (0.15.0) unstable; urgency=medium
 
   * composefs-image --add refuses a commit that carries no

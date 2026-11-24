@@ -1125,6 +1125,7 @@ async fn place_regular(
         }
     }
 
+    let dir = dir_fd.try_clone_to_owned()?;
     let (temp, kind) = crate::write::open_temp(dir_fd)?;
     // A loose object of a bare-family mode holds the raw payload. So a
     // recorded size of zero is the `st_size` of the object, and the empty temp
@@ -1132,11 +1133,13 @@ async fn place_regular(
     // records the declared uncompressed size of its header. That size is not
     // proof of the payload, so that mode always copies.
     if !(policy.repo_mode != RepoMode::Archive && matches!(obj.kind, FileKind::Regular { size: 0 }))
+        && let Err(e) = copy_object(repo, obj, payload, &temp, policy).await
     {
-        copy_object(repo, obj, payload, &temp, policy).await?;
+        remove_named_temp(dir_fd, &kind);
+        return Err(e);
     }
     let plan = FinishCopy {
-        dir: dir_fd.try_clone_to_owned()?,
+        dir,
         name: name.to_owned(),
         temp,
         kind,
@@ -1579,21 +1582,12 @@ struct FinishCopy {
 /// Applies the metadata to the temp inode of a copied regular file and links
 /// it to its destination name. If the plan says so, it fsyncs the inode first.
 ///
-/// Returns the destination `(dev, ino)`.
+/// Returns the destination `(dev, ino)`. If a step up to and including the
+/// link fails, the function removes the named temp file.
 fn finish_copy_blocking(plan: FinishCopy) -> Result<(u64, u64)> {
-    apply_regular_metadata(
-        plan.temp.as_fd(),
-        plan.effective,
-        plan.uid,
-        plan.gid,
-        plan.mode,
-        &plan.xattrs,
-    )?;
-    if plan.enable_fsync {
-        rustix::fs::fsync(plan.temp.as_fd())?;
-    }
-    if plan.remove_existing {
-        remove_dir_entry(plan.dir.as_fd(), &plan.name)?;
+    if let Err(e) = prepare_copy_blocking(&plan) {
+        remove_named_temp(plan.dir.as_fd(), &plan.kind);
+        return Err(e);
     }
     match &plan.kind {
         TempKind::Anonymous => {
@@ -1651,6 +1645,36 @@ fn finish_copy_blocking(plan: FinishCopy) -> Result<(u64, u64)> {
     }
     let st = rustix::fs::statat(plan.dir.as_fd(), &plan.name, AtFlags::SYMLINK_NOFOLLOW)?;
     Ok((st.st_dev, st.st_ino))
+}
+
+/// Applies the metadata to the temp inode of a copied regular file. If the plan
+/// says so, it then fsyncs the inode and removes the existing destination
+/// entry.
+fn prepare_copy_blocking(plan: &FinishCopy) -> Result<()> {
+    apply_regular_metadata(
+        plan.temp.as_fd(),
+        plan.effective,
+        plan.uid,
+        plan.gid,
+        plan.mode,
+        &plan.xattrs,
+    )?;
+    if plan.enable_fsync {
+        rustix::fs::fsync(plan.temp.as_fd())?;
+    }
+    if plan.remove_existing {
+        remove_dir_entry(plan.dir.as_fd(), &plan.name)?;
+    }
+    Ok(())
+}
+
+/// Removes the named temp file of a failed copy. An anonymous temp inode goes
+/// away when its fd closes, so it needs no removal. The function ignores an
+/// error of the removal, because the caller returns the first error.
+fn remove_named_temp(dir_fd: BorrowedFd<'_>, kind: &TempKind) {
+    if let TempKind::Named(tmp) = kind {
+        let _ = rustix::fs::unlinkat(dir_fd, tmp.as_str(), AtFlags::empty());
+    }
 }
 
 /// Applies the checkout-mode metadata of a regular file to its inode fd.
@@ -2350,5 +2374,39 @@ mod tests {
 
         finish_copy_blocking(named_none_plan(&scratch)).unwrap();
         assert_eq!(std::fs::read(scratch.path().join("dest")).unwrap(), b"NEW");
+    }
+
+    /// A failed metadata apply removes the named temp file. The plan keeps the
+    /// owner of the temp file, so the chown succeeds for each user. The xattr
+    /// name is longer than the 255-byte name limit of the kernel. The kernel
+    /// refuses it before it calls the file system, so the refusal is the same
+    /// on each file system and for each user.
+    #[test]
+    fn named_temp_removed_when_metadata_apply_fails() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let scratch = Scratch::new("co-named-meta-fail");
+        let mut plan = named_none_plan(&scratch);
+        let meta = std::fs::metadata(scratch.path().join(".ostrya-test-tmp")).unwrap();
+        plan.effective = CheckoutMode::None;
+        plan.uid = meta.uid();
+        plan.gid = meta.gid();
+        let mut name = format!("user.{}", "x".repeat(256)).into_bytes();
+        name.push(0);
+        plan.xattrs = Xattrs::new([(name, b"v".to_vec())]).unwrap();
+
+        let err = finish_copy_blocking(plan);
+        assert!(
+            matches!(&err, Err(Error::Io(e)) if e.raw_os_error() == Some(Errno::RANGE.raw_os_error())),
+            "the xattr apply fails with ERANGE, got {err:?}"
+        );
+        assert!(
+            !scratch.path().join(".ostrya-test-tmp").exists(),
+            "the named temp file is removed"
+        );
+        assert!(
+            !scratch.path().join("dest").exists(),
+            "no destination is written"
+        );
     }
 }

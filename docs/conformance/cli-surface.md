@@ -551,6 +551,48 @@ tool. The port extension has these rules:
   `--delete` removes the refs that they selected. `-A --create=@OWN:NAME`
   writes the local alias `NAME`.
 
+`refs --create` and `refs --delete` of the port read `[core]
+auto-update-summary` and its alias `commit-update-summary` by the rule of the
+tool on `commit` ("P2", `commit`). They read the two keys only after a run
+that writes or removes a ref or an alias under `refs/heads/` or
+`refs/mirrors/`. Then they write the summaries as `ostrya commit` does, with
+no new `ostree-metadata` commit, and with no `sign-summary` each write
+removes the old `summary.sig`, as in the tool. `--create` writes the
+summaries after the ref write, and does not compare the old value, so
+`--force` to the commit that NEWREF already names writes them, as in the
+tool. `--delete` writes them one time, after the last `PREFIX` that runs. A
+removal call counts if it removes the refs or fails with an I/O error. The
+ref store checks each ref before the first removal, so an error other than
+an I/O error comes before any removal, unless the tree changes out of band.
+After such a run, a value that is not a boolean makes the tool and the port
+exit 1, with the refs written or removed and no summary. A `--delete` that
+matches no ref writes no summary in the tool and in the port.
+`cli-behavior.md`, `refs`, "The summary update", records the tool. The two
+commands differ in these points:
+
+- A run that writes or removes remote refs alone, `refs --create=REMOTE:NAME`
+  and `refs --delete REMOTE:NAME`, writes `summary` in the tool. The port
+  writes none and reads neither key. No record observes the tool with
+  `auto-update-summary=yes` for these runs. The port exits 0.
+- An alias under `refs/heads/` whose target is under `refs/remotes/` is in no
+  summary of the port. A run that writes or removes such an alias writes the
+  summary again with no change, and removes `summary.sig`. No record
+  observes the tool for this case.
+- `refs --delete ALIAS` without `-A` removes the alias in the tool and writes
+  `summary`. The port refuses the alias, as the divergence of `refs --delete`
+  above states, and writes no summary.
+- The port signs the summary with the key groups that `sign-summary` of
+  `[ex-ostrya server]` names, and also writes the summary of each auth item
+  under `extensions/ostrya/summary/`, as on `commit`. The tool never signs
+  this summary.
+- If a `PREFIX` of `--delete` fails after an earlier `PREFIX` removed a ref
+  that a summary lists, the port prints the error line, writes the summary,
+  and exits 1. If the summary write fails too, its error line comes second.
+  No record observes the tool for this case.
+- `--delete ostree-metadata` in a repository with a collection id removes the
+  anchor ref, and the port then writes a summary with no anchor. No record
+  observes the tool for this case.
+
 Abbreviated checksum resolution is shared: a run of one to 63 lowercase hex
 characters names the one commit object whose checksum starts with it, wherever a
 revision is taken, and a prefix more than one commit carries reports `error:
@@ -2148,7 +2190,8 @@ at its current commit. `ostrya receive` and `ostrya serve` write a new
 
 `ostrya pull` and `ostrya pull-local` read the two keys by the same rule
 after a run that creates or moves a ref that is not a remote ref ("P2",
-`pull`).
+`pull`). `ostrya refs --create` and `ostrya refs --delete` read them by the
+same rule after a run that writes or removes such a ref ("P1", `refs`).
 `ostrya receive` and `ostrya serve` read the two keys by the rule of the
 tool. They refuse a value that is not a boolean in either one
 (`ostrya-config(1)`).

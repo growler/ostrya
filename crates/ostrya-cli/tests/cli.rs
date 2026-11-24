@@ -41766,6 +41766,519 @@ fn pull_local_keeps_the_ref_when_the_auto_summary_fails() {
     }
 }
 
+/// Creates an archive repository at `base/repo` with the branch `main` and
+/// `groups` in its config, then puts `core` in `[core]` and
+/// [`AUTO_MARKER`] in `summary.sig`. The commit of `main` reads no key.
+/// Returns the path of the repository and the commit of `main`.
+fn auto_refs_repo(base: &Path, core: &str, groups: &str) -> (PathBuf, String) {
+    std::fs::create_dir_all(base).unwrap();
+    let repo = auto_summary_repo(base, "", groups);
+    let main = auto_commit(&repo, &["-b", "main"]).ok().stdout_trimmed();
+    let config = config_text(&repo).replacen("[core]\n", &format!("[core]\n{core}"), 1);
+    std::fs::write(repo.join("config"), config).unwrap();
+    reset_auto_summary(&repo);
+    (repo, main)
+}
+
+/// Returns the collection map of the summary of `repo`, with the names of
+/// the refs of each id.
+fn summary_collection_names(repo: &Path) -> Vec<(String, Vec<String>)> {
+    let bytes = std::fs::read(repo.join("summary")).expect("summary exists");
+    ostrya::Summary::parse(&bytes)
+        .unwrap()
+        .collection_map()
+        .unwrap()
+        .into_iter()
+        .map(|(id, refs)| (id, refs.into_iter().map(|entry| entry.name).collect()))
+        .collect()
+}
+
+/// `refs --create=NEWREF` writes the ref and then the summary, which lists
+/// it. The write removes the old `summary.sig`. The alias
+/// `commit-update-summary=true` alone writes the summary too. With the key
+/// absent or false, the run writes no summary.
+#[test]
+fn refs_create_writes_the_auto_summary() {
+    let tmp = TmpDir::new("refs-auto-create");
+    let cases = [
+        ("auto-update-summary", "auto-update-summary=true\n", true),
+        (
+            "commit-update-summary",
+            "commit-update-summary=true\n",
+            true,
+        ),
+        ("absent", "", false),
+        ("false", "auto-update-summary=false\n", false),
+    ];
+    for (case, core, written) in cases {
+        let (repo, main) = auto_refs_repo(&tmp.path().join(case), core, "");
+        let run = ostrya_repo(&repo, &["refs", "--create=newref", "main"]);
+        run.ok();
+        assert!(run.stdout.is_empty(), "{case}");
+        assert!(run.stderr.is_empty(), "{case}");
+        assert_eq!(ref_file(&repo, "refs/heads/newref"), Some(main), "{case}");
+        if written {
+            assert_eq!(summary_ref_names(&repo), ["main", "newref"], "{case}");
+            assert!(!repo.join("summary.sig").exists(), "{case}");
+        } else {
+            assert_no_auto_summary(&repo, case);
+        }
+    }
+}
+
+/// `refs --force --create=NEWREF` to the commit that NEWREF already names
+/// writes the summary again.
+#[test]
+fn refs_create_with_force_to_the_same_commit_writes_the_auto_summary() {
+    let tmp = TmpDir::new("refs-auto-force");
+    let (repo, _main) = auto_refs_repo(tmp.path(), "auto-update-summary=true\n", "");
+    ostrya_repo(&repo, &["refs", "--create=newref", "main"]).ok();
+    reset_auto_summary(&repo);
+    let run = ostrya_repo(&repo, &["refs", "--force", "--create=newref", "main"]);
+    run.ok();
+    assert!(run.stderr.is_empty());
+    assert_eq!(summary_ref_names(&repo), ["main", "newref"]);
+    assert!(!repo.join("summary.sig").exists());
+}
+
+/// `refs -c --create=ID:NAME` and `refs --create=@ID:NAME` write
+/// `refs/mirrors/ID/NAME`, and the summary lists it in the collection map.
+/// With the collection id of the repository, `-c --create=OWN:NAME` writes
+/// the local ref NAME, and the summary lists it. The run writes no new
+/// `ostree-metadata` commit.
+#[test]
+fn refs_create_of_a_collection_ref_writes_the_auto_summary() {
+    let tmp = TmpDir::new("refs-auto-create-collection");
+    let (repo, _main) = auto_refs_repo(tmp.path(), "auto-update-summary=true\n", "");
+    ostrya_repo(
+        &repo,
+        &["refs", "-c", "--create=org.example.Other:cref", "main"],
+    )
+    .ok();
+    assert!(repo.join("refs/mirrors/org.example.Other/cref").is_file());
+    assert_eq!(summary_ref_names(&repo), ["main"]);
+    assert_eq!(
+        summary_collection_names(&repo),
+        [("org.example.Other".to_owned(), vec!["cref".to_owned()])]
+    );
+    assert!(!repo.join("summary.sig").exists());
+
+    reset_auto_summary(&repo);
+    ostrya_repo(&repo, &["refs", "--create=@org.example.Other:x", "main"]).ok();
+    assert!(repo.join("refs/mirrors/org.example.Other/x").is_file());
+    assert_eq!(
+        summary_collection_names(&repo),
+        [(
+            "org.example.Other".to_owned(),
+            vec!["cref".to_owned(), "x".to_owned()]
+        )]
+    );
+    assert!(!repo.join("summary.sig").exists());
+
+    let tmp = TmpDir::new("refs-auto-create-own");
+    let (repo, main) = auto_refs_repo(
+        tmp.path(),
+        &format!("auto-update-summary=true\ncollection-id={OWN_ID}\n"),
+        "",
+    );
+    ostrya_repo(&repo, &["summary", "-u"]).ok();
+    let anchor = ref_file(&repo, "refs/heads/ostree-metadata").expect("summary -u wrote it");
+    reset_auto_summary(&repo);
+    let run = ostrya_repo(
+        &repo,
+        &["refs", "-c", &format!("--create={OWN_ID}:n"), "main"],
+    );
+    run.ok();
+    assert!(run.stderr.is_empty());
+    assert_eq!(ref_file(&repo, "refs/heads/n"), Some(main));
+    assert_eq!(ref_file(&repo, "refs/heads/ostree-metadata"), Some(anchor));
+    assert_eq!(summary_ref_names(&repo), ["main", "n", "ostree-metadata"]);
+    assert!(!repo.join("summary.sig").exists());
+}
+
+/// `refs --create=@OWN:NAME` without `-c`, where OWN is the collection id of
+/// the repository, writes the local ref NAME and then the summary, which
+/// lists it.
+#[test]
+fn refs_create_of_an_own_collection_ref_writes_the_auto_summary() {
+    let tmp = TmpDir::new("refs-auto-create-own-at");
+    let (repo, main) = auto_refs_repo(
+        tmp.path(),
+        &format!("auto-update-summary=true\ncollection-id={OWN_ID}\n"),
+        "",
+    );
+    let run = ostrya_repo(&repo, &["refs", &format!("--create=@{OWN_ID}:n"), "main"]);
+    run.ok();
+    assert!(run.stderr.is_empty());
+    assert_eq!(ref_file(&repo, "refs/heads/n"), Some(main));
+    assert!(!repo.join(format!("refs/mirrors/{OWN_ID}")).exists());
+    assert_eq!(summary_ref_names(&repo), ["main", "n"]);
+    assert!(!repo.join("summary.sig").exists());
+}
+
+/// `refs -A --create=ALIAS` writes the alias and then the summary, which
+/// lists it. An alias whose target is a remote ref counts too: the run
+/// writes the summary, which leaves the alias out.
+#[test]
+fn refs_create_of_an_alias_writes_the_auto_summary() {
+    let tmp = TmpDir::new("refs-auto-create-alias");
+    let (repo, _main) = auto_refs_repo(tmp.path(), "auto-update-summary=true\n", "");
+    let run = ostrya_repo(&repo, &["refs", "-A", "--create=al", "main"]);
+    run.ok();
+    assert!(run.stderr.is_empty());
+    assert_eq!(summary_ref_names(&repo), ["al", "main"]);
+    assert!(!repo.join("summary.sig").exists());
+
+    ostrya_repo(&repo, &["refs", "--create=origin:rr", "main"]).ok();
+    reset_auto_summary(&repo);
+    let run = ostrya_repo(&repo, &["refs", "-A", "--create=ral", "origin:rr"]);
+    run.ok();
+    assert!(run.stderr.is_empty());
+    assert!(
+        repo.join("refs/heads/ral")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(summary_ref_names(&repo), ["al", "main"]);
+    assert!(!repo.join("summary.sig").exists());
+}
+
+/// `refs --create=REMOTE:NAME` writes a remote ref alone, which no summary
+/// lists, so the run writes no summary. With `auto-update-summary=yes`, the
+/// run reads no key and exits 0.
+#[test]
+fn refs_create_of_a_remote_ref_writes_no_auto_summary() {
+    let tmp = TmpDir::new("refs-auto-create-remote");
+    for value in ["true", "yes"] {
+        let (repo, main) = auto_refs_repo(
+            &tmp.path().join(value),
+            &format!("auto-update-summary={value}\n"),
+            "",
+        );
+        let run = ostrya_repo(&repo, &["refs", "--create=origin:rr", "main"]);
+        run.ok();
+        assert!(run.stderr.is_empty(), "{value}");
+        assert_eq!(
+            ref_file(&repo, "refs/remotes/origin/rr"),
+            Some(main),
+            "{value}"
+        );
+        assert_no_auto_summary(&repo, value);
+    }
+}
+
+/// `refs --delete NAME` removes the ref and then writes the summary, which
+/// lists the refs that stay.
+#[test]
+fn refs_delete_writes_the_auto_summary() {
+    let tmp = TmpDir::new("refs-auto-delete");
+    let (repo, _main) = auto_refs_repo(tmp.path(), "auto-update-summary=true\n", "");
+    ostrya_repo(&repo, &["refs", "--create=newref", "main"]).ok();
+    reset_auto_summary(&repo);
+    let run = ostrya_repo(&repo, &["refs", "--delete", "newref"]);
+    run.ok();
+    assert!(run.stdout.is_empty());
+    assert!(run.stderr.is_empty());
+    assert!(!repo.join("refs/heads/newref").exists());
+    assert_eq!(summary_ref_names(&repo), ["main"]);
+    assert!(!repo.join("summary.sig").exists());
+}
+
+/// `refs -A --delete ALIAS` removes the alias and then writes the summary.
+#[test]
+fn refs_delete_of_an_alias_writes_the_auto_summary() {
+    let tmp = TmpDir::new("refs-auto-delete-alias");
+    let (repo, _main) = auto_refs_repo(tmp.path(), "auto-update-summary=true\n", "");
+    ostrya_repo(&repo, &["refs", "-A", "--create=al", "main"]).ok();
+    reset_auto_summary(&repo);
+    let run = ostrya_repo(&repo, &["refs", "-A", "--delete", "al"]);
+    run.ok();
+    assert!(run.stderr.is_empty());
+    assert!(repo.join("refs/heads/al").symlink_metadata().is_err());
+    assert_eq!(summary_ref_names(&repo), ["main"]);
+    assert!(!repo.join("summary.sig").exists());
+}
+
+/// `refs -A --delete NAME`, where NAME is a ref file and no alias, removes
+/// the ref and then writes the summary.
+#[test]
+fn refs_delete_of_a_ref_file_with_the_alias_option_writes_the_auto_summary() {
+    let tmp = TmpDir::new("refs-auto-delete-alias-option");
+    let (repo, _main) = auto_refs_repo(tmp.path(), "auto-update-summary=true\n", "");
+    ostrya_repo(&repo, &["refs", "--create=newref", "main"]).ok();
+    reset_auto_summary(&repo);
+    let run = ostrya_repo(&repo, &["refs", "-A", "--delete", "newref"]);
+    run.ok();
+    assert!(run.stderr.is_empty());
+    assert!(!repo.join("refs/heads/newref").exists());
+    assert_eq!(summary_ref_names(&repo), ["main"]);
+    assert!(!repo.join("summary.sig").exists());
+}
+
+/// `refs -c --delete OWN`, where OWN is the collection id of the repository,
+/// removes the refs under `refs/heads/` and then writes the summary. The
+/// remote ref stays.
+#[test]
+fn refs_delete_of_the_own_collection_writes_the_auto_summary() {
+    let tmp = TmpDir::new("refs-auto-delete-own");
+    let (repo, main) = auto_refs_repo(
+        tmp.path(),
+        &format!("auto-update-summary=true\ncollection-id={OWN_ID}\n"),
+        "",
+    );
+    ostrya_repo(&repo, &["refs", "--create=origin:rr", "main"]).ok();
+    reset_auto_summary(&repo);
+    let run = ostrya_repo(&repo, &["refs", "-c", "--delete", OWN_ID]);
+    run.ok();
+    assert!(run.stderr.is_empty());
+    assert!(!repo.join("refs/heads/main").exists());
+    assert_eq!(ref_file(&repo, "refs/remotes/origin/rr"), Some(main));
+    assert!(summary_ref_names(&repo).is_empty());
+    assert!(!repo.join("summary.sig").exists());
+}
+
+/// `refs -c --delete ID` and `refs --delete @ID:NAME` remove collection refs
+/// and then write the summary.
+#[test]
+fn refs_delete_of_a_collection_writes_the_auto_summary() {
+    let tmp = TmpDir::new("refs-auto-delete-collection");
+    let (repo, _main) = auto_refs_repo(tmp.path(), "auto-update-summary=true\n", "");
+    ostrya_repo(&repo, &["refs", "--create=@org.example.Other:cref", "main"]).ok();
+    ostrya_repo(&repo, &["refs", "--create=@org.example.Other:x", "main"]).ok();
+
+    reset_auto_summary(&repo);
+    let run = ostrya_repo(&repo, &["refs", "--delete", "@org.example.Other:cref"]);
+    run.ok();
+    assert!(run.stderr.is_empty());
+    assert!(!repo.join("refs/mirrors/org.example.Other/cref").exists());
+    assert_eq!(
+        summary_collection_names(&repo),
+        [("org.example.Other".to_owned(), vec!["x".to_owned()])]
+    );
+    assert!(!repo.join("summary.sig").exists());
+
+    reset_auto_summary(&repo);
+    let run = ostrya_repo(&repo, &["refs", "-c", "--delete", "org.example.Other"]);
+    run.ok();
+    assert!(run.stderr.is_empty());
+    assert!(!repo.join("refs/mirrors/org.example.Other/x").exists());
+    assert_eq!(summary_ref_names(&repo), ["main"]);
+    assert!(summary_collection_names(&repo).is_empty());
+    assert!(!repo.join("summary.sig").exists());
+}
+
+/// `refs --delete PREFIX` that matches no ref writes no summary. The run
+/// reads no key, so with `auto-update-summary=yes` it exits 0.
+#[test]
+fn refs_delete_of_no_ref_writes_no_auto_summary() {
+    let tmp = TmpDir::new("refs-auto-delete-none");
+    for value in ["true", "yes"] {
+        let (repo, _main) = auto_refs_repo(
+            &tmp.path().join(value),
+            &format!("auto-update-summary={value}\n"),
+            "",
+        );
+        let run = ostrya_repo(&repo, &["refs", "--delete", "nosuch"]);
+        run.ok();
+        assert!(run.stderr.is_empty(), "{value}");
+        assert_no_auto_summary(&repo, value);
+    }
+}
+
+/// `refs --delete REMOTE:NAME` and `refs -A --delete REMOTE:NAME` remove a
+/// remote ref alone, which no summary lists, so the run writes no summary.
+/// With `auto-update-summary=yes`, the run reads no key and exits 0.
+#[test]
+fn refs_delete_of_remote_refs_writes_no_auto_summary() {
+    let tmp = TmpDir::new("refs-auto-delete-remote");
+    for value in ["true", "yes"] {
+        for alias in [false, true] {
+            let case = format!("{value} -A={alias}");
+            let (repo, _main) = auto_refs_repo(
+                &tmp.path().join(format!("{value}-{alias}")),
+                &format!("auto-update-summary={value}\n"),
+                "",
+            );
+            ostrya_repo(&repo, &["refs", "--create=origin:rr", "main"]).ok();
+            let mut args = vec!["refs"];
+            if alias {
+                args.push("-A");
+            }
+            args.extend_from_slice(&["--delete", "origin:rr"]);
+            let run = ostrya_repo(&repo, &args);
+            run.ok();
+            assert!(run.stderr.is_empty(), "{case}");
+            assert!(!repo.join("refs/remotes/origin/rr").exists(), "{case}");
+            assert_no_auto_summary(&repo, &case);
+        }
+    }
+}
+
+/// A `refs --delete` whose later PREFIX fails after an earlier PREFIX
+/// removed a ref that a summary lists: the command prints one `error:`
+/// line, writes the summary of the refs that stay, and exits 1. The cases
+/// are the alias guard, a whole-remote PREFIX, and a collection PREFIX of
+/// `-A`. If the earlier PREFIX removed a remote ref alone, the run writes no
+/// summary and reads no key.
+#[test]
+fn refs_delete_writes_the_auto_summary_after_a_later_prefix_fails() {
+    let tmp = TmpDir::new("refs-auto-delete-later-failure");
+    let cases: [(&str, &[&str], &str, &[&str]); 3] = [
+        (
+            "guard",
+            &["--delete", "gone", "guarded"],
+            "error: Ref 'guarded' has an active alias: 'al'\n",
+            &["al", "guarded", "main"],
+        ),
+        (
+            "whole remote",
+            &["--delete", "gone", "origin:"],
+            "error: Invalid refspec origin:\n",
+            &["al", "guarded", "main"],
+        ),
+        (
+            "-A collection",
+            &["-A", "--delete", "al", "@org.example.X:a"],
+            "error: -A takes no collection prefix: @org.example.X:a\n",
+            &["gone", "guarded", "main"],
+        ),
+    ];
+    for (case, args, stderr, names) in cases {
+        let (repo, _main) =
+            auto_refs_repo(&tmp.path().join(case), "auto-update-summary=true\n", "");
+        for create in [
+            &["refs", "--create=gone", "main"][..],
+            &["refs", "--create=guarded", "main"],
+            &["refs", "-A", "--create=al", "guarded"],
+            &["refs", "--create=origin:rr", "main"],
+        ] {
+            ostrya_repo(&repo, create).ok();
+        }
+        reset_auto_summary(&repo);
+        let mut all = vec!["refs"];
+        all.extend_from_slice(args);
+        let run = ostrya_repo(&repo, &all);
+        assert_eq!(run.status.code(), Some(1), "{case}");
+        assert!(run.stdout.is_empty(), "{case}");
+        assert_eq!(String::from_utf8_lossy(&run.stderr), stderr, "{case}");
+        assert_eq!(summary_ref_names(&repo), names, "{case}");
+        assert!(!repo.join("summary.sig").exists(), "{case}");
+    }
+
+    for value in ["true", "yes"] {
+        let (repo, _main) = auto_refs_repo(&tmp.path().join(format!("remote-{value}")), "", "");
+        for create in [
+            &["refs", "--create=guarded", "main"][..],
+            &["refs", "-A", "--create=al", "guarded"],
+            &["refs", "--create=origin:rr", "main"],
+        ] {
+            ostrya_repo(&repo, create).ok();
+        }
+        let config = config_text(&repo).replacen(
+            "[core]\n",
+            &format!("[core]\nauto-update-summary={value}\n"),
+            1,
+        );
+        std::fs::write(repo.join("config"), config).unwrap();
+        let run = ostrya_repo(&repo, &["refs", "--delete", "origin:rr", "guarded"]);
+        assert_eq!(run.status.code(), Some(1), "{value}");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            "error: Ref 'guarded' has an active alias: 'al'\n",
+            "{value}"
+        );
+        assert!(!repo.join("refs/remotes/origin/rr").exists(), "{value}");
+        assert_no_auto_summary(&repo, value);
+    }
+}
+
+/// `refs --create` and `refs --delete` with `auto-update-summary=yes` or
+/// with a key group of `sign-summary` whose key file is absent: the command
+/// prints one `error:` line and exits 1. The ref stays as the run wrote or
+/// removed it, and the summary files do not change.
+#[test]
+fn refs_keeps_the_refs_when_the_auto_summary_fails() {
+    let tmp = TmpDir::new("refs-auto-fails");
+    let absent = tmp.path().join("absent.ed25519");
+    let groups = format!(
+        "[ex-ostrya server]\nsign-summary=a\n\
+         [ex-ostrya key \"a\"]\ntype=ed25519\nsecret-key-file={}\n",
+        absent.display()
+    );
+    let cases = [
+        ("yes", "auto-update-summary=yes\n", String::new()),
+        ("absent key", "auto-update-summary=true\n", groups),
+    ];
+    for (case, core, groups) in cases {
+        let (repo, main) = auto_refs_repo(&tmp.path().join(case), core, &groups);
+        let prefix = if case == "yes" {
+            "error: keyfile: value 'yes' for core.auto-update-summary is not a boolean"
+        } else {
+            "error: signature: [ex-ostrya key \"a\"]: "
+        };
+
+        let run = ostrya_repo(&repo, &["refs", "--create=newref", "main"]);
+        assert_eq!(run.status.code(), Some(1), "{case}: create");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(stderr.lines().count(), 1, "{case}: {stderr}");
+        assert!(stderr.starts_with(prefix), "{case}: {stderr}");
+        assert_eq!(
+            ref_file(&repo, "refs/heads/newref").as_ref(),
+            Some(&main),
+            "{case}"
+        );
+        assert_no_auto_summary(&repo, case);
+
+        let run = ostrya_repo(&repo, &["refs", "--delete", "newref"]);
+        assert_eq!(run.status.code(), Some(1), "{case}: delete");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(stderr.lines().count(), 1, "{case}: {stderr}");
+        assert!(stderr.starts_with(prefix), "{case}: {stderr}");
+        assert!(!repo.join("refs/heads/newref").exists(), "{case}");
+        assert_no_auto_summary(&repo, case);
+    }
+}
+
+/// A `refs --delete` whose later PREFIX fails at the alias guard after an
+/// earlier PREFIX removed a ref, with a failed summary write: the command
+/// prints the line of the guard and then the line of the summary, and exits
+/// 1. The earlier ref stays removed.
+#[test]
+fn refs_delete_prints_both_errors_when_the_auto_summary_fails() {
+    let tmp = TmpDir::new("refs-auto-delete-both");
+    let absent = tmp.path().join("absent.ed25519");
+    let groups = format!(
+        "[ex-ostrya server]\nsign-summary=a\n\
+         [ex-ostrya key \"a\"]\ntype=ed25519\nsecret-key-file={}\n",
+        absent.display()
+    );
+    let (repo, _main) = auto_refs_repo(tmp.path(), "", &groups);
+    for create in [
+        &["refs", "--create=gone", "main"][..],
+        &["refs", "--create=guarded", "main"],
+        &["refs", "-A", "--create=al", "guarded"],
+    ] {
+        ostrya_repo(&repo, create).ok();
+    }
+    let config = config_text(&repo).replacen("[core]\n", "[core]\nauto-update-summary=true\n", 1);
+    std::fs::write(repo.join("config"), config).unwrap();
+    let run = ostrya_repo(&repo, &["refs", "--delete", "gone", "guarded"]);
+    assert_eq!(run.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 2, "{stderr}");
+    assert_eq!(lines[0], "error: Ref 'guarded' has an active alias: 'al'");
+    assert!(
+        lines[1].starts_with("error: signature: [ex-ostrya key \"a\"]: "),
+        "{stderr}"
+    );
+    assert!(!repo.join("refs/heads/gone").exists());
+    assert!(repo.join("refs/heads/guarded").is_file());
+    assert_no_auto_summary(&repo, "guard and absent key");
+}
+
 /// The report reads `ostree.summary.collection-map` as the `ostree` command
 /// reads it:
 ///

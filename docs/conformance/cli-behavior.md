@@ -4189,6 +4189,52 @@ A prefix can match more than one guarded ref, or more than one alias can name
 one matched ref. The message then names one pair. `cli-surface.md`, "P1",
 `refs`, records the pair that each side names.
 
+#### The summary update
+
+These records come from libostree 2026.4, in an `archive` repository with the
+ref `main`, the remote `origin`, and a `summary` from `ostree summary -u`.
+Before each run, the probe writes marker bytes into `summary.sig`.
+
+With `[core] auto-update-summary=true`, each run exits 0:
+
+- `refs --create=newref main` writes `summary`.
+- `refs --force --create=newref main`, where `newref` already points at the
+  commit, writes `summary`.
+- `refs --create=origin:rr main`, a remote ref, writes `summary`.
+- `refs -A --create=al main`, an alias, writes `summary`.
+- `refs --delete newref` writes `summary`.
+- `refs --delete nosuch`, which matches no ref, writes no `summary`.
+- `refs --delete al` and `refs -A --delete al2` remove the link and write
+  `summary`. `al` and `al2` are aliases of `main` from `refs -A --create=al
+  main` and `refs -A --create=al2 main`.
+- `refs --delete origin:rr`, a remote ref, removes the ref and writes
+  `summary`.
+
+Each run that writes `summary` removes the existing `summary.sig`. Each run that
+writes no `summary` keeps it. The tool reads no key that names a signing key,
+so it never signs this summary.
+
+With `[core] collection-id=org.example.Dst`, the results are the same, and no
+run writes a new `ostree-metadata` commit. `refs/heads/ostree-metadata` stays
+at the commit of the first `ostree summary -u`, and `ostree log
+ostree-metadata` shows one commit. The summary that the tool writes lists
+`(org.example.Dst, ostree-metadata)` at that commit. It lists no ref under
+`refs/remotes/`.
+
+With the alias alone, `[core] commit-update-summary=true`,
+`refs --create=newref main` writes `summary` and removes the local
+`summary.sig`, as `auto-update-summary=true` does.
+
+With `[core] auto-update-summary=yes`, each run writes its ref, prints
+`error: Key file contains key “auto-update-summary” which has a value that
+cannot be interpreted.`, and exits 1:
+
+- `refs --create=newref main` writes `refs/heads/newref`.
+- `refs --delete newref` removes it.
+
+These runs write no `summary` and keep `summary.sig`. `cli-surface.md`, "P1",
+`refs`, records the port side.
+
 #### Symlinks under refs
 
 A dangling alias is a symlink under `refs/` whose target ref does not exist.

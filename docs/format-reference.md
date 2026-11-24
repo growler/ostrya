@@ -1614,10 +1614,14 @@ the receive policies, `ReceivePolicies::from_config`, and
 `Repo::regenerate_summaries_if_configured` after a run that writes a tag or a
 branch that is not a remote ref. `ostrya pull` and `ostrya pull-local` call it
 after a run that creates or moves a ref that is not a remote ref, except
-`ostrya pull --mirror` with no ref. A run that writes no such ref does not
-read the two keys.
+`ostrya pull --mirror` with no ref. `ostrya refs --create` and `ostrya refs
+--delete` call it after a run that writes or removes a ref that is not a
+remote ref. For `ostrya refs --delete`, a removal that fails with an I/O
+error counts as a removal of the ref. A run that writes or removes no such
+ref does not read the two keys.
 `conformance/cli-surface.md`, "P2", `commit` and `pull`, records the effect
-of the two keys on a commit and on a pull.
+of the two keys on a commit and on a pull, and "P1", `refs`, records it on
+`refs`.
 
 Observed behavior: the tool reads and writes `config` by these rules.
 
@@ -6567,7 +6571,10 @@ and `Repo::pull_local_with_report`, and from
 `CollectionPullStats::changed_refs` of a pull with `--collection`. With
 `auto-update-summary` and its alias `commit-update-summary` false or absent,
 a pull with no `--collection` calls `Repo::pull` or `Repo::pull_local`,
-which read no old ref.
+which read no old ref. `ostrya refs --create` and `ostrya refs --delete` write
+the same summaries in the same way after a run that writes or removes a ref
+that is not a remote ref. An alias under `refs/heads/` or `refs/mirrors/` is
+such a ref. They compare no old ref.
 
 A mirror pull that writes `summary` writes no file under
 `extensions/ostrya/summary/`. It writes `summary` and `summary.sig` through

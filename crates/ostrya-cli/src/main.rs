@@ -253,6 +253,22 @@ enum Command {
     /// the output groups the rows by PREFIX in the order given. -A lists the
     /// aliases, and -c lists the collection refs. --create and --delete write
     /// the refs and print nothing. --create wins over --delete.
+    ///
+    /// After --create writes a ref that is not a remote ref, or after --delete
+    /// removes such a ref, the command reads `[core] auto-update-summary` and
+    /// its alias `commit-update-summary`. If one of the two is true, the
+    /// command writes the root summary and each summary of an item again. The
+    /// key groups of `sign-summary` of `[ex-ostrya server]` sign them. The
+    /// command writes no new `ostree-metadata` commit. An alias under
+    /// `refs/heads/` or `refs/mirrors/` is such a ref. With --force, --create
+    /// writes the summaries also if NEWREF already points at the commit. A
+    /// removal that fails with an I/O error counts as a removal of the ref. A
+    /// run that writes or removes no such ref does not read the two keys. If
+    /// a PREFIX of --delete fails after an earlier PREFIX removed such a ref,
+    /// the command prints the error, writes the summaries, and exits 1. After
+    /// a run that writes or removes such a ref, a value that is not a boolean,
+    /// or a failed write, makes the command exit 1. The refs stay as the run
+    /// left them.
     Refs(RefsArgs),
     /// Print the commit checksum that a revision names.
     ///
@@ -12280,9 +12296,20 @@ async fn export(repo: Repo, name: &str, args: ExportArgs) -> Result<()> {
 ///
 /// `--create` wins over `--delete`, and `--collections` wins over `--alias`.
 /// This is the precedence of the `ostree` command.
+///
+/// After `--create` writes a ref that a summary lists, the command writes the
+/// summaries again if `[core] auto-update-summary` is true. A remote ref
+/// writes no summary. `--delete` follows the rule of [`refs_delete`].
 async fn refs(repo: Repo, args: RefsArgs) -> Result<()> {
     if let Some(newref) = args.create.as_deref() {
-        refs_create(&repo, newref, &args).await
+        // The write comes first, and then the summary. A failed summary exits
+        // 1, and the ref stays. The command does not compare the old value,
+        // so a `--force` write to the same commit writes the summary too.
+        let written = refs_create(&repo, newref, &args).await?;
+        if summary_lists(&written) {
+            update_summary_if_configured(&repo).await?;
+        }
+        Ok(())
     } else if args.delete {
         refs_delete(&repo, &args).await
     } else if args.collections {
@@ -12294,11 +12321,12 @@ async fn refs(repo: Repo, args: RefsArgs) -> Result<()> {
     }
 }
 
-/// Points a new ref, collection ref, or alias at the revision of PREFIX.
+/// Points a new ref, collection ref, or alias at the revision of PREFIX, and
+/// returns the written ref.
 ///
 /// The command line must give exactly one PREFIX. `-c` wins over `-A`, as in
 /// a listing.
-async fn refs_create(repo: &Repo, newref: &str, args: &RefsArgs) -> Result<()> {
+async fn refs_create(repo: &Repo, newref: &str, args: &RefsArgs) -> Result<Ref> {
     let existing = match args.prefix.len() {
         1 => args.prefix[0].as_str(),
         0 => exit_error("You must specify a revision when creating a new ref"),
@@ -12366,16 +12394,19 @@ async fn refs_create(repo: &Repo, newref: &str, args: &RefsArgs) -> Result<()> {
             ));
         }
         // Both names parsed as refs at the checks above.
-        return repo
-            .set_ref_alias_immediate(&newref.parse::<Ref>()?, &existing.parse::<Ref>()?)
-            .await;
+        let alias = newref.parse::<Ref>()?;
+        repo.set_ref_alias_immediate(&alias, &existing.parse::<Ref>()?)
+            .await?;
+        return Ok(alias);
     }
     let commit = resolve(repo, existing).await?;
-    repo.set_ref_immediate(&newref.parse::<Ref>()?, Some(&commit))
-        .await
+    let written = newref.parse::<Ref>()?;
+    repo.set_ref_immediate(&written, Some(&commit)).await?;
+    Ok(written)
 }
 
-/// Writes a collection ref for `-c` from a `<collection-id>:<ref>` NEWREF.
+/// Writes a collection ref for `-c` from a `<collection-id>:<ref>` NEWREF, and
+/// returns the written ref.
 ///
 /// The pair names `refs/mirrors/<collection-id>/<ref>`, or `refs/heads/<ref>`
 /// if `<collection-id>` is the `collection-id` of the repository. The steps
@@ -12388,7 +12419,7 @@ async fn refs_create(repo: &Repo, newref: &str, args: &RefsArgs) -> Result<()> {
 /// The ref-name check of each NEWREF refuses an empty half one step earlier.
 /// If NEWREF holds no `:`, it names no ref. The full argument is then read as
 /// the collection id, and if that id is valid, the missing name is reported.
-async fn refs_create_collection(repo: &Repo, newref: &str, existing: &str) -> Result<()> {
+async fn refs_create_collection(repo: &Repo, newref: &str, existing: &str) -> Result<Ref> {
     let pair = match newref.split_once(':') {
         // A second `:` gets the message for the pair at this step. A `^` never
         // reaches this step, because the ref-name rule refuses it earlier.
@@ -12407,8 +12438,9 @@ async fn refs_create_collection(repo: &Repo, newref: &str, existing: &str) -> Re
     if !ostrya::is_valid_collection_id(collection_id) {
         exit_error(&format!("Invalid collection ID {collection_id}"));
     }
-    repo.set_ref_immediate(&Ref::collection(collection_id, ref_name), Some(&commit))
-        .await
+    let written = Ref::collection(collection_id, ref_name);
+    repo.set_ref_immediate(&written, Some(&commit)).await?;
+    Ok(written)
 }
 
 /// Returns the local name NAME of `@OWN:NAME`, where OWN is the
@@ -12574,10 +12606,77 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// An alias under `refs/mirrors` comes from a write of the library or from an
 /// out-of-band write. The `ostrya` command writes none. The `ostree` command
 /// removes both aliases. This is a recorded divergence.
+///
+/// # Summary
+///
+/// After the last prefix that runs, the command writes the summaries again if
+/// a prefix removed a ref that a summary lists and `[core]
+/// auto-update-summary` is true. A ref or an alias under `refs/heads/` or
+/// `refs/mirrors/` counts. A remote ref does not count. A removal call counts
+/// if it returns `Ok` or [`Error::Io`]. The ref store checks each ref before
+/// the first removal, so an error other than an `Io` error comes before any
+/// removal, unless the tree changes out of band. An `Io` error can come after
+/// a removal.
+///
+/// If a prefix fails after an earlier prefix removed such a ref, the command
+/// prints the error line, writes the summaries, and exits 1. If the summary
+/// write fails too, its error line comes second. The refs that the run
+/// removed stay removed.
 async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
     if args.prefix.is_empty() {
         exit_error("At least one PREFIX is required when deleting refs");
     }
+    let mut listed = false;
+    let outcome = delete_prefixes(repo, args, &mut listed).await;
+    match &outcome {
+        Err(DeleteFailure::Error(err)) => eprintln!("error: {}", error_line(err)),
+        Err(DeleteFailure::Refusal(text)) => eprintln!("error: {text}"),
+        Ok(()) => {}
+    }
+    let summary = if listed {
+        update_summary_if_configured(repo).await
+    } else {
+        Ok(())
+    };
+    if outcome.is_err() {
+        if let Err(err) = &summary {
+            eprintln!("error: {}", error_line(err));
+        }
+        exit_process(1);
+    }
+    summary
+}
+
+/// The failure of a `refs --delete` prefix.
+enum DeleteFailure {
+    /// An error of the library.
+    Error(Error),
+    /// A refusal of the command, with the text of its `error:` line.
+    Refusal(String),
+}
+
+impl From<Error> for DeleteFailure {
+    fn from(err: Error) -> Self {
+        Self::Error(err)
+    }
+}
+
+/// Returns `true` if a removal call that gave `result` can have removed a
+/// ref. The ref store checks each ref before the first removal, so only an
+/// [`Error::Io`] comes after it, unless the tree changes out of band.
+fn removal_counts(result: &Result<()>) -> bool {
+    matches!(result, Ok(()) | Err(Error::Io(_)))
+}
+
+/// Removes the refs that each prefix of [`refs_delete`] matches.
+///
+/// `listed` becomes `true` when a removal call that counts by
+/// [`removal_counts`] names a ref that a summary lists.
+async fn delete_prefixes(
+    repo: &Repo,
+    args: &RefsArgs,
+    listed: &mut bool,
+) -> std::result::Result<(), DeleteFailure> {
     if args.collections {
         // An id that is equal to the `collection-id` of the repository removes
         // only the refs under `refs/heads`: the listing holds no mirror ref of
@@ -12603,13 +12702,15 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
         // ref-name rule, so a name with `:` fails. A mirror ref takes the
         // collection-id rule and the ref-name rule. An alias is refused, local
         // or mirror: only `-A --delete` removes an alias.
-        return repo.remove_refs_immediate(&removed).await;
+        let result = repo.remove_refs_immediate(&removed).await;
+        *listed = *listed || (removal_counts(&result) && removed.iter().any(summary_lists));
+        return result.map_err(DeleteFailure::from);
     }
-    let listed = listed_aliases(repo.list_ref_aliases().await?);
-    let mut aliases = active_aliases(&listed);
+    let all_aliases = listed_aliases(repo.list_ref_aliases().await?);
+    let mut aliases = active_aliases(&all_aliases);
     // All aliases, local and remote. A `-A` prefix filters this set, and a
     // `-A --delete` removes from it.
-    let mut alias_names: Vec<String> = listed.into_iter().map(|(name, _)| name).collect();
+    let mut alias_names: Vec<String> = all_aliases.into_iter().map(|(name, _)| name).collect();
     let own = repo.config().collection_id();
     let mut all = if !args.alias && needs_all_refs(&args.prefix, own) {
         all_refs(repo).await?
@@ -12618,8 +12719,10 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
     };
     for given in prefixes(&args.prefix) {
         let (prefix, local_only) = own_prefix(given, own);
-        if args.alias {
-            refuse_collection_alias_prefix(prefix);
+        if args.alias
+            && let Some(refusal) = collection_alias_prefix_refusal(prefix)
+        {
+            return Err(DeleteFailure::Refusal(refusal));
         }
         check_prefix(repo, prefix).await?;
         let selected: Vec<String> = if args.alias {
@@ -12641,7 +12744,7 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
             && (whole_remote(given).is_some() || whole_collection(given))
             && !selected.is_empty()
         {
-            return Err(Error::InvalidRefspec(given.to_owned()));
+            return Err(Error::InvalidRefspec(given.to_owned()).into());
         }
         for refspec in &selected {
             // A ref under `refs/remotes` is removed also if an alias names it,
@@ -12654,7 +12757,9 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
                 continue;
             }
             if let Some((alias, _)) = aliases.iter().find(|(_, named)| named == refspec) {
-                exit_error(&format!("Ref '{refspec}' has an active alias: '{alias}'"));
+                return Err(DeleteFailure::Refusal(format!(
+                    "Ref '{refspec}' has an active alias: '{alias}'"
+                )));
             }
         }
         if prefix.and_then(collection_prefix).is_some() {
@@ -12666,32 +12771,38 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
                 .filter_map(|name| collection_prefix(name))
                 .map(|(id, name)| Ref::collection(id, name))
                 .collect();
-            repo.remove_refs_immediate(&removed).await?;
+            let result = repo.remove_refs_immediate(&removed).await;
+            *listed = *listed || (removal_counts(&result) && removed.iter().any(summary_lists));
+            result?;
         } else {
             // Each selected name parses before the first removal.
             let mut removed: Vec<Ref> = Vec::new();
             for refspec in &selected {
                 // A listed name is a refspec. A name with `@` from outside the
                 // port fails here, and it is not read as a collection ref.
-                let r = refspec.parse::<Ref>()?;
+                let r = refspec.parse::<Ref>().map_err(Error::from)?;
                 if matches!(r, Ref::Collection { .. }) {
-                    return Err(Error::InvalidRefspec(refspec.clone()));
+                    return Err(Error::InvalidRefspec(refspec.clone()).into());
                 }
                 removed.push(r);
             }
             if args.alias {
                 // A `-A` prefix that names a ref file exactly removes that ref.
                 for (refspec, r) in selected.iter().zip(&removed) {
-                    if alias_names.contains(refspec) {
-                        repo.remove_ref_alias_immediate(r).await?;
+                    let result = if alias_names.contains(refspec) {
+                        repo.remove_ref_alias_immediate(r).await
                     } else {
-                        repo.set_ref_immediate(r, None).await?;
-                    }
+                        repo.set_ref_immediate(r, None).await
+                    };
+                    *listed = *listed || (removal_counts(&result) && summary_lists(r));
+                    result?;
                 }
             } else {
                 // The ref store checks each ref before the first removal of
                 // the prefix, and refuses an alias.
-                repo.remove_refs_immediate(&removed).await?;
+                let result = repo.remove_refs_immediate(&removed).await;
+                *listed = *listed || (removal_counts(&result) && removed.iter().any(summary_lists));
+                result?;
             }
         }
         all.retain(|(name, _)| !selected.contains(name));
@@ -12821,7 +12932,9 @@ async fn refs_list_aliases(repo: &Repo, args: &RefsArgs) -> Result<()> {
     let own = repo.config().collection_id();
     for given in prefixes(&args.prefix) {
         let (prefix, local_only) = own_prefix(given, own);
-        refuse_collection_alias_prefix(prefix);
+        if let Some(refusal) = collection_alias_prefix_refusal(prefix) {
+            exit_error(&refusal);
+        }
         check_prefix(repo, prefix).await?;
         if let Some(prefix) = prefix
             && let Some(commit) = resolve_ref_name(repo, prefix).await?
@@ -12907,13 +13020,13 @@ fn own_prefix<'a>(prefix: Option<&'a str>, own: Option<&str>) -> (Option<&'a str
     }
 }
 
-/// Refuses a PREFIX `@X:` or `@X:PREFIX` of `-A`. An alias is a local ref, so
-/// a collection ref of another id is no alias. [`own_prefix`] read the PREFIX
-/// before the call.
-fn refuse_collection_alias_prefix(prefix: Option<&str>) {
-    if let Some(prefix) = prefix.filter(|prefix| collection_prefix(prefix).is_some()) {
-        exit_error(&format!("-A takes no collection prefix: {prefix}"));
-    }
+/// Returns the refusal text of a PREFIX `@X:` or `@X:PREFIX` of `-A`, or
+/// `None` for each other PREFIX. An alias is a local ref, so a collection ref
+/// of another id is no alias. [`own_prefix`] read the PREFIX before the call.
+fn collection_alias_prefix_refusal(prefix: Option<&str>) -> Option<String> {
+    prefix
+        .filter(|prefix| collection_prefix(prefix).is_some())
+        .map(|prefix| format!("-A takes no collection prefix: {prefix}"))
 }
 
 /// Returns the refs that a PREFIX selects, as `(name, commit)` pairs.

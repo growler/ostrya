@@ -9,6 +9,8 @@ ostrya refs [OPTIONS] [PREFIX]...
 List, create, or delete refs.
 .PP
 Without an option, the command prints the local refs and the remote refs, one on each line, sorted by refspec. A remote ref prints as \fB\%remote:name\fR\&. Each PREFIX keeps the refs equal to it or below it, and the output groups the rows by PREFIX in the order given. \%\-A lists the aliases, and \%\-c lists the collection refs. \%\-\-create and \%\-\-delete write the refs and print nothing. \%\-\-create wins over \%\-\-delete.
+.PP
+After \%\-\-create writes a ref that is not a remote ref, or after \%\-\-delete removes such a ref, the command reads \fB\%[core] auto\-update\-summary\fR and its alias \fB\%commit\-update\-summary\fR\&. If one of the two is true, the command writes the root summary and each summary of an item again. The key groups of \fB\%sign\-summary\fR of \fB\%[ex\-ostrya server]\fR sign them. The command writes no new \fB\%ostree\-metadata\fR commit. An alias under \fB\%refs/heads/\fR or \fB\%refs/mirrors/\fR is such a ref. With \%\-\-force, \%\-\-create writes the summaries also if NEWREF already points at the commit. A removal that fails with an \%I/O error counts as a removal of the ref. A run that writes or removes no such ref does not read the two keys. If a PREFIX of \%\-\-delete fails after an earlier PREFIX removed such a ref, the command prints the error, writes the summaries, and exits \%1. After a run that writes or removes such a ref, a value that is not a boolean, or a failed write, makes the command exit \%1. The refs stay as the run left them.
 .SH ARGUMENTS
 .TP
 \fIPREFIX...\fR

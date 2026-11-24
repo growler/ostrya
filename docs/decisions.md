@@ -5533,7 +5533,25 @@ These rules apply to a pull:
   summary. With the key unset, the `ostree` command also keeps it
   (`conformance/cli-behavior.md`, "Ref list and mirror pulls").
 
-Three alternatives were rejected:
+`ostrya refs --create` and `ostrya refs --delete` call it after a run that
+writes or removes a ref that is not a remote ref. An alias under
+`refs/heads/` or `refs/mirrors/` is such a ref. These rules apply to `refs`:
+
+- `--create` calls it after the ref write, and does not compare the old
+  value. So `--force` to the commit that NEWREF already names writes the
+  summary. The reason: the `ostree` command writes the summary for
+  `--force` to the same commit (`conformance/cli-behavior.md`, `refs`, "The
+  summary update").
+- `--delete` calls it one time, after the last prefix that runs. The
+  reason: one run writes one summary, also when many prefixes remove refs.
+- If a prefix fails after an earlier prefix removed such a ref, the command
+  prints the error, writes the summary, and then exits 1. The reason: the
+  refs that the earlier prefixes removed stay removed, so a summary that
+  still lists them names refs that do not exist.
+- A write or a removal of remote refs alone writes no summary, by the rule
+  of a pull.
+
+Five alternatives were rejected:
 
 - The ref writers of the library read the key and write the summary. A
   library caller that writes many refs in a sequence then writes the
@@ -5547,6 +5565,10 @@ Three alternatives were rejected:
   `ostree` command does (`conformance/cli-behavior.md`, "The summary update
   of a pull"). The summary of the port then replaces the copy, and the
   `summary.sig` of the remote does not stay.
+- `refs --delete` writes the summary after each prefix. A run with many
+  prefixes then writes the summary many times.
+- A `refs --delete` that fails writes no summary. The summary then lists the
+  refs that the earlier prefixes removed.
 
 ## The pull scheduler
 

@@ -2146,8 +2146,9 @@ In a repository with a collection id, neither command writes a new
 at its current commit. `ostrya receive` and `ostrya serve` write a new
 `ostree-metadata` commit on a push.
 
-`ostrya pull` reads neither key and writes no `summary`, so the port leaves
-`summary` as it stands and exits 0 over each of these values.
+`ostrya pull` and `ostrya pull-local` read the two keys by the same rule
+after a run that creates or moves a ref that is not a remote ref ("P2",
+`pull`).
 `ostrya receive` and `ostrya serve` read the two keys by the rule of the
 tool. They refuse a value that is not a boolean in either one
 (`ostrya-config(1)`).
@@ -3925,6 +3926,43 @@ until a prune. `pull-local` does the same. An alias under `refs/remotes` or
 `refs/mirrors` comes from a write of the library or from an out-of-band
 write. The `ostrya` command writes none.
 
+`ostrya pull` and `ostrya pull-local` read `[core] auto-update-summary` and
+its alias `commit-update-summary` by the rule of the tool on `commit`
+("P2", `commit`), after they print the statistics lines. They read the two
+keys only after a run that creates or moves a ref under `refs/heads/` or
+`refs/mirrors/`. Then they write the summaries as `ostrya commit` does, with
+no new `ostree-metadata` commit, and with no `sign-summary` each write removes
+the old `summary.sig`, as in the tool. After such a run, a value that is not
+a boolean makes both commands exit 1, with the refs written and no summary.
+`pull --mirror` with no ref keeps the `summary` and the `summary.sig` that it
+copies from the remote, and reads neither key. `cli-behavior.md`, "The
+summary update of a pull", records the tool. The two commands differ in these
+points:
+
+- A run that changes remote refs alone, `pull REMOTE REF` and
+  `pull-local --remote=REMOTE SRC REF`, writes `summary` in the tool. The port
+  writes none. With `auto-update-summary=yes`, the tool exits 1 and the port
+  exits 0.
+- `pull --mirror REMOTE REF` that changes no ref writes `summary` in the
+  tool. The port writes none.
+- `pull --mirror REMOTE` with no ref copies the remote summary in both. The
+  tool then writes its own `summary` and removes the copied `summary.sig`.
+  The port keeps the copy and the copied `summary.sig`. If the remote has no
+  `summary.sig`, the tool removes the local `summary.sig`, and the port keeps
+  it. With `auto-update-summary=yes`, the tool exits 1 and the port exits 0.
+- The port signs the summary with the key groups that `sign-summary` of
+  `[ex-ostrya server]` names, and also writes the summary of each auth item
+  under `extensions/ostrya/summary/`, as on `commit`. The tool never signs
+  this summary.
+- A pull that fails writes no summary in the port, also after it wrote refs:
+  a pull with `--collection` whose later candidate fails after an earlier
+  candidate wrote its refs, and a `pull --mirror` with no ref whose copy of
+  the summary fails after the ref write. No record observes the tool for
+  these cases.
+- An alias under `refs/heads/` whose target is under `refs/remotes/` is in no
+  summary of the port. A pull that moves the target alone writes no summary.
+  No record observes the tool for this case.
+
 `pull` also fetches the full set of attachments of each pulled commit: the
 attachments that field 2 names, and the attachments of each attachment, level
 by level. It fetches each one at depth 0 and with no ref, unless the pull is
@@ -4485,6 +4523,11 @@ ends on the same assertion (`SIGABRT`, exit 134 from a shell), and the port
 refuses the value at exit 1. The port opens the source repository and each
 `--localcache-repo` first, and refuses the value before it reads a ref or an
 object of the source. Neither writes an object or a ref.
+
+`pull-local` reads `[core] auto-update-summary` by the rule of `pull` above.
+With `--remote`, a `REF` operand writes a remote ref, and an `@ID:REF`
+operand writes a ref under `refs/mirrors/` or `refs/heads/`, which a summary
+lists.
 
 The ref operands of `pull-local` of the port also take `@ID:REF` as a port
 extension (`../format-reference.md`, "The pull of collection refs"). One

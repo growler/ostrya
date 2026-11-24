@@ -13,6 +13,8 @@ The command opens \%SRC_REPO and imports each ref, the commits that \%\-\-depth 
 The pull also imports the full set of attachments of each pulled commit, unless it takes \%\-\-commit\-metadata\-only: the attachments that field \%2 names, and the attachments of each attachment, level by level. It imports each one with no parent and no ref. For an attachment that this repository holds complete, it reads field \%2 from the commit object of this repository, and imports each attachment that field \%2 names. It reads no tree of such an attachment.
 .PP
 On success, the command prints one statistics line to standard output: \fB\%M metadata, C content objects imported; SIZE content written\fR\&. Under \%\-\-require\-static\-deltas, the line has the form of a pull from a remote. The command writes no progress line.
+.PP
+After a pull that creates or moves a ref that is not a remote ref, the command reads \fB\%[core] auto\-update\-summary\fR and its alias \fB\%commit\-update\-summary\fR\&. If one of the two is true, the command writes the root summary and each summary of an item again, after the statistics line. The key groups of \fB\%sign\-summary\fR of \fB\%[ex\-ostrya server]\fR sign them. The command writes no new \fB\%ostree\-metadata\fR commit. A pull that creates or moves no such ref does not read the two keys. With \%\-\-remote, a REF operand writes a remote ref, so a pull of REF operands alone writes no summary. After a pull that creates or moves such a ref, a value that is not a boolean, or a failed write, makes the command exit \%1. The objects and the refs stay.
 .SH ARGUMENTS
 .TP
 \fISRC_REPO\fR

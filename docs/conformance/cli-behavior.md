@@ -1204,17 +1204,75 @@ collection id"). A plain pull writes `refs/remotes/<remote>/<ref>`. A mirror
 pull of `REF@CHECKSUM` writes `refs/heads/REF`, also where the summary states
 a collection id ("Pull of a commit by its checksum").
 
-A mirror pull of the tool that fetched every ref copies the bytes of the remote
-summary to `<repo>/summary` with no change. It copies the bytes of the remote
-`summary.sig` to `<repo>/summary.sig` in the same way. Where the remote holds
-no `summary.sig`, the pull writes `<repo>/summary` alone. Then a
-`<repo>/summary.sig` that an earlier pull wrote stays as it is. A mirror pull of
-named refs writes neither file, and a plain pull writes neither file.
+With `[core] auto-update-summary` unset, a mirror pull of the tool that fetched
+every ref copies the bytes of the remote summary to `<repo>/summary` with no
+change. It copies the bytes of the remote `summary.sig` to `<repo>/summary.sig`
+in the same way. Where the remote holds no `summary.sig`, the pull writes
+`<repo>/summary` alone. Then a `<repo>/summary.sig` that an earlier pull wrote
+stays as it is. A mirror pull of named refs writes neither file, and a plain
+pull writes neither file.
 
 A repeat pull of an unchanged ref fetches `summary.sig`, `summary`, `config`,
 the delta index, and `.commitmeta` again, and then stops. Into an `archive`
 client, the tool does not request the delta index ("Delta selection in a
 pull"). `cli-surface.md`, "P2", `pull`, records the port side.
+
+#### The summary update of a pull
+
+These records come from libostree 2026.4. The source is an `archive`
+repository with the refs `main` and `other`, a `summary` from
+`ostree summary -u`, and a `summary.sig` that holds marker bytes. The
+destination is an `archive` repository with the remote `origin` at the
+`file://` address of the source, with no signature verification, and a
+`summary` from `ostree summary -u`. Before each run, the probe writes other
+marker bytes into the `summary.sig` of the destination.
+
+With `[core] auto-update-summary=true` in the destination, each run exits 0:
+
+- `pull origin other` with a new remote ref writes `summary`.
+- `pull origin other` with no change writes no `summary`.
+- `pull --mirror origin main` with a new ref writes `summary`.
+- `pull --mirror origin main` with no change writes `summary`.
+- `pull --mirror origin` copies the remote `summary`, and then writes its own
+  `summary`. The local `summary` is then not the remote `summary`, and the
+  local `summary.sig` is absent, also where the remote holds a `summary.sig`.
+  The result is the same with refs that change and with no change.
+- `pull --mirror origin` from a remote with no `summary.sig` writes `summary`
+  and removes the local `summary.sig`.
+- `pull-local SRC main` with a ref that moves writes `summary`.
+- `pull-local SRC main` with no change writes no `summary`.
+- `pull-local --remote=origin SRC main` with a new remote ref writes
+  `summary`.
+
+Each run that writes `summary` removes the existing `summary.sig`. Each run that
+writes no `summary` keeps it. The tool reads no key that names a signing key,
+so it never signs this summary.
+
+With `[core] collection-id=org.example.Src` in the source and
+`[core] collection-id=org.example.Dst` in the destination, the results are the
+same. `pull --mirror origin main` then writes
+`refs/mirrors/org.example.Src/main`. No run writes a new `ostree-metadata`
+commit. The summary that the tool writes lists `(org.example.Dst,
+ostree-metadata)` at the commit of the first `ostree summary -u`, the refs of
+the own id, and the refs under `refs/mirrors/org.example.Src/` in the
+collection map. It lists no ref under `refs/remotes/`.
+
+With the alias alone, `[core] commit-update-summary=true`,
+`pull --mirror origin main` writes `summary` and removes the local
+`summary.sig`, as `auto-update-summary=true` does.
+
+With `[core] auto-update-summary=yes`, each run writes its refs, prints
+`error: Key file contains key “auto-update-summary” which has a value that
+cannot be interpreted.`, and exits 1:
+
+- `pull origin other` writes `refs/remotes/origin/other`.
+- `pull --mirror origin main` writes `refs/heads/main`.
+- `pull --mirror origin` writes `refs/heads/other`, and copies the remote
+  `summary` and `summary.sig` as with the key unset.
+- `pull-local SRC main` moves `refs/heads/main`.
+
+Except for `pull --mirror origin`, these runs write no `summary` and keep the
+local `summary.sig`. `cli-surface.md`, "P2", `pull`, records the port side.
 
 #### The pulled ref under the own collection id
 
@@ -2600,9 +2658,11 @@ calls on `pull-local`, on `pull`, and on a `--mirror` pull. The port makes 15,
 pulled `.commitmeta` durable.
 
 In the port, `--disable-fsync` turns off each sync of the pull. This includes
-the per-object syncs, the publication step, and the ref writes. It also
-includes the detached metadata of each pulled commit and the summary that a
-mirror pull copies.
+the per-object syncs, the publication step, and the ref writes. It also includes
+the detached metadata of each pulled commit and the summary that a mirror pull
+copies. The summary that `pull` and `pull-local` write under
+`[core] auto-update-summary` follows `[core] fsync` alone, and `--disable-fsync`
+does not change it (`ostrya-config(1)`).
 
 ### Sync counts of a local pull
 

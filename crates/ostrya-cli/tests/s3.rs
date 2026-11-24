@@ -1420,6 +1420,72 @@ fn a_pull_from_a_bucket_takes_plain_and_collection_refs() {
     }
 }
 
+/// With `[core] auto-update-summary=true`, a pull from a bucket of a plain
+/// ref writes the remote ref alone, and writes no summary. A pull of
+/// `@ID:REF` writes `refs/mirrors/ID/REF`, and then the summary, which lists
+/// the ref in its collection map. The write removes the old `summary.sig`.
+#[cfg(feature = "push")]
+#[test]
+fn a_pull_from_a_bucket_writes_the_auto_summary_for_a_collection_ref() {
+    const MARKER: &[u8] = b"marker signature";
+    let scratch = Scratch::new("pull-auto-summary");
+    let server = StandIn::start();
+    init(&scratch, &server, None);
+    let src = scratch.repo("src");
+    let x_a = "@org.example.X:a";
+    let main = scratch.commit(&src, "main", "one");
+    let a = scratch.commit(&src, x_a, "two");
+    let endpoint = endpoint_of(&server);
+    scratch.ok(&[&src, "push", ADDRESS, "main", x_a, &endpoint, CLEARTEXT]);
+
+    let dest = scratch.repo("dest");
+    scratch.ok(&[
+        &dest,
+        "remote",
+        "add",
+        "--no-gpg-verify",
+        "r",
+        ADDRESS,
+        &format!("--set=s3-endpoint={}", server.endpoint()),
+    ]);
+    scratch.ok(&[&dest, "config", "set", "core.auto-update-summary", "true"]);
+    let path = scratch.path().join("dest");
+    let summary = path.join("summary");
+    let sig = path.join("summary.sig");
+    std::fs::write(&sig, MARKER).unwrap();
+
+    let out = scratch.run(&[&dest, "pull", "r", "main", CLEARTEXT]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
+    assert_eq!(scratch.ok(&[&dest, "rev-parse", "r:main"]).trim(), main);
+    assert!(!summary.exists());
+    assert_eq!(std::fs::read(&sig).unwrap(), MARKER);
+
+    let out = scratch.run(&[&dest, "pull", "r", x_a, CLEARTEXT]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
+    let bytes = std::fs::read(&summary).expect("the pull wrote the summary");
+    let parsed = ostrya::Summary::parse(&bytes).unwrap();
+    assert!(parsed.refs.is_empty());
+    let map: Vec<(String, Vec<(String, String)>)> = parsed
+        .collection_map()
+        .unwrap()
+        .into_iter()
+        .map(|(id, refs)| {
+            let refs = refs
+                .into_iter()
+                .map(|entry| (entry.name, entry.commit.to_hex()))
+                .collect();
+            (id, refs)
+        })
+        .collect();
+    assert_eq!(
+        map,
+        [("org.example.X".to_owned(), vec![("a".to_owned(), a)])]
+    );
+    assert!(!sig.exists());
+}
+
 /// `pull --mirror` from a bucket whose summary states the collection id ID
 /// writes a plain ref REF to `refs/mirrors/ID/REF`, or to `refs/heads/REF`
 /// in a repository with the collection id ID.

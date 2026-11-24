@@ -5513,7 +5513,27 @@ commit, as the `ostree` command does under the same key
 commit` calls it after a run that writes a tag or a branch that is not a
 remote ref. A run that writes no such ref does not read the key.
 
-Two alternatives were rejected:
+`ostrya pull` and `ostrya pull-local` call it after a run that creates or
+moves a ref that is not a remote ref. The changed refs come from
+`Repo::pull_with_report`, `Repo::pull_local_with_report`, and
+`CollectionPullStats::changed_refs`. The list costs a read of each old ref
+under the update lock. With both keys false or absent, a pull with no
+`--collection` calls `Repo::pull` or `Repo::pull_local`, which make no list.
+These rules apply to a pull:
+
+- A change of remote refs alone writes no summary, so `pull REMOTE REF` and
+  `pull-local --remote` write none. The reason: a summary lists no remote
+  ref, so a remote ref that changes does not change the summary.
+- `pull --mirror` with no ref keeps the `summary` and the `summary.sig` that
+  it copies from the remote, and does not read the key. The reason: the copy
+  already lists the refs that the pull wrote, and a `summary.sig` that the
+  pull copies from the remote stays valid for it. If the remote has no
+  `summary.sig`, the pull copies `summary` alone, and the old local
+  `summary.sig` stays. This `summary.sig` holds the signatures of an earlier
+  summary. With the key unset, the `ostree` command also keeps it
+  (`conformance/cli-behavior.md`, "Ref list and mirror pulls").
+
+Three alternatives were rejected:
 
 - The ref writers of the library read the key and write the summary. A
   library caller that writes many refs in a sequence then writes the
@@ -5523,6 +5543,10 @@ Two alternatives were rejected:
   does. Each commit then adds an `ostree-metadata` commit to the chain, and
   the repository differs from the repository that the `ostree` command
   writes for the same commands.
+- `pull --mirror` with no ref writes its own summary after the copy, as the
+  `ostree` command does (`conformance/cli-behavior.md`, "The summary update
+  of a pull"). The summary of the port then replaces the copy, and the
+  `summary.sig` of the remote does not stay.
 
 ## The pull scheduler
 

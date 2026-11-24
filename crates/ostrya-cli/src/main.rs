@@ -474,6 +474,18 @@ enum Command {
     /// A pull with --collection can print two lines, as --collection states.
     /// If standard output is a terminal, a progress line shows while the pull
     /// runs, and the first statistics line is drawn over it.
+    ///
+    /// After a pull that creates or moves a ref that is not a remote ref, the
+    /// command reads `[core] auto-update-summary` and its alias
+    /// `commit-update-summary`. If one of the two is true, the command writes
+    /// the root summary and each summary of an item again, after the
+    /// statistics lines. The key groups of `sign-summary` of
+    /// `[ex-ostrya server]` sign them. The command writes no new
+    /// `ostree-metadata` commit. A pull that creates or moves no such ref,
+    /// and a --mirror pull with no REF, do not read the two keys. After a
+    /// pull that creates or moves such a ref, a value that is not a boolean,
+    /// or a failed write, makes the command exit 1. The objects and the refs
+    /// stay.
     Pull(PullArgs),
     /// Import refs and their objects from another local repository.
     ///
@@ -497,6 +509,19 @@ enum Command {
     /// `M metadata, C content objects imported; SIZE content written`. Under
     /// --require-static-deltas, the line has the form of a pull from a
     /// remote. The command writes no progress line.
+    ///
+    /// After a pull that creates or moves a ref that is not a remote ref, the
+    /// command reads `[core] auto-update-summary` and its alias
+    /// `commit-update-summary`. If one of the two is true, the command writes
+    /// the root summary and each summary of an item again, after the
+    /// statistics line. The key groups of `sign-summary` of
+    /// `[ex-ostrya server]` sign them. The command writes no new
+    /// `ostree-metadata` commit. A pull that creates or moves no such ref
+    /// does not read the two keys. With --remote, a REF operand writes a
+    /// remote ref, so a pull of REF operands alone writes no summary. After
+    /// a pull that creates or moves such a ref, a value that is not a
+    /// boolean, or a failed write, makes the command exit 1. The objects and
+    /// the refs stay.
     #[command(name = "pull-local")]
     PullLocal(PullLocalArgs),
     /// Write the composefs image of a commit as an image commit.
@@ -4049,7 +4074,8 @@ struct PullArgs {
     /// the remote serves no summary. This pull also copies the `summary` and
     /// `summary.sig` of the remote to this repository. If the remote has no
     /// `summary.sig`, the `summary.sig` of this repository stays as it is. A
-    /// pull of named refs copies no summary.
+    /// pull of named refs copies no summary. Under `auto-update-summary`, the
+    /// pull keeps this copy and does not write the summary again.
     #[arg(long)]
     mirror: bool,
     /// The number of parents of each pulled commit to follow.
@@ -7669,6 +7695,14 @@ async fn pull(
     let line = progress
         .clone()
         .map(|progress| ProgressLine::start(progress, redraw));
+    // A mirror pull of every ref copies the summary of the remote, and the
+    // copy lists the refs that the pull wrote. The pull keeps the copy.
+    let mirror_all = args.mirror && refs.is_empty() && matches!(from, PullFrom::Remote(_));
+    // The list of the changed refs costs a read of each old ref, so the pull
+    // makes the list only if the summary update can follow. A value that is
+    // not a boolean makes the list, so that the update refuses the value
+    // after a change of a listed ref alone.
+    let summary_wanted = !mirror_all && repo.config().auto_update_summary().unwrap_or(true);
     let opts = PullOptions {
         refs,
         flags,
@@ -7692,10 +7726,14 @@ async fn pull(
         ..PullOptions::default()
     };
     let pulled = match from {
+        PullFrom::Remote(remote) if summary_wanted => repo
+            .pull_with_report(&remote, opts)
+            .await
+            .map(|report| (vec![(report.stats, PullSource::Http)], report.changed_refs)),
         PullFrom::Remote(remote) => repo
             .pull(&remote, opts)
             .await
-            .map(|stats| vec![(stats, PullSource::Http)]),
+            .map(|stats| (vec![(stats, PullSource::Http)], Vec::new())),
         PullFrom::Collection { id, remotes } => {
             let remotes: Vec<&str> = remotes.iter().map(String::as_str).collect();
             let mut collection = CollectionPullOptions::default();
@@ -7703,11 +7741,16 @@ async fn pull(
             collection.on_event = Some(Box::new(|event| eprintln!("warning: {event}")));
             repo.pull_collection(&id, &remotes, collection)
                 .await
-                .map(|pulled| collection_lines(&pulled.stats, &pulled.local))
+                .map(|pulled| {
+                    (
+                        collection_lines(&pulled.stats, &pulled.local),
+                        pulled.changed_refs,
+                    )
+                })
         }
     };
     let prefix = line.map_or("", ProgressLine::finish);
-    let lines = match pulled {
+    let (lines, changed) = match pulled {
         Ok(pulled) => pulled,
         Err(e) => {
             // The error goes to standard error, on a line of its own.
@@ -7727,6 +7770,11 @@ async fn pull(
         } else {
             println!("{text}");
         }
+    }
+    // The statistics lines come first, and then the summary. A failed
+    // summary exits 1, and the objects and the refs stay.
+    if summary_wanted && changed.iter().any(|change| summary_lists(&change.name)) {
+        update_summary_if_configured(&repo).await?;
     }
     Ok(())
 }
@@ -8218,34 +8266,40 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
         flags |= PullFlags::FORCE_COPY;
     }
 
-    let stats = repo
-        .pull_local(
-            &src,
-            PullOptions {
-                refs: args.refs,
-                remote: args.remote,
-                flags,
-                depth: args.depth,
-                localcache_repos,
-                disable_fsync: args.disable_fsync,
-                per_object_fsync: args.per_object_fsync,
-                require_static_deltas: args.require_static_deltas,
-                disable_static_deltas: args.disable_static_deltas,
-                // `clap` refuses a switch together with its off switch, so
-                // each pair gives one value or none.
-                verify: PullVerify {
-                    gpg: (args.gpg_verify || args.no_gpg_verify).then_some(args.gpg_verify),
-                    gpg_summary: (args.gpg_verify_summary || args.no_gpg_verify_summary)
-                        .then_some(args.gpg_verify_summary),
-                    sign: (args.sign_verify || args.no_sign_verify).then_some(args.sign_verify),
-                    sign_summary: (args.sign_verify_summary || args.no_sign_verify_summary)
-                        .then_some(args.sign_verify_summary),
-                },
-                trust_group: args.trust,
-                ..PullOptions::default()
-            },
-        )
-        .await?;
+    let opts = PullOptions {
+        refs: args.refs,
+        remote: args.remote,
+        flags,
+        depth: args.depth,
+        localcache_repos,
+        disable_fsync: args.disable_fsync,
+        per_object_fsync: args.per_object_fsync,
+        require_static_deltas: args.require_static_deltas,
+        disable_static_deltas: args.disable_static_deltas,
+        // `clap` refuses a switch together with its off switch, so each pair
+        // gives one value or none.
+        verify: PullVerify {
+            gpg: (args.gpg_verify || args.no_gpg_verify).then_some(args.gpg_verify),
+            gpg_summary: (args.gpg_verify_summary || args.no_gpg_verify_summary)
+                .then_some(args.gpg_verify_summary),
+            sign: (args.sign_verify || args.no_sign_verify).then_some(args.sign_verify),
+            sign_summary: (args.sign_verify_summary || args.no_sign_verify_summary)
+                .then_some(args.sign_verify_summary),
+        },
+        trust_group: args.trust,
+        ..PullOptions::default()
+    };
+    // The list of the changed refs costs a read of each old ref, so the pull
+    // makes the list only if the summary update can follow. A value that is
+    // not a boolean makes the list, so that the update refuses the value
+    // after a change of a listed ref alone.
+    let summary_wanted = repo.config().auto_update_summary().unwrap_or(true);
+    let (stats, changed) = if summary_wanted {
+        let report = repo.pull_local_with_report(&src, opts).await?;
+        (report.stats, report.changed_refs)
+    } else {
+        (repo.pull_local(&src, opts).await?, Vec::new())
+    };
     // A pull that requires static deltas reads the source as a fetch, and the
     // `ostree` command reports it in the words of a fetch.
     let source = if args.require_static_deltas {
@@ -8254,6 +8308,11 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
         PullSource::Local
     };
     println!("{}", statistics_line(&stats, source));
+    // The statistics line comes first, and then the summary. A failed
+    // summary exits 1, and the objects and the refs stay.
+    if changed.iter().any(|change| summary_lists(&change.name)) {
+        update_summary_if_configured(&repo).await?;
+    }
     Ok(())
 }
 
@@ -9912,7 +9971,7 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         || args
             .branch
             .as_deref()
-            .is_some_and(|branch| !matches!(branch.parse::<Ref>(), Ok(Ref::Remote { .. })));
+            .is_some_and(|branch| branch.parse::<Ref>().as_ref().map_or(true, summary_lists));
     let summary = if listed {
         update_summary_if_configured(&repo).await
     } else {
@@ -16407,6 +16466,14 @@ async fn update_summary_if_configured(repo: &Repo) -> Result<()> {
         print_invalid_collection_dirs(&report.invalid_collection_dirs);
     }
     Ok(())
+}
+
+/// Returns `true` if a summary lists the ref `name`.
+///
+/// A summary lists each ref under `refs/heads/`, each alias, and each ref
+/// under `refs/mirrors/`. It lists no remote ref.
+fn summary_lists(name: &Ref) -> bool {
+    !matches!(name, Ref::Remote { .. })
 }
 
 /// Returns the signers of a summary update, in the order of the signatures:

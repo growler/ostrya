@@ -41299,6 +41299,473 @@ fn commit_consume_with_a_failed_auto_summary_removes_the_source() {
     assert_no_auto_summary(&repo, "consume with a failed removal");
 }
 
+/// Creates the destination of a pull test of `[core] auto-update-summary` at
+/// `base/<name>/repo`, with `core` in `[core]`, `groups` after it, and
+/// [`AUTO_MARKER`] in `summary.sig`. With `url`, the config also holds the
+/// remote `origin` at `url` with no signature verification. Returns the path
+/// of the repository.
+fn auto_pull_dest(base: &Path, name: &str, core: &str, groups: &str, url: Option<&str>) -> PathBuf {
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest = auto_summary_repo(&dir, core, groups);
+    if let Some(url) = url {
+        configure_remote(&dest, url, "gpg-verify=false\n");
+    }
+    dest
+}
+
+/// Removes `summary` of `repo` and writes [`AUTO_MARKER`] into `summary.sig`,
+/// so that the next run shows if it writes the summary.
+fn reset_auto_summary(repo: &Path) {
+    let _ = std::fs::remove_file(repo.join("summary"));
+    std::fs::write(repo.join("summary.sig"), AUTO_MARKER).unwrap();
+}
+
+/// A mirror pull of a named ref over HTTP writes `refs/heads/REF`, and then
+/// the summary, which lists the ref. The write removes the old `summary.sig`.
+/// A second pull that changes no ref writes no summary.
+#[test]
+fn pull_mirror_of_a_ref_writes_the_auto_summary() {
+    let tmp = TmpDir::new("pull-auto-mirror-ref");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let server = FileServer::start(&remote);
+    let dest = auto_pull_dest(
+        base,
+        "dest",
+        "auto-update-summary=true\n",
+        "",
+        Some(&server.url()),
+    );
+
+    let run = ostrya_repo(&dest, &["pull", "--mirror", "origin", BRANCH]);
+    run.ok();
+    assert!(run.stderr.is_empty());
+    assert_eq!(
+        ref_file(&dest, "refs/heads/test/main").as_deref(),
+        Some(COMMIT)
+    );
+    assert_eq!(summary_ref_names(&dest), [BRANCH]);
+    assert!(!dest.join("summary.sig").exists());
+
+    reset_auto_summary(&dest);
+    let run = ostrya_repo(&dest, &["pull", "--mirror", "origin", BRANCH]);
+    run.ok();
+    assert_no_auto_summary(&dest, "no change");
+}
+
+/// A plain pull writes the remote ref alone, which no summary lists, so the
+/// run writes no summary. With `auto-update-summary=yes`, the run reads no
+/// key and exits 0.
+#[test]
+fn pull_of_a_remote_ref_writes_no_auto_summary() {
+    let tmp = TmpDir::new("pull-auto-remote-ref");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let server = FileServer::start(&remote);
+    for value in ["true", "yes"] {
+        let dest = auto_pull_dest(
+            base,
+            &format!("dest-{value}"),
+            &format!("auto-update-summary={value}\n"),
+            "",
+            Some(&server.url()),
+        );
+        let run = ostrya_repo(&dest, &["pull", "origin", BRANCH]);
+        run.ok();
+        assert!(run.stderr.is_empty(), "{value}");
+        assert_eq!(
+            ref_file(&dest, "refs/remotes/origin/test/main").as_deref(),
+            Some(COMMIT),
+            "{value}"
+        );
+        assert_no_auto_summary(&dest, value);
+    }
+}
+
+/// A pull of a `CHECKSUM` operand alone writes no ref, so the run writes no
+/// summary.
+#[test]
+fn pull_of_a_checksum_writes_no_auto_summary() {
+    let tmp = TmpDir::new("pull-auto-checksum");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let server = FileServer::start(&remote);
+    let dest = auto_pull_dest(
+        base,
+        "dest",
+        "auto-update-summary=true\n",
+        "",
+        Some(&server.url()),
+    );
+    let run = ostrya_repo(&dest, &["pull", "origin", COMMIT]);
+    run.ok();
+    assert!(holds_commit(&dest, COMMIT));
+    assert_eq!(ref_files(&dest), Vec::<(String, String)>::new());
+    assert_no_auto_summary(&dest, "CHECKSUM");
+}
+
+/// `pull --mirror REMOTE REF@CHECKSUM` writes `refs/heads/REF`, and the run
+/// writes the summary. A plain `pull REMOTE REF@CHECKSUM` writes the remote
+/// ref alone, and the run writes no summary.
+#[test]
+fn pull_of_a_commit_operand_follows_the_written_ref() {
+    let tmp = TmpDir::new("pull-auto-commit-operand");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let server = FileServer::start(&remote);
+    let operand = format!("{BRANCH}@{COMMIT}");
+
+    let dest = auto_pull_dest(
+        base,
+        "mirror",
+        "auto-update-summary=true\n",
+        "",
+        Some(&server.url()),
+    );
+    ostrya_repo(&dest, &["pull", "--mirror", "origin", &operand]).ok();
+    assert_eq!(
+        ref_file(&dest, "refs/heads/test/main").as_deref(),
+        Some(COMMIT)
+    );
+    assert_eq!(summary_ref_names(&dest), [BRANCH]);
+    assert!(!dest.join("summary.sig").exists());
+
+    let dest = auto_pull_dest(
+        base,
+        "plain",
+        "auto-update-summary=true\n",
+        "",
+        Some(&server.url()),
+    );
+    ostrya_repo(&dest, &["pull", "origin", &operand]).ok();
+    assert_eq!(
+        ref_file(&dest, "refs/remotes/origin/test/main").as_deref(),
+        Some(COMMIT)
+    );
+    assert_no_auto_summary(&dest, "plain REF@CHECKSUM");
+}
+
+/// A mirror pull of every ref keeps the `summary` that it copies from the
+/// remote, and writes no summary of its own. The remote has no `summary.sig`,
+/// so the old `summary.sig` stays. No summary of an auth item is written.
+/// With `auto-update-summary=yes`, the run reads no key and exits 0.
+#[test]
+fn pull_mirror_of_every_ref_keeps_the_copied_summary() {
+    let tmp = TmpDir::new("pull-auto-mirror-all");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    assert!(!remote.join("summary.sig").exists());
+    let server = FileServer::start(&remote);
+    for value in ["true", "yes"] {
+        let dest = auto_pull_dest(
+            base,
+            &format!("dest-{value}"),
+            &format!("auto-update-summary={value}\n"),
+            "",
+            Some(&server.url()),
+        );
+        let run = ostrya_repo(&dest, &["pull", "--mirror", "origin"]);
+        run.ok();
+        assert!(run.stderr.is_empty(), "{value}");
+        assert_eq!(
+            ref_file(&dest, "refs/heads/test/main").as_deref(),
+            Some(COMMIT),
+            "{value}"
+        );
+        assert_eq!(
+            summary_files(&dest),
+            (
+                Some(std::fs::read(remote.join("summary")).unwrap()),
+                Some(AUTO_MARKER.to_vec())
+            ),
+            "{value}"
+        );
+        assert!(
+            !dest.join("extensions/ostrya/summary").exists(),
+            "{value}: a summary of an auth item was written"
+        );
+    }
+}
+
+/// A mirror pull of a named ref that writes the ref, with
+/// `auto-update-summary=yes`: the command prints the statistics line, then
+/// one `error:` line, and exits 1. The ref stays, and the run writes no
+/// summary.
+#[test]
+fn pull_keeps_the_ref_when_the_auto_summary_key_is_not_a_boolean() {
+    let tmp = TmpDir::new("pull-auto-yes");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let server = FileServer::start(&remote);
+    let dest = auto_pull_dest(
+        base,
+        "dest",
+        "auto-update-summary=yes\n",
+        "",
+        Some(&server.url()),
+    );
+    let run = ostrya_repo(&dest, &["pull", "--mirror", "origin", BRANCH]);
+    assert_eq!(run.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(stdout.ends_with(" content written\n"), "{stdout}");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr),
+        "error: keyfile: value 'yes' for core.auto-update-summary is not a boolean\n"
+    );
+    assert_eq!(
+        ref_file(&dest, "refs/heads/test/main").as_deref(),
+        Some(COMMIT)
+    );
+    assert_no_auto_summary(&dest, "yes");
+}
+
+/// `pull-local` writes the local ref, then the summary, which lists the ref.
+/// A second run that changes no ref writes no summary. `pull-local --remote`
+/// writes a remote ref alone and writes no summary, also with
+/// `auto-update-summary=yes`.
+#[test]
+fn pull_local_writes_the_auto_summary_for_a_local_ref() {
+    let tmp = TmpDir::new("pull-local-auto");
+    let base = tmp.path();
+    let src_dir = base.join("source");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src = commit_fixture(&src_dir);
+    let src_s = src.to_str().unwrap();
+
+    let dest = auto_pull_dest(base, "dest", "auto-update-summary=true\n", "", None);
+    let run = ostrya_repo(&dest, &["pull-local", src_s, BRANCH]);
+    run.ok();
+    assert!(run.stderr.is_empty());
+    assert_eq!(
+        ref_file(&dest, "refs/heads/test/main").as_deref(),
+        Some(COMMIT)
+    );
+    assert_eq!(summary_ref_names(&dest), [BRANCH]);
+    assert!(!dest.join("summary.sig").exists());
+
+    reset_auto_summary(&dest);
+    ostrya_repo(&dest, &["pull-local", src_s, BRANCH]).ok();
+    assert_no_auto_summary(&dest, "no change");
+
+    for value in ["true", "yes"] {
+        let dest = auto_pull_dest(
+            base,
+            &format!("remote-{value}"),
+            &format!("auto-update-summary={value}\n"),
+            "",
+            None,
+        );
+        let run = ostrya_repo(&dest, &["pull-local", "--remote=origin", src_s, BRANCH]);
+        run.ok();
+        assert!(run.stderr.is_empty(), "{value}");
+        assert_eq!(
+            ref_file(&dest, "refs/remotes/origin/test/main").as_deref(),
+            Some(COMMIT),
+            "{value}"
+        );
+        assert_no_auto_summary(&dest, value);
+    }
+}
+
+/// `pull-local --remote` of an `@ID:REF` operand writes `refs/mirrors/ID/REF`,
+/// and the run writes the summary, which lists the ref in its collection map.
+#[test]
+fn pull_local_with_remote_writes_the_auto_summary_for_a_collection_ref() {
+    let tmp = TmpDir::new("pull-local-auto-remote-collection");
+    let base = tmp.path();
+    let src_dir = base.join("source");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src = auto_summary_repo(&src_dir, "collection-id=org.example.X\n", "");
+    let commit = auto_commit(&src, &["-b", "a"]).ok().stdout_trimmed();
+
+    let dest = auto_pull_dest(base, "dest", "auto-update-summary=true\n", "", None);
+    let run = ostrya_repo(
+        &dest,
+        &[
+            "pull-local",
+            "--remote=origin",
+            src.to_str().unwrap(),
+            "@org.example.X:a",
+        ],
+    );
+    run.ok();
+    assert!(run.stderr.is_empty());
+    assert_eq!(
+        ref_file(&dest, "refs/mirrors/org.example.X/a").as_ref(),
+        Some(&commit)
+    );
+    let bytes = std::fs::read(dest.join("summary")).expect("the pull wrote the summary");
+    let summary = ostrya::Summary::parse(&bytes).unwrap();
+    assert!(summary.refs.is_empty());
+    let map: Vec<(String, Vec<(String, String)>)> = summary
+        .collection_map()
+        .unwrap()
+        .into_iter()
+        .map(|(id, refs)| {
+            let refs = refs
+                .into_iter()
+                .map(|entry| (entry.name, entry.commit.to_hex()))
+                .collect();
+            (id, refs)
+        })
+        .collect();
+    assert_eq!(
+        map,
+        [("org.example.X".to_owned(), vec![("a".to_owned(), commit)])]
+    );
+    assert!(!dest.join("summary.sig").exists());
+}
+
+/// With `auto-update-summary` absent or false, `pull --mirror REMOTE REF` and
+/// `pull-local` write the local ref, write no summary, and keep
+/// `summary.sig`.
+#[test]
+fn pull_and_pull_local_write_no_summary_with_the_auto_summary_key_off() {
+    let tmp = TmpDir::new("pull-auto-off");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let server = FileServer::start(&remote);
+    let src_dir = base.join("source");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src = commit_fixture(&src_dir);
+    let src_s = src.to_str().unwrap();
+
+    for (case, core) in [("absent", ""), ("false", "auto-update-summary=false\n")] {
+        let dest = auto_pull_dest(base, &format!("pull-{case}"), core, "", Some(&server.url()));
+        let run = ostrya_repo(&dest, &["pull", "--mirror", "origin", BRANCH]);
+        run.ok();
+        assert!(run.stderr.is_empty(), "{case}");
+        assert_eq!(
+            ref_file(&dest, "refs/heads/test/main").as_deref(),
+            Some(COMMIT),
+            "{case}"
+        );
+        assert_no_auto_summary(&dest, case);
+
+        let dest = auto_pull_dest(base, &format!("pull-local-{case}"), core, "", None);
+        let run = ostrya_repo(&dest, &["pull-local", src_s, BRANCH]);
+        run.ok();
+        assert!(run.stderr.is_empty(), "{case}");
+        assert_eq!(
+            ref_file(&dest, "refs/heads/test/main").as_deref(),
+            Some(COMMIT),
+            "{case}"
+        );
+        assert_no_auto_summary(&dest, case);
+    }
+}
+
+/// In a destination with a collection id, `pull --mirror REMOTE REF` and
+/// `pull-local` write the summary, which lists the pulled ref and lists
+/// `ostree-metadata` at its current commit. The runs write no new anchor
+/// commit.
+#[test]
+fn pull_and_pull_local_auto_summary_writes_no_anchor_commit() {
+    let tmp = TmpDir::new("pull-auto-collection");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let server = FileServer::start(&remote);
+    let src_dir = base.join("source");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src = commit_fixture(&src_dir);
+    let src_s = src.to_str().unwrap();
+    let core = "auto-update-summary=true\ncollection-id=org.example.Dst\n";
+
+    let cases: [(&str, Option<&str>, Vec<&str>); 2] = [
+        (
+            "pull",
+            Some(&server.url()),
+            vec!["pull", "--mirror", "origin", BRANCH],
+        ),
+        ("pull-local", None, vec!["pull-local", src_s, BRANCH]),
+    ];
+    for (case, url, args) in cases {
+        let dest = auto_pull_dest(base, case, core, "", url);
+        ostrya_repo(&dest, &["summary", "-u"]).ok();
+        let anchor = ref_file(&dest, "refs/heads/ostree-metadata").expect("summary -u wrote it");
+        std::fs::write(dest.join("summary.sig"), AUTO_MARKER).unwrap();
+
+        let run = ostrya_repo(&dest, &args);
+        run.ok();
+        assert!(run.stderr.is_empty(), "{case}");
+        assert_eq!(
+            ref_file(&dest, "refs/heads/test/main").as_deref(),
+            Some(COMMIT),
+            "{case}"
+        );
+        assert_eq!(
+            ref_file(&dest, "refs/heads/ostree-metadata").as_deref(),
+            Some(anchor.as_str()),
+            "{case}"
+        );
+        assert_eq!(
+            summary_ref_names(&dest),
+            ["ostree-metadata", BRANCH],
+            "{case}"
+        );
+        let bytes = std::fs::read(dest.join("summary")).unwrap();
+        let summary = ostrya::Summary::parse(&bytes).unwrap();
+        let listed = summary
+            .refs
+            .iter()
+            .find(|entry| entry.name == "ostree-metadata")
+            .unwrap();
+        assert_eq!(listed.commit.to_hex(), anchor, "{case}");
+        assert!(!dest.join("summary.sig").exists(), "{case}");
+    }
+}
+
+/// `pull-local` that writes a local ref, with `auto-update-summary=yes` or
+/// with a key group of `sign-summary` whose key file is absent: the command
+/// prints the statistics line, then one `error:` line, and exits 1. The ref
+/// stays, and the summary files do not change.
+#[test]
+fn pull_local_keeps_the_ref_when_the_auto_summary_fails() {
+    let tmp = TmpDir::new("pull-local-auto-fails");
+    let base = tmp.path();
+    let src_dir = base.join("source");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src = commit_fixture(&src_dir);
+    let src_s = src.to_str().unwrap();
+    let absent = base.join("absent.ed25519");
+    let groups = format!(
+        "[ex-ostrya server]\nsign-summary=a\n\
+         [ex-ostrya key \"a\"]\ntype=ed25519\nsecret-key-file={}\n",
+        absent.display()
+    );
+    let cases = [
+        ("yes", "auto-update-summary=yes\n", String::new()),
+        ("absent key", "auto-update-summary=true\n", groups),
+    ];
+    for (case, core, groups) in cases {
+        let dest = auto_pull_dest(base, &format!("dest-{case}"), core, &groups, None);
+        let run = ostrya_repo(&dest, &["pull-local", src_s, BRANCH]);
+        assert_eq!(run.status.code(), Some(1), "{case}");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert_eq!(stdout.lines().count(), 1, "{case}: {stdout}");
+        assert!(
+            stdout.contains(" content objects imported; "),
+            "{case}: {stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(stderr.lines().count(), 1, "{case}: {stderr}");
+        let prefix = if case == "yes" {
+            "error: keyfile: value 'yes' for core.auto-update-summary is not a boolean"
+        } else {
+            "error: signature: [ex-ostrya key \"a\"]: "
+        };
+        assert!(stderr.starts_with(prefix), "{case}: {stderr}");
+        assert_eq!(
+            ref_file(&dest, "refs/heads/test/main").as_deref(),
+            Some(COMMIT),
+            "{case}"
+        );
+        assert_no_auto_summary(&dest, case);
+    }
+}
+
 /// The report reads `ostree.summary.collection-map` as the `ostree` command
 /// reads it:
 ///

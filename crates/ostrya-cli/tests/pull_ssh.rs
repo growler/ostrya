@@ -475,6 +475,48 @@ fn remote_refs_and_remote_summary_read_the_remote_over_ssh() {
     assert_failed(&out, "Remote server has no summary file");
 }
 
+/// With `[core] auto-update-summary=true`, a mirror pull of `main` over ssh
+/// writes `refs/heads/main`, and then the summary, which lists the ref. The
+/// write removes the old `summary.sig`. A plain pull of `main` writes the
+/// remote ref alone, and writes no summary.
+#[test]
+fn a_pull_over_ssh_writes_the_auto_summary_for_a_local_ref() {
+    const MARKER: &[u8] = b"marker signature";
+    let setup = Setup::new("auto-summary", "archive", "archive");
+    setup.configure(&format!(
+        "pull-url={}\n{}",
+        setup.address(),
+        setup.standin_keys()
+    ));
+    let out = setup.client(&["config", "set", "core.auto-update-summary", "true"], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let summary = setup.client.join("summary");
+    let sig = setup.client.join("summary.sig");
+    std::fs::write(&sig, MARKER).unwrap();
+
+    let out = setup.client(&["pull", "--mirror", "origin", "main"], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
+    let bytes = std::fs::read(&summary).expect("the pull wrote the summary");
+    let names: Vec<String> = ostrya::Summary::parse(&bytes)
+        .unwrap()
+        .refs
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    assert_eq!(names, ["main"]);
+    assert!(!sig.exists());
+
+    std::fs::remove_file(&summary).unwrap();
+    std::fs::write(&sig, MARKER).unwrap();
+    let out = setup.client(&["pull", "origin", "main"], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = setup.client(&["rev-parse", "origin:main"], &[]);
+    assert_eq!(stdout(&out).trim(), setup.commit);
+    assert!(!summary.exists());
+    assert_eq!(std::fs::read(&sig).unwrap(), MARKER);
+}
+
 /// `OSTRYA_SSH_COMMAND` wins over the remote key `ssh-command`.
 #[test]
 fn the_environment_wins_over_the_ssh_command_key() {

@@ -1612,10 +1612,12 @@ the directory when `[core] add-remotes-config-dir` of `config` is not
 the receive policies, `ReceivePolicies::from_config`, and
 `Repo::regenerate_summaries_if_configured`. `ostrya commit` calls
 `Repo::regenerate_summaries_if_configured` after a run that writes a tag or a
-branch that is not a remote ref. A run that writes no such ref does not read
-the two keys.
-`conformance/cli-surface.md`, "P2", `commit`, records the effect of the two
-keys on a commit.
+branch that is not a remote ref. `ostrya pull` and `ostrya pull-local` call it
+after a run that creates or moves a ref that is not a remote ref, except
+`ostrya pull --mirror` with no ref. A run that writes no such ref does not
+read the two keys.
+`conformance/cli-surface.md`, "P2", `commit` and `pull`, records the effect
+of the two keys on a commit and on a pull.
 
 Observed behavior: the tool reads and writes `config` by these rules.
 
@@ -6558,11 +6560,20 @@ same summaries after a run that writes a tag or a branch that is not a remote
 ref, through `Repo::regenerate_summaries_if_configured`, signed by the same
 key groups. In a repository with a collection id, it writes no new anchor
 commit, and the summaries list `ostree-metadata` at its current commit.
+`ostrya pull` and `ostrya pull-local` write the same summaries in the same
+way after a run that creates or moves a ref that is not a remote ref. The
+changed refs come from `PullReport::changed_refs` of `Repo::pull_with_report`
+and `Repo::pull_local_with_report`, and from
+`CollectionPullStats::changed_refs` of a pull with `--collection`. With
+`auto-update-summary` and its alias `commit-update-summary` false or absent,
+a pull with no `--collection` calls `Repo::pull` or `Repo::pull_local`,
+which read no old ref.
 
 A mirror pull that writes `summary` writes no file under
 `extensions/ostrya/summary/`. It writes `summary` and `summary.sig` through
 temp files in `tmp/`, as `ostrya summary -u` writes them, and syncs the
-repository root after the two moves.
+repository root after the two moves. Under `auto-update-summary`, the command
+keeps this copy and writes no summary of its own.
 
 A read of a summary of the repository by the port, `summary`,
 `summary.sig`, or a file under `extensions/ostrya/summary/`, opens the file

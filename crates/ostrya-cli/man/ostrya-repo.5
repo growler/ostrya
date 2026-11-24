@@ -258,7 +258,7 @@ A read of a summary by \fB\%ostrya serve\fR refuses a symbolic link with no erro
 .TP
 \fB\%<repo>/extensions/ostrya/summary/\fR
 The summaries of the authentication items of the client groups.
-\fB\%ostrya summary \-u\fR makes the directory and writes its files.
+\fB\%ostrya summary \-u\fR makes the directory and writes its files, and a summary write under \fB\%auto\-update\-summary\fR does the same.
 In the names below, \fB\%<hex>\fR is the SHA\-256 digest, in 64 lowercase hex digits, of the text of an item.
 \fB\%ostrya summary \-u\fR removes the files of each item that has no summary, and leaves each other entry.
 \fB\%ostrya serve\fR serves no path under \fB\%extensions/ostrya/\fR.
@@ -298,6 +298,8 @@ The temporary files of a write are in \fB\%tmp/\fR, so \fB\%deltas/\fR, \fB\%del
 The root summary: each ref and its commit, the static deltas, and the repository metadata.
 It holds each local ref and each collection ref, whatever the client groups, and states the mode of the repository.
 \fB\%ostrya summary \-u\fR writes it, and \fB\%ostrya summary \-u \-c\fR leaves it as it is.
+Under the key \fB\%auto\-update\-summary\fR, \fB\%ostrya receive\fR, \fB\%ostrya serve\fR, \fB\%ostrya commit\fR, \fB\%ostrya pull\fR, and \fB\%ostrya pull\-local\fR also write it after a change of a ref, as \fB\%ostrya\-config\fR(1) states.
+\fB\%ostrya pull \-\-mirror\fR with no ref copies the \fB\%summary\fR of the remote to it.
 \fB\%ostrya summary \-v\fR and a local pull read it.
 A local pull reads \fB\%summary\fR and \fB\%summary.sig\fR of its source repository with no symbolic link followed, and refuses a file that is not a regular file.
 \fB\%ostrya serve\fR and \fB\%ostrya send\fR never serve it.
@@ -307,6 +309,9 @@ A summary is at most 64 MiB: \fB\%ostrya summary \-u\fR refuses a larger summary
 \fB\%<repo>/summary.sig\fR
 The signatures of the summary.
 \fB\%ostrya summary \-u \-\-sign\fR and \fB\%\-\-gpg\-sign\fR write it.
+A summary write under \fB\%auto\-update\-summary\fR writes it with the key groups that \fB\%sign\-summary\fR of \fB\%[ex\-ostrya server]\fR names.
+\fB\%ostrya pull \-\-mirror\fR with no ref copies the \fB\%summary.sig\fR of the remote to it.
+If the remote has no \fB\%summary.sig\fR, this file stays as it is.
 A regeneration of the summary with no key removes it.
 \fB\%ostrya summary \-u \-c\fR leaves it as it is.
 .TP

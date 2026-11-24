@@ -809,6 +809,72 @@ fn a_file_candidate_is_a_local_repository() {
     assert!(!other.join("refs/mirrors").join(ID).exists());
 }
 
+/// With `[core] auto-update-summary=true`, a collection pull from an HTTP
+/// candidate and from a `file://` candidate writes `refs/mirrors/ID/REF`, and
+/// then the summary, which lists the ref in its collection map. The write
+/// removes the old `summary.sig`. A second pull that changes no ref writes no
+/// summary.
+#[test]
+fn a_collection_pull_writes_the_auto_summary() {
+    const MARKER: &[u8] = b"marker signature";
+    let dir = TmpDir::new("auto-summary");
+    let a = dir.path().join("a");
+    init(&a, Some(ID));
+    let stable = commit(&a, "a1", REF, TS);
+    let serving = Serving::start(&a);
+    let file_url = format!("file://{}", a.display());
+
+    for (kind, url) in [("http", serving.url.as_str()), ("file", file_url.as_str())] {
+        let client = dir.path().join(format!("client-{kind}"));
+        init(&client, None);
+        configure(&client, &http_remote("a", url, ID));
+        ok(
+            &client,
+            &["config", "set", "core.auto-update-summary", "true"],
+        );
+        let summary = client.join("summary");
+        let sig = client.join("summary.sig");
+        std::fs::write(&sig, MARKER).unwrap();
+
+        let out = ostrya(&client, &["pull", "--collection", ID, REF]);
+        assert!(out.status.success(), "{kind}: {}", stderr(&out));
+        assert_eq!(stderr(&out), "", "{kind}");
+        assert_eq!(
+            ref_file(&client, &format!("refs/mirrors/{ID}/{REF}")).as_ref(),
+            Some(&stable),
+            "{kind}"
+        );
+        let bytes = std::fs::read(&summary).expect("the pull wrote the summary");
+        let parsed = ostrya::Summary::parse(&bytes).unwrap();
+        assert!(parsed.refs.is_empty(), "{kind}");
+        let map: Vec<(String, Vec<(String, String)>)> = parsed
+            .collection_map()
+            .unwrap()
+            .into_iter()
+            .map(|(id, refs)| {
+                let refs = refs
+                    .into_iter()
+                    .map(|entry| (entry.name, entry.commit.to_hex()))
+                    .collect();
+                (id, refs)
+            })
+            .collect();
+        assert_eq!(
+            map,
+            [(ID.to_owned(), vec![(REF.to_owned(), stable.clone())])],
+            "{kind}"
+        );
+        assert!(!sig.exists(), "{kind}");
+
+        std::fs::remove_file(&summary).unwrap();
+        std::fs::write(&sig, MARKER).unwrap();
+        let out = ostrya(&client, &["pull", "--collection", ID, REF]);
+        assert!(out.status.success(), "{kind}: {}", stderr(&out));
+        assert!(!summary.exists(), "{kind}");
+        assert_eq!(std::fs::read(&sig).unwrap(), MARKER, "{kind}");
+    }
+}
+
 /// A pull that fetches from an HTTP candidate and imports from a `file://`
 /// candidate prints two statistics lines: the line of the fetch, and then
 /// the line of the import. The client is a `bare-user` repository, so the

@@ -91,6 +91,7 @@ In the \fB\%config\fR of a bucket repository, \fB\%ostrya remote init \-\-collec
 \fB\%fsync\fR (boolean, default true)
 Sync each write to disk before it completes.
 \fB\%ostrya commit \-\-fsync=false\fR, and \fB\%\-\-disable\-fsync\fR of \fB\%ostrya pull\fR and \fB\%ostrya pull\-local\fR, turn the sync off for one command.
+The summary that a command writes under \fB\%auto\-update\-summary\fR follows this key alone.
 .TP
 \fB\%per\-object\-fsync\fR (boolean, default false)
 Sync each content object when it is staged.
@@ -137,15 +138,17 @@ In an archive repository, the summary of each authentication item also records i
 Write each summary again after a command that reads the key changes a ref, as \fB\%ostrya summary \-u\fR writes them.
 \fB\%ostrya receive\fR and \fB\%ostrya serve\fR read it after a push that changes a ref.
 \fB\%ostrya commit\fR reads it after a run that writes a tag or a branch that is not a remote ref.
+\fB\%ostrya pull\fR and \fB\%ostrya pull\-local\fR read it after a run that creates or moves a ref that is not a remote ref.
 A run that writes no such ref does not read the key and writes no summary.
+\fB\%ostrya pull \-\-mirror\fR with no ref keeps the summary that it copies from the remote, and does not read the key.
 The key groups that \fB\%sign\-summary\fR of \fB\%[ex\-ostrya server]\fR names sign each summary, the GPG keys first.
 With no \fB\%sign\-summary\fR, the summary has no signature, and the old \fB\%summary.sig\fR is removed.
-In a repository with a collection id, \fB\%ostrya commit\fR writes no new \fB\%ostree\-metadata\fR commit.
+In a repository with a collection id, \fB\%ostrya commit\fR, \fB\%ostrya pull\fR, and \fB\%ostrya pull\-local\fR write no new \fB\%ostree\-metadata\fR commit.
 \fB\%ostrya receive\fR and \fB\%ostrya serve\fR write one.
-After a run of \fB\%ostrya commit\fR that writes a tag or a branch that is not a remote ref, a value that is not a boolean, or a failed write, makes the command exit 1.
-The commit and the refs stay.
+After a run of \fB\%ostrya commit\fR, \fB\%ostrya pull\fR, or \fB\%ostrya pull\-local\fR that writes such a ref, a value that is not a boolean, or a failed write, makes the command exit 1.
+The objects and the refs stay.
+The summary write follows \fB\%fsync\fR alone, so \fB\%ostrya commit \-\-fsync=false\fR and \fB\%ostrya pull \-\-disable\-fsync\fR do not change it.
 \fB\%ostrya receive \-\-one\-way\fR writes no summary.
-\fB\%ostrya pull\fR does not write the summary.
 .TP
 \fB\%commit\-update\-summary\fR (boolean, default false)
 A deprecated name of \fB\%auto\-update\-summary\fR.

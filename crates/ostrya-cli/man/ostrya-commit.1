@@ -198,9 +198,9 @@ Start from the given commit as a base.
 No modifiers apply to the base. The base is the bottom layer at any position on the command line, and the tree sources go on top of it. An entry that no source changes keeps the mode, the owner, and the extended attributes of the base. If the option occurs more than once, the last value wins.
 .TP
 \fB\-\-consume\fR
-Delete the files of each directory source while the command reads it.
+Remove each directory source after the commit.
 .IP
-The command removes each source entry after it records the entry. It also removes the entries that \%\-\-skip\-list prunes. Then it removes the source directory, unless the path is exactly \fB\%\&.\fR\&. A \fB\%tar\fR or \fB\%ref\fR source ignores this switch. If a later step fails, the removed files stay removed.
+The command first writes the commit and the refs, and prints its output. Then it removes each \fB\%dir=\fR source and PATH, with all files in it. This includes the entries that \%\-\-skip\-list prunes. If the last component of the path is \fB\%\&.\fR, for example \fB\%\&.\fR, \fB\%\&./\fR, or \fB\%a/.\fR, the command removes the contents and keeps the directory. A \fB\%tar\fR or \fB\%ref\fR source ignores this switch. If the command writes no commit, it removes no source. If a removal fails, the command prints the path and the error, removes the other sources, and exits \%1. The commit and the refs stay.
 .TP
 \fB\-\-tar\-autocreate\-parents\fR
 Create the missing parent directories of the members of a tar archive.

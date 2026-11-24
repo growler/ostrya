@@ -5,10 +5,11 @@
 //! `Transaction::overlay_tree_to_mtree` hold the behavior that a caller sees.
 //! The object writers are in `write.rs`.
 
+use std::ffi::OsStr;
 use std::future::Future;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use ostrya_core::{DirMeta, RepoMode, Xattrs};
@@ -548,11 +549,15 @@ fn walk_dir<'a>(
                 // stays, the source stays half removed, and the removal of its
                 // directory fails.
                 if consume {
-                    remove_tree(
-                        dir_fd.as_fd(),
-                        &entry.name,
-                        matches!(entry.kind, EntryKind::Dir),
-                    )?;
+                    if matches!(entry.kind, EntryKind::Dir) {
+                        // A subtree can be large, so its removal runs on the
+                        // blocking pool with a copy of the descriptor.
+                        let level = dir_fd.try_clone()?;
+                        let name = entry.name;
+                        ostrya_rt::unblock(move || remove_tree(level.as_fd(), &name)).await?;
+                    } else {
+                        unlink(dir_fd.as_fd(), &entry.name, false)?;
+                    }
                 }
                 continue;
             }
@@ -975,9 +980,9 @@ fn open_walk_root(dfd: BorrowedFd<'_>, path: &Path) -> Result<OwnedFd> {
 /// function keeps the root. It removes the root for each other spelling, `./`
 /// included. This is the rule of `ostree commit --consume`.
 ///
-/// The CLI opens each source and removes its own walk root, so this function
-/// runs only for a caller of the library API. The function ignores a failed
-/// removal for these reasons:
+/// The CLI does not set `CONSUME`. It removes each source after the commit
+/// with [`remove_source_tree`], so this function runs only for a caller of the
+/// library API. The function ignores a failed removal for these reasons:
 ///
 /// - If the root is already removed, nothing is left to remove.
 /// - An empty path names `dfd` itself.
@@ -989,61 +994,174 @@ fn remove_walk_root(dfd: BorrowedFd<'_>, path: &Path) {
     let _ = rustix::fs::unlinkat(dfd, path, AtFlags::REMOVEDIR);
 }
 
+/// Removes the source tree at `path` under `dfd`, with all entries in it.
+///
+/// A caller calls this function after the commit of a directory source, so
+/// that the source stays in place if the commit fails. The commit does not
+/// need [`CONSUME`](crate::CommitModifierFlags::CONSUME) for it.
+///
+/// The function removes each entry below `path`, and then the directory at
+/// `path`. If the last component of `path` is `.`, for example `.`, `./`, or
+/// `a/.`, the function removes the entries and keeps the directory. An empty
+/// `path` names `dfd` itself and has the same result as `.`. An absolute
+/// `path` ignores `dfd`, so an absolute path to the working directory removes
+/// that directory. `dfd` can be [`rustix::fs::CWD`]: then a relative `path`
+/// starts at the working directory, and the function needs no read
+/// permission on the working directory.
+///
+/// The function strips trailing slashes from `path` before it opens the
+/// directory, and it does not follow a symlink at `path`. A symlink or a file
+/// at `path` gives an error, and the function removes nothing. The function
+/// removes a symlink in the tree and does not follow it. If nothing is at
+/// `path`, the function returns `Ok(())`, because nothing is left to remove.
+///
+/// # File system access
+///
+/// The removal runs on the blocking pool. It holds a copy of `dfd`, except
+/// for [`rustix::fs::CWD`], and at most two descriptors of the tree: the
+/// descriptor of the current directory, and for a short time the descriptor
+/// of the next directory down or up. So it removes a tree that is deeper than
+/// the descriptor limit of the process. It goes back up the tree through
+/// `..`, so the tree must not move during the call. If the caller drops the
+/// future, a removal that has started runs to its end.
+///
+/// The read of a directory unlinks each entry that is not a directory when
+/// the read returns it. For each directory on the path from `path` to the
+/// current directory, the removal holds the name of the directory and the
+/// names of its subdirectories that are not removed yet. The memory thus
+/// grows with the depth of the tree and the number of subdirectories on that
+/// path, and not with the number of files in a directory.
+///
+/// # Errors
+///
+/// - [`Error::ConsumeUnlink`] if the open, the read, or the removal of an
+///   entry fails, or if the name of an entry below `path` is not valid UTF-8.
+///   The error names the entry, with each byte that is not valid UTF-8 shown
+///   as the replacement character. For the directory at `path`, it names
+///   `path` with its trailing slashes removed, or `.` for an empty `path`. An
+///   entry with a name that is not valid UTF-8 stays. The entries that the
+///   function removed before the failure stay removed.
+/// - [`Error::Io`] if the copy of `dfd` fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn run() -> ostrya::Result<()> {
+/// use std::os::fd::AsFd;
+///
+/// let cwd = std::fs::File::open(".")?;
+/// ostrya::remove_source_tree(cwd.as_fd(), "src".as_ref()).await?;
+/// # Ok(()) }
+/// ```
+pub async fn remove_source_tree(dfd: BorrowedFd<'_>, path: &Path) -> Result<()> {
+    // `AT_FDCWD` is not a descriptor, so it has no copy. It is valid on each
+    // thread, so the closure uses it as it is.
+    let copy = if dfd.as_raw_fd() == rustix::fs::CWD.as_raw_fd() {
+        None
+    } else {
+        Some(dfd.try_clone_to_owned()?)
+    };
+    let path = path.to_owned();
+    ostrya_rt::unblock(move || {
+        let dir = copy.as_ref().map_or(rustix::fs::CWD, |copy| copy.as_fd());
+        let bytes = path.as_os_str().as_bytes();
+        let mut end = bytes.len();
+        while end > 1 && bytes[end - 1] == b'/' {
+            end -= 1;
+        }
+        let root = match &bytes[..end] {
+            b"" => b".".as_slice(),
+            trimmed => trimmed,
+        };
+        // The test is on the bytes. `Path::components` drops a `.` that is
+        // not the first component, so it cannot see `a/.`.
+        let keep_root = root == b"." || root.ends_with(b"/.");
+        let root = Path::new(OsStr::from_bytes(root));
+        let level = match open_dir(dir, root) {
+            Ok(level) => level,
+            Err(Errno::NOENT) => return Ok(()),
+            Err(err) => return Err(unlink_error(root, err)),
+        };
+        remove_opened_tree(dir, level, root, keep_root)
+    })
+    .await
+}
+
 /// Unlinks an entry from a directory: a file, or a directory with
 /// `AT_REMOVEDIR`.
 ///
 /// The error of a failed removal names the entry, as the `ostree` command
 /// reports it.
-fn unlink(dir: BorrowedFd<'_>, name: &str, is_dir: bool) -> Result<()> {
+fn unlink(dir: BorrowedFd<'_>, name: &(impl AsRef<Path> + ?Sized), is_dir: bool) -> Result<()> {
     let flags = if is_dir {
         AtFlags::REMOVEDIR
     } else {
         AtFlags::empty()
     };
-    rustix::fs::unlinkat(dir, name, flags).map_err(|err| unlink_error(name, err))
+    rustix::fs::unlinkat(dir, name.as_ref(), flags).map_err(|err| unlink_error(name, err))
 }
 
-/// Removes `name` under `dir` and all entries below it.
+/// Removes the directory `name` under `dir` and all entries below it.
 ///
-/// A consuming walk uses it for an entry that the filter keeps out of the
+/// A consuming walk uses it for a directory that the filter keeps out of the
 /// commit. The walk does not visit the children of such an entry, so it does
 /// not remove them one by one.
-///
-/// The removal is a loop over an explicit stack of levels. One descriptor is
-/// open at a time. A descent replaces the descriptor of the level with the
-/// descriptor of the child. An ascent replaces it with the descriptor that
-/// `..` opens. `..` names the parent because the emptied level is still linked
-/// where it was opened.
-///
-/// Each level costs a name and an entry list on the heap. The function can
-/// remove a subtree that is deeper than the descriptor limit of the process.
-fn remove_tree(dir: BorrowedFd<'_>, name: &str, is_dir: bool) -> Result<()> {
-    if !is_dir {
-        return unlink(dir, name, false);
-    }
-    let mut level = open_dir(dir, name).map_err(|err| unlink_error(name, err))?;
-    // One entry for each level from `name` to the current level: the name of
-    // the level, and the entries left to remove in it.
-    let mut levels = vec![(name.to_owned(), read_level(level.as_fd(), name)?)];
+fn remove_tree(dir: BorrowedFd<'_>, name: &str) -> Result<()> {
+    let level = open_dir(dir, name).map_err(|err| unlink_error(name, err))?;
+    remove_opened_tree(dir, level, Path::new(name), false)
+}
 
-    while let Some((_, entries)) = levels.last_mut() {
-        match entries.pop() {
-            Some((child, false)) => unlink(level.as_fd(), &child, false)?,
-            Some((child, true)) => {
-                let child_fd =
-                    open_dir(level.as_fd(), &child).map_err(|err| unlink_error(&child, err))?;
-                let child_entries = read_level(child_fd.as_fd(), &child)?;
-                level = child_fd;
-                levels.push((child, child_entries));
+/// Removes all entries below `name` under `dir`, and then `name` itself
+/// unless `keep_root` is set. `level` is the open descriptor of `name`.
+///
+/// The removal is a loop over an explicit stack of levels. The descriptor of
+/// the current level is open, and at most one more for a short time. A
+/// descent replaces the descriptor of the level with the descriptor of the
+/// child. An ascent replaces it with the descriptor that `..` opens. `..`
+/// names the parent because the emptied level is still linked where it was
+/// opened.
+///
+/// The read of a level unlinks each entry that is not a directory when the
+/// read returns it. So each level on the path from `name` to the current
+/// level holds its own name and the names of its subdirectories that are not
+/// removed yet, and no other name. The function can remove a subtree that is
+/// deeper than the descriptor limit of the process.
+fn remove_opened_tree(
+    dir: BorrowedFd<'_>,
+    level: OwnedFd,
+    name: &Path,
+    keep_root: bool,
+) -> Result<()> {
+    let mut level = Dir::new(level).map_err(|err| unlink_error(name, err))?;
+    // One entry for each level from `name` to the current level: the name of
+    // the level, and the names of the subdirectories left to remove in it.
+    let mut levels = vec![(name.to_owned(), clear_level(&mut level, name)?)];
+
+    while let Some((_, subdirs)) = levels.last_mut() {
+        let level_fd = level.fd().map_err(|err| unlink_error(name, err))?;
+        match subdirs.pop() {
+            Some(child) => {
+                let mut child_dir = open_dir(level_fd, &child)
+                    .and_then(Dir::new)
+                    .map_err(|err| unlink_error(&child, err))?;
+                let child_subdirs = clear_level(&mut child_dir, Path::new(&child))?;
+                level = child_dir;
+                levels.push((PathBuf::from(child), child_subdirs));
             }
             None => {
                 let (cleared, _) = levels.pop().expect("a level is in hand within the loop");
                 if levels.is_empty() {
                     drop(level);
+                    if keep_root {
+                        return Ok(());
+                    }
                     return unlink(dir, &cleared, true);
                 }
-                level = open_dir(level.as_fd(), "..").map_err(|err| unlink_error(&cleared, err))?;
-                unlink(level.as_fd(), &cleared, true)?;
+                level = open_dir(level_fd, "..")
+                    .and_then(Dir::new)
+                    .map_err(|err| unlink_error(&cleared, err))?;
+                let parent_fd = level.fd().map_err(|err| unlink_error(&cleared, err))?;
+                unlink(parent_fd, &cleared, true)?;
             }
         }
     }
@@ -1051,49 +1169,68 @@ fn remove_tree(dir: BorrowedFd<'_>, name: &str, is_dir: bool) -> Result<()> {
 }
 
 /// Opens `name` under `dir` as a directory, no-follow.
-fn open_dir(dir: BorrowedFd<'_>, name: &str) -> std::result::Result<OwnedFd, Errno> {
+fn open_dir(
+    dir: BorrowedFd<'_>,
+    name: &(impl AsRef<Path> + ?Sized),
+) -> std::result::Result<OwnedFd, Errno> {
     rustix::fs::openat(
         dir,
-        name,
+        name.as_ref(),
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
 }
 
-/// Returns the entries of one directory level, each with a flag that is `true`
-/// for a directory.
+/// Reads one directory level, unlinks each entry that is not a directory when
+/// the read returns it, and returns the names of the subdirectories.
 ///
-/// `name` is the name of the level. The error of a failed read names it.
-fn read_level(level: BorrowedFd<'_>, name: &str) -> Result<Vec<(String, bool)>> {
-    let mut entries = Vec::new();
-    for entry in Dir::read_from(level).map_err(|err| unlink_error(name, err))? {
+/// `name` is the name of the level. The error of a failed read names it. The
+/// type comes from the directory entry. Only an entry of unknown type costs a
+/// `stat`. A name that is not valid UTF-8 stops the read with an error that
+/// names the entry, and the entry stays.
+fn clear_level(level: &mut Dir, name: &Path) -> Result<Vec<String>> {
+    let mut subdirs = Vec::new();
+    while let Some(entry) = level.read() {
         let entry = entry.map_err(|err| unlink_error(name, err))?;
         let child_name = entry.file_name();
         if child_name == c"." || child_name == c".." {
             continue;
         }
-        let child_name = child_name
-            .to_str()
-            .map_err(|_| Error::InvalidFormat("directory entry name is not valid UTF-8".into()))?
-            .to_owned();
-        let stat = rustix::fs::statat(level, child_name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|err| unlink_error(&child_name, err))?;
-        let child_is_dir = FileType::from_raw_mode(stat.st_mode) == FileType::Directory;
-        entries.push((child_name, child_is_dir));
+        let Ok(child_str) = child_name.to_str() else {
+            return Err(Error::ConsumeUnlink {
+                name: child_name.to_string_lossy().into_owned(),
+                reason: "Name is not valid UTF-8".to_owned(),
+            });
+        };
+        let level_fd = level.fd().map_err(|err| unlink_error(name, err))?;
+        let child_is_dir = match entry.file_type() {
+            FileType::Unknown => {
+                let stat = rustix::fs::statat(level_fd, child_name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|err| unlink_error(child_str, err))?;
+                FileType::from_raw_mode(stat.st_mode) == FileType::Directory
+            }
+            file_type => file_type == FileType::Directory,
+        };
+        if child_is_dir {
+            subdirs.push(child_str.to_owned());
+        } else {
+            rustix::fs::unlinkat(level_fd, child_name, AtFlags::empty())
+                .map_err(|err| unlink_error(child_str, err))?;
+        }
     }
-    Ok(entries)
+    Ok(subdirs)
 }
 
 /// Returns the error of a failed removal: the name of the entry and the
 /// reason, in the words of the `ostree` command.
-fn unlink_error(name: &str, err: Errno) -> Error {
+fn unlink_error(name: &(impl AsRef<Path> + ?Sized), err: Errno) -> Error {
     let reason = std::io::Error::from(err).to_string();
     let reason = match reason.find(" (os error ") {
         Some(cut) => reason[..cut].to_owned(),
         None => reason,
     };
     Error::ConsumeUnlink {
-        name: name.to_owned(),
+        name: name.as_ref().to_string_lossy().into_owned(),
         reason,
     }
 }

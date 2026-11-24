@@ -977,12 +977,12 @@ refusal comes at the end of the command, after the signatures.
 
 The five tree-source options carry seven divergences between them, and the
 walk of a filesystem source carries the divergences its own paragraph states
-below. The composition rule, the source list, the two type-change refusals,
-`--base`, `--consume`, `--generate-sizes` over any source list, and the two tar
-options otherwise agree with the tool over every form the cells and the tests
-hold, each accepted form checked by the commit checksum and each refusal by its
-text (`cli-behavior.md`, "CLI output formats", `commit`, and that file's
-"The tar import options").
+below. `--consume` parts from the tool as its own paragraph states below. The
+composition rule, the source list, the two type-change refusals, `--base`,
+`--generate-sizes` over any source list, and the two tar options otherwise agree
+with the tool over every form the cells and the tests hold, each accepted form
+checked by the commit checksum and each refusal by its text (`cli-behavior.md`,
+"CLI output formats", `commit`, and that file's "The tar import options").
 
 The first is the source a command line naming neither `--tree` nor a positional
 `PATH` states. The tool walks the current working directory; the port reads a
@@ -1285,6 +1285,37 @@ above (`../format-reference.md`, "The tar import"):
   these records. A global `path`, `linkpath`, or `size` record has no effect in
   either. A global `mtime`, `atime`, `ctime`, `uname`, or `gname` record has no
   effect on the tree of the port. No matrix cell states the case.
+
+`--consume` removes the sources at a different step, and this is not counted
+among the seven above. The tool removes each entry of a `dir=` source when the
+walk reads it, before the commit object and the ref
+(`cli-behavior.md`, "CLI output formats", `commit`). The port walks each
+source and does not change it. After the commit and the refs are written and
+the output is printed, the port removes each `dir=` source and the positional
+`PATH`, in order, with all entries in it. A run that writes the commit gives
+the same result in both: the source is gone, or it is an empty directory when
+the path text is exactly `.` (`commit_consume_matches_the_tool` in
+`crates/ostrya-cli/tests/cli.rs`). These outcomes part:
+
+- A run that fails after the walk, for example over a timestamp that does not
+  parse, a branch name that is not valid, or a later source that does not
+  open. The tool leaves the removed entries removed. The
+  port leaves each source in place. Neither writes a commit or a ref
+  (`commit_consume_keeps_the_source_when_the_run_fails`).
+- A path whose last component is `.` and whose text is not exactly `.`, for
+  example `./` or `a/.`. The tool reports `error: unlinkat(./): Invalid
+  argument` for `./` at exit 1 and writes no commit. The port writes the
+  commit, removes the contents, and keeps the directory
+  (`commit_consume_keeps_a_directory_spelled_dot`). Not observed: `a/.` in the
+  tool.
+- A removal that fails. The tool reports `error: unlinkat(<name>): <reason>` at
+  exit 1 and writes no commit. The port keeps the commit and the refs, prints
+  its output, reports `error: <path>: unlinkat(<name>): <reason>`, removes the
+  other sources, and exits 1
+  (`commit_consume_reports_a_failed_removal_and_removes_the_other_sources`).
+- A run under `--skip-if-unchanged` that writes no commit. The port removes no
+  source (`commit_consume_with_skip_if_unchanged_keeps_the_source`). Not
+  observed: the tool in this case.
 
 The walk of a filesystem source carries divergences apart from the seven
 above: the wording of each refusal of an entry, and two outcomes. The walk
@@ -1636,8 +1667,10 @@ not. Nine divergences stand:
     reports the empty tree and leaves the directory in place. Over a source
     directory holding one regular file the removal fails and the tool reports
     `error: unlinkat(<path>): Directory not empty`, where the port reports the
-    empty tree; both leave the tree and its content in place. Under `--base` both
-    write the same commit and the removal alone parts them.
+    empty tree; both leave the tree and its content in place. Under `--base` the
+    port writes the commit the base states and then removes the whole source
+    (`commit_consume_removes_the_source_under_a_pruned_walk_root_with_base`),
+    where the tool attempts the removal of the source directory alone.
   - Over `--tree=tar=<path>` the tool reads the stream, the archive format being
     detected only by the read the pruned walk skips. A file that is not an
     archive reports `error: archive_read_open_filename: Unrecognized archive
@@ -1947,11 +1980,12 @@ stand.
   at exit 1. A `commit` refusal leaves no published state on either side: no
   object in `objects/`, no `.commitmeta`, and the ref where it stood. This holds
   for a sign failure, for a `dir=` source that does not open, for a `tar=`
-  source that does not open, for a `--consume` removal that fails, for a
-  `--tar-pathname-filter` value the reader refuses, for a `--base` revision that
-  does not resolve, for a `--tree=ref=REV` value that does not resolve, for a
-  timestamp the reader refuses, and for a branch name the refspec grammar
-  refuses. A branch name of 64 lowercase hex characters parts the two: the tool
+  source that does not open, for a `--tar-pathname-filter` value the reader
+  refuses, for a `--base` revision that does not resolve, for a
+  `--tree=ref=REV` value that does not resolve, for a timestamp the reader
+  refuses, and for a branch name the refspec grammar refuses. A `--consume`
+  removal that fails comes after the port publishes the commit and the refs,
+  and the port then exits 1. A branch name of 64 lowercase hex characters parts the two: the tool
   writes the tree and the commit object before it reads the name, so its
   refusal leaves them in `objects/`, and the port publishes none
   (`ostrya_cli::cli::commit_checksum_branch_name_matches_the_tool`). For a

@@ -1733,6 +1733,7 @@ dependencies = [
  "ostrya-rt",
  "ostrya-server",
  "pcre2",
+ "rustix",
 ]
 
 [[package]]

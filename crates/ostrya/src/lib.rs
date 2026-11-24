@@ -193,6 +193,7 @@ pub use image_commit::{
     COMPOSEFS_RELATION, ComposefsImage, ComposefsImageDefect, ComposefsImageSource,
     ComposefsSupplementAdd,
 };
+pub use ingest::remove_source_tree;
 pub use lock::LockKind;
 #[doc(hidden)]
 pub use media::{

@@ -353,7 +353,8 @@ pub enum Error {
     #[error("tar: {0}")]
     Tar(String),
     /// A failure to remove an entry of the source under
-    /// [`CONSUME`](crate::CommitModifierFlags::CONSUME).
+    /// [`CONSUME`](crate::CommitModifierFlags::CONSUME), or in
+    /// [`remove_source_tree`](crate::remove_source_tree).
     ///
     /// The fields hold the name of the entry and the reason of the failure.
     #[error("unlinkat({name}): {reason}")]

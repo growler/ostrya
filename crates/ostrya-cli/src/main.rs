@@ -1277,13 +1277,17 @@ struct CommitArgs {
     /// the last value wins.
     #[arg(long, value_name = "REV", overrides_with = "base")]
     base: Option<String>,
-    /// Delete the files of each directory source while the command reads it.
+    /// Remove each directory source after the commit.
     ///
-    /// The command removes each source entry after it records the entry. It
-    /// also removes the entries that --skip-list prunes. Then it removes the
-    /// source directory, unless the path is exactly `.`. A `tar` or `ref`
-    /// source ignores this switch. If a later step fails, the removed files
-    /// stay removed.
+    /// The command first writes the commit and the refs, and prints its
+    /// output. Then it removes each `dir=` source and PATH, with all files in
+    /// it. This includes the entries that --skip-list prunes. If the last
+    /// component of the path is `.`, for example `.`, `./`, or `a/.`, the
+    /// command removes the contents and keeps the directory. A `tar` or `ref`
+    /// source ignores this switch. If the command writes no commit, it removes
+    /// no source. If a removal fails, the command prints the path and the
+    /// error, removes the other sources, and exits 1. The commit and the refs
+    /// stay.
     #[arg(long)]
     consume: bool,
     /// Create the missing parent directories of the members of a tar archive.
@@ -9563,8 +9567,7 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
 
     // `--base` is the bottom layer of the source list at any position on the
     // command line. It resolves before the tree specifications. The error for a
-    // base that does not resolve then comes before a source that does not open,
-    // and before `--consume` removes anything.
+    // base that does not resolve then comes before a source that does not open.
     let base = match args.base.as_deref() {
         Some(rev) => match repo.resolve_rev(rev, false).await {
             Ok(found) => found,
@@ -9588,8 +9591,8 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     let mut mtree = MutableTree::new();
     // The sources are read before `--timestamp`, one at a time and in order.
     // The error for a source that does not open then comes at the step of the
-    // `ostree` command. If a later source fails, a source that `--consume`
-    // emptied stays empty.
+    // `ostree` command. `--consume` removes the sources only after the commit,
+    // so a failure of a later source leaves each source in place.
     let specs = refuse!(tree_specs(&args));
     // The base is the bottom layer, and no modifier applies to it. Each entry
     // that no later source changes keeps the mode, the owner, and the extended
@@ -9600,8 +9603,16 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         txn.overlay_tree_to_mtree(&commit.root_dirtree, &commit.root_dirmeta, &mut mtree, None)
             .await?;
     }
+    let mut consumed: Vec<PathBuf> = Vec::new();
     for spec in specs {
         let source = refuse!(open_tree_source(&repo, spec).await?);
+        // The path is kept before the test for a pruned walk root. A commit
+        // over `--base` then still removes the whole source.
+        if args.consume
+            && let OpenSource::Dir(_, path) = &source
+        {
+            consumed.push(path.clone());
+        }
         // If a skip list names the walk root, it prunes the whole walk. The
         // source is opened, so a source that does not open is reported here.
         // The filter gets no entry under the root, so every other entry of
@@ -9669,6 +9680,7 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         if previous.root_dirtree == *root.dirtree_checksum()
             && previous.root_dirmeta == *root.dirmeta_checksum()
         {
+            // No commit is written, so `--consume` removes no source.
             txn.abort().await?;
             if args.table_output {
                 print_skipped_commit_table(&parent);
@@ -9801,6 +9813,11 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         print_commit_table(&checksum, &stats);
     } else {
         println!("{}", checksum.to_hex());
+    }
+    // The output comes first, and then the removal. A failed removal exits 1,
+    // and the commit and the refs stay.
+    if !remove_consumed_sources(&consumed).await {
+        exit_process(1);
     }
     Ok(())
 }
@@ -10868,7 +10885,8 @@ fn leading_u32(text: &str) -> u32 {
 /// One tree source that a `commit` command line names.
 enum TreeSpec {
     /// `--tree=dir=PATH`, and the positional `PATH`. The path is kept as the
-    /// command line gives it, because `--consume` reads that text.
+    /// command line gives it, because the removal of `--consume` tests the
+    /// last component of that text.
     Dir(PathBuf),
     /// `--tree=tar=PATH`. The `ostree` command writes standard input as `-`,
     /// and also reaches it through `/dev/stdin`.
@@ -10928,9 +10946,8 @@ fn tree_specs(args: &CommitArgs) -> std::result::Result<Vec<TreeSpec>, String> {
 ///
 /// The caller opens and overlays the sources one at a time and in order. The
 /// error for a source that does not open then comes after every earlier source
-/// is read. It also comes after `--consume` removed the paths of those sources.
-/// The timestamp is read after the last source is overlaid, so this error comes
-/// before the error for a refused timestamp.
+/// is read. The timestamp is read after the last source is overlaid, so this
+/// error comes before the error for a refused timestamp.
 ///
 /// If a `dir=` or a `tar=` source does not open, the function returns the
 /// message and does not exit. The caller holds an open transaction, and its
@@ -11007,26 +11024,9 @@ async fn overlay_source(
     modifier: Option<&mut CommitModifier>,
 ) -> Result<std::result::Result<(), String>> {
     match source {
-        OpenSource::Dir(dfd, path) => {
+        OpenSource::Dir(dfd, _) => {
             txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("."), mtree, modifier)
                 .await?;
-            // After the contents are ingested, `--consume` removes the source
-            // directory itself, unless the path is `.`. The test is on the
-            // text, so an absolute path that names the working directory is
-            // removed, and `./` is also removed. A comparison with `Path`
-            // equality loses this difference, because `./` and `.` name one
-            // directory. If the removal fails, the commit aborts and the
-            // message names the path, as the `ostree` command does.
-            if args.consume
-                && path.as_os_str() != "."
-                && let Err(err) = std::fs::remove_dir(&path)
-            {
-                return Ok(Err(format!(
-                    "unlinkat({}): {}",
-                    path.display(),
-                    io_reason(&err)
-                )));
-            }
             Ok(Ok(()))
         }
         OpenSource::Ref(dirtree, dirmeta) => {
@@ -11044,6 +11044,25 @@ async fn overlay_source(
             Ok(Ok(()))
         }
     }
+}
+
+/// Removes each source of `commit --consume`, in order, after the commit.
+///
+/// A path is read against the working directory. If a removal fails, the
+/// function prints the path and the error, and goes on with the next path.
+/// It returns `false` if a removal failed.
+async fn remove_consumed_sources(paths: &[PathBuf]) -> bool {
+    if paths.is_empty() {
+        return true;
+    }
+    let mut removed = true;
+    for path in paths {
+        if let Err(err) = ostrya::remove_source_tree(rustix::fs::CWD, path).await {
+            eprintln!("error: {}: {}", path.display(), error_line(&err));
+            removed = false;
+        }
+    }
+    removed
 }
 
 /// The PCRE2 start-of-pattern option for the `any` newline convention.
@@ -11384,11 +11403,6 @@ fn commit_modifier(
     }
     if args.devino_canonical {
         flags |= CommitModifierFlags::DEVINO_CANONICAL;
-    }
-    // `--consume` empties each file system source during its walk. Only that
-    // walk reads the flag, so a `tar` or a `ref` source ignores it.
-    if args.consume {
-        flags |= CommitModifierFlags::CONSUME;
     }
     let shapes_modes = args.mode_ro_executables || walk.shapes_modes();
     // An empty cache resolves nothing, so it asks for no modifier of its own.

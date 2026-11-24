@@ -9,7 +9,7 @@
 //! - the pruning of a subtree by the filter
 //! - an xattr callback that changes the object id
 //! - a devino-cache hit that skips the ingest of a file
-//! - the consumption of the source
+//! - the consumption of the source, and its removal after the commit
 //! - a round trip of a `user.*` xattr
 
 mod common;
@@ -1189,6 +1189,57 @@ fn consume_with_a_pruning_filter_still_empties_the_source() {
 }
 
 #[test]
+fn consume_with_a_filter_that_prunes_a_directory_empties_the_source() {
+    // The walk removes a pruned directory with its subtree on the blocking
+    // pool, and then goes on with the other entries.
+    let tmp = TmpDir::new("ingest-consume-prune-dir");
+    let base = tmp.path();
+    let src = base.join("src");
+    std::fs::create_dir_all(src.join("pruned/deeper")).unwrap();
+    std::fs::write(src.join("pruned/a.txt"), b"a\n").unwrap();
+    std::fs::write(src.join("pruned/deeper/b.txt"), b"b\n").unwrap();
+    std::fs::write(src.join("keep.txt"), b"keep\n").unwrap();
+    for path in ["pruned/deeper/b.txt", "pruned/a.txt", "keep.txt"] {
+        set_mode(&src.join(path), 0o644);
+    }
+    for path in ["pruned/deeper", "pruned", ""] {
+        set_mode(&src.join(path), 0o755);
+    }
+
+    block_on(async {
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let dfd = std::fs::File::open(base).unwrap();
+        let mut modifier =
+            CommitModifier::new(CommitModifierFlags::CONSUME | CommitModifierFlags::SKIP_XATTRS);
+        modifier.filter = Some(Box::new(|path, _meta| {
+            if path == Path::new("/pruned") {
+                FilterResult::Skip
+            } else {
+                FilterResult::Allow
+            }
+        }));
+        let mut mtree = MutableTree::new();
+        txn.write_dfd_to_mtree(
+            dfd.as_fd(),
+            Path::new("src"),
+            &mut mtree,
+            Some(&mut modifier),
+        )
+        .await
+        .unwrap();
+        txn.abort().await.unwrap();
+    });
+
+    assert!(
+        !src.exists(),
+        "the pruned directory is consumed with the rest"
+    );
+}
+
+#[test]
 fn modifier_callbacks_run_once_per_directory() {
     // The xattr callback runs exactly once for each path, directories
     // included.
@@ -1489,4 +1540,345 @@ fn ingest_a_deep_tree() {
     });
 
     assert!(!src.exists(), "the consuming walk emptied the deep source");
+}
+
+/// The environment variable that marks the re-executed child of
+/// [`remove_source_tree_removes_a_deep_tree_under_a_low_descriptor_limit`].
+/// Its value names the file that the child writes to record that the removal
+/// ran.
+const REMOVE_DEEP_CHILD: &str = "OSTRYA_REMOVE_DEEP_CHILD";
+/// The soft descriptor limit of the child.
+const REMOVE_DEEP_NOFILE: usize = 128;
+/// The depth of the tree that the child removes. It is much higher than
+/// [`REMOVE_DEEP_NOFILE`], so a removal that holds one descriptor for each
+/// level runs out.
+const REMOVE_DEEP_DEPTH: usize = 512;
+
+#[test]
+fn remove_source_tree_removes_a_deep_tree_under_a_low_descriptor_limit() {
+    // The limit applies to the whole process, and the tests of this binary
+    // run in parallel threads. For this reason, a child gets the lowered
+    // limit, as in `deep_source_tree_ingests_under_a_low_descriptor_limit`.
+    if let Some(marker) = std::env::var_os(REMOVE_DEEP_CHILD) {
+        remove_a_deep_tree();
+        std::fs::write(marker, b"removed").expect("record that the deep removal ran");
+        return;
+    }
+    let tmp = TmpDir::new("remove-deep-marker");
+    let marker = tmp.path().join("removed");
+    let exe = std::env::current_exe().expect("the path of the running test binary");
+    let status = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"ulimit -n "$1" || exit 111; shift; exec "$@""#)
+        .arg("sh")
+        .arg(REMOVE_DEEP_NOFILE.to_string())
+        .arg(&exe)
+        .arg("--exact")
+        .arg("remove_source_tree_removes_a_deep_tree_under_a_low_descriptor_limit")
+        .arg("--nocapture")
+        .env(REMOVE_DEEP_CHILD, &marker)
+        .status()
+        .expect("re-run the test binary under a lowered descriptor limit");
+    assert!(
+        status.success(),
+        "the deep removal failed under a soft limit of {REMOVE_DEEP_NOFILE} descriptors: {status}"
+    );
+    assert!(
+        marker.exists(),
+        "the child ran no deep removal: the test name the filter names is stale"
+    );
+}
+
+/// Removes a tree [`REMOVE_DEEP_DEPTH`] directories deep with
+/// `remove_source_tree`. Runs in the child process, under the lowered
+/// descriptor limit.
+fn remove_a_deep_tree() {
+    assert_eq!(
+        soft_nofile_limit(),
+        REMOVE_DEEP_NOFILE,
+        "the child runs under the lowered descriptor limit"
+    );
+    let tmp = TmpDir::new("remove-deep");
+    let base = tmp.path();
+    let src = base.join("src");
+    std::fs::create_dir(&src).unwrap();
+    // The test builds the tree through a descriptor that descends, so no path
+    // that it uses grows past the path limit of the kernel.
+    let mut dir: std::os::fd::OwnedFd = std::fs::File::open(&src).unwrap().into();
+    for _ in 0..REMOVE_DEEP_DEPTH {
+        rustix::fs::mkdirat(dir.as_fd(), "d", rustix::fs::Mode::from_raw_mode(0o755)).unwrap();
+        dir = rustix::fs::openat(
+            dir.as_fd(),
+            "d",
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+    }
+    let bottom = rustix::fs::openat(
+        dir.as_fd(),
+        "f",
+        rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::from_raw_mode(0o644),
+    )
+    .unwrap();
+    drop(bottom);
+    drop(dir);
+
+    let dfd = std::fs::File::open(base).unwrap();
+    block_on(ostrya::remove_source_tree(dfd.as_fd(), Path::new("src"))).unwrap();
+    assert!(!src.exists(), "the removal left the deep tree behind");
+    assert!(base.exists(), "the removal went past the tree");
+}
+
+/// Builds a tree for a `remove_source_tree` test: a file, a subdirectory with
+/// a file, and a symlink to a directory outside the tree.
+fn removal_source(dir: &Path, outside: &Path) {
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("x"), "x\n").unwrap();
+    std::fs::write(dir.join("sub/y"), "y\n").unwrap();
+    std::os::unix::fs::symlink(outside, dir.join("out")).unwrap();
+}
+
+/// A path whose last component is `.` keeps the directory and loses its
+/// contents. A symlink in the tree is removed, and its target stays.
+#[test]
+fn remove_source_tree_keeps_a_directory_spelled_dot() {
+    let tmp = TmpDir::new("remove-dot");
+    let base = tmp.path();
+    let outside = base.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("kept"), "kept\n").unwrap();
+    let src = base.join("src");
+
+    // The first two spellings name `src` through its own descriptor, the
+    // other two through the descriptor of its parent.
+    for (from_src, spelling) in [
+        (true, "."),
+        (true, "./"),
+        (false, "src/."),
+        (false, "src/./"),
+    ] {
+        removal_source(&src, &outside);
+        let dfd = std::fs::File::open(if from_src { &src } else { base }).unwrap();
+        block_on(ostrya::remove_source_tree(dfd.as_fd(), Path::new(spelling)))
+            .unwrap_or_else(|err| panic!("`{spelling}` failed: {err}"));
+        assert_eq!(
+            std::fs::read_dir(&src).map(Iterator::count).ok(),
+            Some(0),
+            "`{spelling}` did not keep an empty directory",
+        );
+        assert!(
+            outside.join("kept").exists(),
+            "`{spelling}` followed the symlink"
+        );
+    }
+}
+
+/// A relative path and an absolute path remove the directory, and the parent
+/// stays. An absolute path does not use the descriptor.
+#[test]
+fn remove_source_tree_removes_the_directory() {
+    let tmp = TmpDir::new("remove-dir");
+    let base = tmp.path();
+    let outside = base.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let dfd = std::fs::File::open(base).unwrap();
+    let unrelated = std::fs::File::open(&outside).unwrap();
+
+    let relative = base.join("relative");
+    removal_source(&relative, &outside);
+    block_on(ostrya::remove_source_tree(
+        dfd.as_fd(),
+        Path::new("relative"),
+    ))
+    .unwrap();
+    assert!(!relative.exists(), "the relative path stayed");
+
+    let absolute = base.join("absolute");
+    removal_source(&absolute, &outside);
+    block_on(ostrya::remove_source_tree(unrelated.as_fd(), &absolute)).unwrap();
+    assert!(!absolute.exists(), "the absolute path stayed");
+
+    assert!(
+        base.exists() && outside.exists(),
+        "the removal went too far"
+    );
+}
+
+/// A symlink or a file at the path is refused, and nothing is removed. A
+/// trailing slash does not make the removal follow a symlink.
+#[test]
+fn remove_source_tree_refuses_a_symlink_or_a_file_at_the_path() {
+    let tmp = TmpDir::new("remove-refused");
+    let base = tmp.path();
+    let target = base.join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("kept"), "kept\n").unwrap();
+    std::os::unix::fs::symlink("target", base.join("link")).unwrap();
+    std::fs::write(base.join("file"), "file\n").unwrap();
+    let dfd = std::fs::File::open(base).unwrap();
+
+    for spelling in ["link", "link/", "file", "file/"] {
+        let err = block_on(ostrya::remove_source_tree(dfd.as_fd(), Path::new(spelling)))
+            .expect_err(spelling);
+        assert!(
+            matches!(err, ostrya::Error::ConsumeUnlink { .. }),
+            "`{spelling}` gave another error: {err:?}"
+        );
+    }
+    assert!(
+        target.join("kept").exists(),
+        "the symlink target lost an entry"
+    );
+    assert!(
+        base.join("link").symlink_metadata().is_ok(),
+        "the symlink is gone"
+    );
+    assert!(base.join("file").exists(), "the file is gone");
+}
+
+/// Nothing at the path is not an error, because nothing is left to remove.
+#[test]
+fn remove_source_tree_of_a_missing_path_is_ok() {
+    let tmp = TmpDir::new("remove-missing");
+    let dfd = std::fs::File::open(tmp.path()).unwrap();
+    block_on(ostrya::remove_source_tree(dfd.as_fd(), Path::new("absent"))).unwrap();
+    block_on(ostrya::remove_source_tree(
+        dfd.as_fd(),
+        Path::new("absent/"),
+    ))
+    .unwrap();
+}
+
+/// Builds a wide tree for a `remove_source_tree` test: 5000 files at the top,
+/// and three levels of subdirectories with files at each level.
+fn wide_removal_source(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    for i in 0..5000 {
+        std::fs::write(dir.join(format!("f{i}")), "").unwrap();
+    }
+    for a in 0..3 {
+        for b in 0..3 {
+            let sub = dir.join(format!("a{a}/b{b}/c"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for i in 0..20 {
+                std::fs::write(dir.join(format!("a{a}/g{i}")), "").unwrap();
+                std::fs::write(dir.join(format!("a{a}/b{b}/h{i}")), "").unwrap();
+                std::fs::write(sub.join(format!("k{i}")), "").unwrap();
+            }
+        }
+    }
+}
+
+/// A directory with many files and nested subdirectories is removed
+/// completely. With `.` as the last component, the directory stays empty.
+#[test]
+fn remove_source_tree_removes_a_wide_tree() {
+    let tmp = TmpDir::new("remove-wide");
+    let base = tmp.path();
+    let src = base.join("src");
+    let dfd = std::fs::File::open(base).unwrap();
+
+    wide_removal_source(&src);
+    block_on(ostrya::remove_source_tree(dfd.as_fd(), Path::new("src"))).unwrap();
+    assert!(!src.exists(), "the removal left the wide tree behind");
+
+    wide_removal_source(&src);
+    block_on(ostrya::remove_source_tree(dfd.as_fd(), Path::new("src/."))).unwrap();
+    assert_eq!(
+        std::fs::read_dir(&src).map(Iterator::count).ok(),
+        Some(0),
+        "`src/.` did not keep an empty directory",
+    );
+}
+
+/// A name below the path that is not valid UTF-8 stops the removal with an
+/// error that names the entry, and the entry stays.
+#[test]
+fn remove_source_tree_refuses_a_name_that_is_not_utf8() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = TmpDir::new("remove-not-utf8");
+    let base = tmp.path();
+    let sub = base.join("src/sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let bad = sub.join(std::ffi::OsStr::from_bytes(b"bad\xff"));
+    std::fs::write(&bad, "").unwrap();
+    let dfd = std::fs::File::open(base).unwrap();
+
+    let err = block_on(ostrya::remove_source_tree(dfd.as_fd(), Path::new("src")))
+        .expect_err("a name that is not valid UTF-8 is refused");
+    match &err {
+        ostrya::Error::ConsumeUnlink { name, .. } => assert_eq!(name, "bad\u{FFFD}"),
+        other => panic!("another error: {other:?}"),
+    }
+    assert_eq!(
+        err.to_string(),
+        "unlinkat(bad\u{FFFD}): Name is not valid UTF-8"
+    );
+    assert!(bad.exists(), "the entry with the refused name is gone");
+}
+
+/// The environment variable that marks the re-executed child of
+/// [`remove_source_tree_starts_at_the_working_directory_with_cwd`]. Its value
+/// names the file that the child writes to record that the removal ran.
+const REMOVE_CWD_CHILD: &str = "OSTRYA_REMOVE_CWD_CHILD";
+
+/// With `rustix::fs::CWD` as the descriptor, a relative path starts at the
+/// working directory, and a working directory with no read permission does
+/// not stop the removal.
+#[test]
+fn remove_source_tree_starts_at_the_working_directory_with_cwd() {
+    // A change of the working directory applies to the whole process, and
+    // the tests of this binary run in parallel threads. For this reason, a
+    // child changes it.
+    if let Some(marker) = std::env::var_os(REMOVE_CWD_CHILD) {
+        remove_from_the_working_directory();
+        std::fs::write(marker, b"removed").expect("record that the removal ran");
+        return;
+    }
+    let tmp = TmpDir::new("remove-cwd-marker");
+    let marker = tmp.path().join("removed");
+    let exe = std::env::current_exe().expect("the path of the running test binary");
+    let status = std::process::Command::new(&exe)
+        .arg("--exact")
+        .arg("remove_source_tree_starts_at_the_working_directory_with_cwd")
+        .arg("--nocapture")
+        .env(REMOVE_CWD_CHILD, &marker)
+        .status()
+        .expect("re-run the test binary to change the working directory");
+    assert!(
+        status.success(),
+        "the removal from the working directory failed: {status}"
+    );
+    assert!(
+        marker.exists(),
+        "the child ran no removal: the test name the filter names is stale"
+    );
+}
+
+/// Removes `src` relative to the working directory through
+/// `rustix::fs::CWD`, with the working directory at mode 0311. Runs in the
+/// child process.
+fn remove_from_the_working_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TmpDir::new("remove-cwd");
+    let work = tmp.path().join("work");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    removal_source(&work.join("src"), &outside);
+    std::env::set_current_dir(&work).unwrap();
+    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o311)).unwrap();
+    let result = block_on(ostrya::remove_source_tree(
+        rustix::fs::CWD,
+        Path::new("src"),
+    ));
+    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o755)).unwrap();
+    result.unwrap();
+    assert!(!work.join("src").exists(), "the removal left the source");
+    assert!(work.exists(), "the removal went past the source");
 }

@@ -68,6 +68,10 @@ impl CommitModifierFlags {
     /// removes each directory that becomes empty, the walk root included.
     /// [`Transaction::write_dfd_to_mtree`](crate::Transaction::write_dfd_to_mtree)
     /// gives the rules for the walk root.
+    ///
+    /// To remove the source only after the commit, do not set this flag.
+    /// Call [`remove_source_tree`](crate::remove_source_tree) after the
+    /// commit.
     pub const CONSUME: CommitModifierFlags = CommitModifierFlags(1 << 4);
     /// The flag that takes a [`DevInoCache`] hit as the identity of the file.
     ///

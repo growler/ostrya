@@ -8200,13 +8200,14 @@ evidence: ostrya_cli::cli::commit_consume_matches_the_tool
 spec: cli-behavior.md#commit
 note: what `--consume` leaves on disk, which no oracle reads, each case held at
  the state it leaves and at exit 0: the source directory itself goes for a
- `--tree=dir=` value, a positional path, and a trailing-slash spelling, and stays, emptied, where the path is spelled `.`. A
- `ref=` source that resolves and a `tar=` archive file both survive beside a
- consumed `dir=` source, and the commit is written. A walk filter spares nothing:
- a path `--skip-list` names is removed with the rest and the source directory
- goes. Two sources are both consumed, and a second source that does not open
- leaves the first gone with no commit written. A removal that fails reports the entry's own name as `unlinkat(<name>):
- <reason>` at exit 1, from both.
+ `--tree=dir=` value, a positional path, and a trailing-slash spelling, and
+ stays, emptied, where the path is spelled `.`. A `ref=` source that resolves
+ and a `tar=` archive file both survive beside a consumed `dir=` source, and the
+ commit is written. A walk filter spares nothing: a path `--skip-list` names is
+ removed with the rest and the source directory goes. Two sources are both
+ consumed. A run that fails, a removal that fails, a `./` spelling, and a
+ pruned walk root part from the tool, because the port removes the sources
+ after the commit (`cli-surface.md`, `commit`, the `--consume` paragraph).
 
 family: M10
 subcommand: commit

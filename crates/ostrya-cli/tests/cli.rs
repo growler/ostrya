@@ -1055,13 +1055,12 @@ fn commit_refuses_the_values_the_tool_refuses() {
 }
 
 /// Every `commit` refusal after the transaction opens removes the staging
-/// directory, for each way that the refusal ends the process. The seven cases
+/// directory, for each way that the refusal ends the process. The six cases
 /// cover two exit shapes of a refusal:
 ///
 /// - an abort and then a process exit:
 ///   - a `dir=` source that does not open
 ///   - a `tar=` source that does not open
-///   - a `--consume` removal that fails
 ///   - a `--tar-pathname-filter` value that the reader refuses
 ///   - a `--base` revision that does not resolve
 /// - a process exit from inside the revision reader: `--tree=ref=` over an
@@ -1080,13 +1079,6 @@ fn commit_source_refusals_leave_no_staging_directory() {
     let tar = base.join("src.tar");
     pack_tar(&src, &tar);
     let tar_arg = format!("--tree=tar={}", tar.display());
-    // `--consume` removes the source directory after the commit reads its
-    // contents. `remove_dir` on the path `./` reports EINVAL, so the refusal
-    // occurs for any privileges of the caller. The run empties the directory,
-    // so the directory is separate from the fixture source.
-    let consumed = base.join("consumed");
-    std::fs::create_dir_all(&consumed).unwrap();
-    std::fs::write(consumed.join("f.txt"), b"consume me\n").unwrap();
     let objects = |repo: &Path| {
         std::fs::read_dir(repo.join("objects"))
             .unwrap()
@@ -1109,7 +1101,7 @@ fn commit_source_refusals_leave_no_staging_directory() {
     let held = resolve(&repo, "held").expect("the seed commit moved `held`");
     let baseline = objects(&repo);
 
-    let cases: [(Option<&Path>, Vec<&str>, String); 7] = [
+    let cases: [(Option<&Path>, Vec<&str>, String); 6] = [
         (
             None,
             vec!["-b", "refused", "/nonexistent-zz"],
@@ -1119,11 +1111,6 @@ fn commit_source_refusals_leave_no_staging_directory() {
             None,
             vec!["-b", "refused", "--tree=tar=/nonexistent.tar"],
             "error: archive_read_open_filename: Failed to open '/nonexistent.tar'".to_owned(),
-        ),
-        (
-            Some(consumed.as_path()),
-            vec!["-b", "refused", "--consume", "./"],
-            "error: unlinkat(./): Invalid argument".to_owned(),
         ),
         (
             None,
@@ -27864,9 +27851,11 @@ fn commit_tar_pathname_filter_matches_the_tool() {
     }
 }
 
-/// `commit --consume` empties each filesystem source during the walk, before
-/// the command writes the commit object and the ref. If the path is not `.`,
-/// the command also removes the source directory.
+/// `commit --consume` over a run that writes the commit leaves each source as
+/// the `ostree` command leaves it. If the path is not `.`, the source
+/// directory is gone. The port removes the sources after the commit, and the
+/// tool removes each entry during the walk. Each case here writes the
+/// commit, so the two orders give the same result.
 #[test]
 fn commit_consume_matches_the_tool() {
     if !ostree_available() {
@@ -28034,54 +28023,7 @@ fn commit_consume_matches_the_tool() {
         "a filtered path left the source behind"
     );
 
-    // A removal that fails reports the name of the entry. The source holds one
-    // entry in a directory that the walk can read and cannot write, so the name
-    // is the same in both commands.
-    let mut runs = Vec::new();
-    let mut sources = Vec::new();
-    for (index, repo) in [&port_repo, &tool_repo].iter().enumerate() {
-        let src = base.join(format!("readonly-{index}"));
-        std::fs::create_dir_all(src.join("ro")).unwrap();
-        std::fs::write(src.join("ro/only.txt"), "x\n").unwrap();
-        std::fs::set_permissions(src.join("ro"), std::fs::Permissions::from_mode(0o500)).unwrap();
-        let owned = [
-            "commit",
-            "--repo",
-            repo.to_str().unwrap(),
-            "-b",
-            "readonly",
-            FIXED_TIMESTAMP,
-            "--consume",
-            &format!("--tree=dir={}", src.display()),
-        ]
-        .map(str::to_owned);
-        let args: Vec<&str> = owned.iter().map(String::as_str).collect();
-        runs.push(if index == 0 {
-            ostrya(&args, None, &[])
-        } else {
-            ostree(&args)
-        });
-        sources.push(src);
-    }
-    assert_runs_agree(&runs[0], &runs[1], "consume over a read-only directory");
-    for (who, run) in [("port", &runs[0]), ("tool", &runs[1])] {
-        assert_eq!(
-            run.status.code(),
-            Some(1),
-            "the {who} did not fail the run a removal failure ends",
-        );
-    }
-    assert!(
-        String::from_utf8_lossy(&runs[0].stderr).contains("unlinkat(only.txt): Permission denied"),
-        "the failed removal did not name the entry:\n{}",
-        String::from_utf8_lossy(&runs[0].stderr)
-    );
-    for src in &sources {
-        std::fs::set_permissions(src.join("ro"), std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
-    // Both sources are consumed. If the second source fails, the first source
-    // is gone and no commit is written.
+    // Both sources are consumed.
     let (port_first, tool_first) = build("first");
     let (port_second, tool_second) = build("second");
     for (repo, first, second) in [
@@ -28111,75 +28053,29 @@ fn commit_consume_matches_the_tool() {
     assert_eq!(state(&port_first), state(&tool_first));
     assert_eq!(state(&port_second), state(&tool_second));
 
-    let (port_kept, tool_kept) = build("failing");
-    for (repo, src) in [(&port_repo, &port_kept), (&tool_repo, &tool_kept)] {
-        let both = [
+    // A source spelled `.` keeps the directory and loses its contents.
+    let (port_src, tool_src) = build("dot");
+    let mut runs = Vec::new();
+    for (repo, src) in [(&port_repo, &port_src), (&tool_repo, &tool_src)] {
+        let args = [
             "commit",
             "--repo",
             repo.to_str().unwrap(),
             "-b",
-            "failing",
+            "dot",
             FIXED_TIMESTAMP,
             "--consume",
-            &format!("--tree=dir={}", src.display()),
-            "--tree=dir=/nonexistent-zz",
-        ]
-        .map(str::to_owned);
-        let args: Vec<&str> = both.iter().map(String::as_str).collect();
-        let run = if repo == &port_repo {
-            ostrya(&args, None, &[])
+            ".",
+        ];
+        runs.push(if repo == &port_repo {
+            ostrya_in(Some(src), &args, None, &[])
         } else {
-            ostree(&args)
-        };
-        assert_eq!(run.status.code(), Some(1), "the run did not fail");
-        let refs = ostrya(
-            &["rev-parse", "--repo", repo.to_str().unwrap(), "failing"],
-            None,
-            &[],
-        );
-        assert_eq!(refs.status.code(), Some(1), "a commit was written anyway");
+            ostree_in(src, &args)
+        });
     }
-    assert_eq!(
-        state(&port_kept),
-        state(&tool_kept),
-        "the two left the consumed source in different states"
-    );
-    assert_eq!(
-        state(&port_kept),
-        "gone",
-        "the first source was not consumed"
-    );
-
-    // A source spelled `.` keeps the directory and loses its contents. `./` is
-    // a different spelling, so the command tries to remove the directory. That
-    // removal fails, and the failure stops the commit and names the path.
-    for (index, spelling) in [".", "./"].iter().enumerate() {
-        let (port_src, tool_src) = build(&format!("dot{index}"));
-        let mut runs = Vec::new();
-        for (repo, src) in [(&port_repo, &port_src), (&tool_repo, &tool_src)] {
-            let branch = format!("dot{index}");
-            let args = [
-                "commit",
-                "--repo",
-                repo.to_str().unwrap(),
-                "-b",
-                &branch,
-                FIXED_TIMESTAMP,
-                "--consume",
-                spelling,
-            ]
-            .map(str::to_owned);
-            let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            runs.push(if repo == &port_repo {
-                ostrya_in(Some(src), &args, None, &[])
-            } else {
-                ostree_in(src, &args)
-            });
-        }
-        assert_runs_agree(&runs[0], &runs[1], spelling);
-        assert_eq!(state(&port_src), state(&tool_src));
-        assert_eq!(state(&port_src), "kept with 0 entries");
-    }
+    assert_runs_agree(&runs[0], &runs[1], ".");
+    assert_eq!(state(&port_src), state(&tool_src));
+    assert_eq!(state(&port_src), "kept with 0 entries");
 }
 
 /// `commit --consume` removes a source subtree that the filter kept out of the
@@ -28238,6 +28134,440 @@ fn commit_consume_removes_a_deep_filtered_tree() {
         String::from_utf8_lossy(&out.stderr),
     );
     assert!(!src.exists(), "the consuming commit left the source behind");
+}
+
+/// Builds a small source tree for a `commit --consume` test: one file at the
+/// top and one file in a subdirectory.
+fn consume_source(dir: &Path) {
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("x"), "x\n").unwrap();
+    std::fs::write(dir.join("sub/y"), "y\n").unwrap();
+}
+
+/// A `commit --consume` run that writes no commit keeps each source with all
+/// its entries. The cases fail at different steps: a timestamp that does not
+/// parse after the walk, a branch name that is not valid after the commit
+/// object is written, a tag that exists before the walk, and a second source
+/// that does not open.
+#[test]
+fn commit_consume_keeps_the_source_when_the_run_fails() {
+    let tmp = TmpDir::new("commit-consume-fails");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let src = base.join("src");
+    consume_source(&src);
+    let src_arg = format!("--tree=dir={}", src.display());
+    let seed = ostrya(
+        &[
+            &repo_arg,
+            "commit",
+            "-b",
+            "taken",
+            FIXED_TIMESTAMP,
+            &src_arg,
+        ],
+        None,
+        &[],
+    );
+    assert!(seed.status.success(), "the seed commit failed");
+    let before = describe_tree(&src);
+
+    let cases: [Vec<&str>; 4] = [
+        vec!["-b", "kept", "--timestamp=nonsense", &src_arg],
+        vec!["-b", "a b", FIXED_TIMESTAMP, &src_arg],
+        vec!["-b", "kept", "--tag=taken", FIXED_TIMESTAMP, &src_arg],
+        vec![
+            "-b",
+            "kept",
+            FIXED_TIMESTAMP,
+            &src_arg,
+            "--tree=dir=/nonexistent-zz",
+        ],
+    ];
+    for options in &cases {
+        let mut args = vec![repo_arg.as_str(), "commit", "--consume"];
+        args.extend(options.iter().copied());
+        let run = ostrya(&args, None, &[]);
+        assert_eq!(
+            run.status.code(),
+            Some(1),
+            "`{options:?}` was not refused:\n{}",
+            String::from_utf8_lossy(&run.stderr),
+        );
+        assert_eq!(resolve(&repo, "kept"), None, "`{options:?}` wrote a ref");
+        assert_eq!(
+            describe_tree(&src),
+            before,
+            "`{options:?}` changed the source"
+        );
+    }
+}
+
+/// `commit --consume` writes the commit and the ref, prints the output, and
+/// then removes the `dir=` source. A `tar=` source and a `ref=` source stay.
+#[test]
+fn commit_consume_removes_the_source_after_the_commit() {
+    let tmp = TmpDir::new("commit-consume-after");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let seed = base.join("seed");
+    consume_source(&seed);
+    let seed_arg = format!("--tree=dir={}", seed.display());
+    let run = ostrya(
+        &[
+            &repo_arg,
+            "commit",
+            "-b",
+            "seed",
+            FIXED_TIMESTAMP,
+            &seed_arg,
+        ],
+        None,
+        &[],
+    );
+    assert!(run.status.success(), "the seed commit failed");
+    let archive = base.join("seed.tar");
+    pack_tar(&seed, &archive);
+    let tar_arg = format!("--tree=tar={}", archive.display());
+
+    for (branch, table) in [("plain", false), ("table", true)] {
+        let src = base.join(branch);
+        consume_source(&src);
+        std::fs::write(src.join("only"), format!("{branch}\n")).unwrap();
+        let src_arg = format!("--tree=dir={}", src.display());
+        let mut args = vec![
+            repo_arg.as_str(),
+            "commit",
+            "-b",
+            branch,
+            FIXED_TIMESTAMP,
+            "--consume",
+            "--tree=ref=seed",
+            &tar_arg,
+            &src_arg,
+        ];
+        if table {
+            args.push("--table-output");
+        }
+        let run = ostrya(&args, None, &[]);
+        assert!(
+            run.status.success(),
+            "the consuming commit on {branch} failed:\n{}",
+            String::from_utf8_lossy(&run.stderr),
+        );
+        let commit = resolve(&repo, branch).expect("the commit moved the branch");
+        let expected = if table {
+            format!("Commit: {commit}")
+        } else {
+            commit.clone()
+        };
+        assert_eq!(
+            run.stdout_trimmed().lines().next(),
+            Some(expected.as_str()),
+            "the output of {branch} does not name the commit",
+        );
+        assert!(!src.exists(), "{branch} left the source behind");
+    }
+    assert!(archive.exists(), "the `tar=` source was removed");
+    assert!(seed.exists(), "the source of the `ref=` source was removed");
+    assert!(resolve(&repo, "seed").is_some(), "the `ref=` source moved");
+}
+
+/// A source path whose last component is `.` keeps the directory and loses
+/// its contents. An absolute path to the working directory removes the
+/// directory.
+#[test]
+fn commit_consume_keeps_a_directory_spelled_dot() {
+    let tmp = TmpDir::new("commit-consume-dot");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+
+    let cases: [(&str, bool, &str); 4] = [
+        ("dot", true, "."),
+        ("dot-slash", true, "./"),
+        ("parent-dot", false, "--tree=dir=parent-dot/."),
+        ("absolute", true, ""),
+    ];
+    for (name, inside, spelling) in cases {
+        let src = base.join(name);
+        consume_source(&src);
+        let absolute = src.display().to_string();
+        let spelling = if spelling.is_empty() {
+            absolute.as_str()
+        } else {
+            spelling
+        };
+        let cwd = if inside { src.as_path() } else { base };
+        let run = ostrya_in(
+            Some(cwd),
+            &[
+                &repo_arg,
+                "commit",
+                "-b",
+                name,
+                FIXED_TIMESTAMP,
+                "--consume",
+                spelling,
+            ],
+            None,
+            &[],
+        );
+        assert!(
+            run.status.success(),
+            "`{spelling}` failed:\n{}",
+            String::from_utf8_lossy(&run.stderr),
+        );
+        assert!(resolve(&repo, name).is_some(), "`{spelling}` wrote no ref");
+        if name == "absolute" {
+            assert!(!src.exists(), "`{spelling}` kept the directory");
+        } else {
+            assert_eq!(
+                std::fs::read_dir(&src).map(Iterator::count).ok(),
+                Some(0),
+                "`{spelling}` did not keep an empty directory",
+            );
+        }
+    }
+}
+
+/// `commit --consume --skip-if-unchanged` writes no commit over a tree that
+/// equals the parent, so it removes no source.
+#[test]
+fn commit_consume_with_skip_if_unchanged_keeps_the_source() {
+    let tmp = TmpDir::new("commit-consume-skip");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let first = base.join("first");
+    let again = base.join("again");
+    consume_source(&first);
+    consume_source(&again);
+    let first_arg = format!("--tree=dir={}", first.display());
+    let run = ostrya(
+        &[
+            &repo_arg,
+            "commit",
+            "-b",
+            "same",
+            FIXED_TIMESTAMP,
+            &first_arg,
+        ],
+        None,
+        &[],
+    );
+    assert!(run.status.success(), "the first commit failed");
+    let parent = resolve(&repo, "same").expect("the first commit moved the branch");
+    let before = describe_tree(&again);
+
+    let again_arg = format!("--tree=dir={}", again.display());
+    let run = ostrya(
+        &[
+            &repo_arg,
+            "commit",
+            "-b",
+            "same",
+            FIXED_TIMESTAMP,
+            "--consume",
+            "--skip-if-unchanged",
+            &again_arg,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        run.status.success(),
+        "the skipped commit failed:\n{}",
+        String::from_utf8_lossy(&run.stderr),
+    );
+    assert_eq!(
+        run.stdout_trimmed(),
+        parent,
+        "the run did not print the parent"
+    );
+    assert_eq!(resolve(&repo, "same"), Some(parent), "the branch moved");
+    assert_eq!(
+        describe_tree(&again),
+        before,
+        "the skipped run changed the source"
+    );
+}
+
+/// If the removal of one source fails, `commit --consume` keeps the commit and
+/// the ref, prints the checksum, names the path and the entry, removes the
+/// other source, and exits 1.
+#[test]
+fn commit_consume_reports_a_failed_removal_and_removes_the_other_sources() {
+    // A root process removes an entry from a directory without write
+    // permission, so the removal does not fail.
+    if is_root() {
+        return;
+    }
+    let tmp = TmpDir::new("commit-consume-partial");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let first = base.join("first");
+    std::fs::create_dir_all(first.join("ro")).unwrap();
+    std::fs::write(first.join("ro/only.txt"), "x\n").unwrap();
+    std::fs::set_permissions(first.join("ro"), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let second = base.join("second");
+    consume_source(&second);
+
+    let first_arg = format!("--tree=dir={}", first.display());
+    let second_arg = format!("--tree=dir={}", second.display());
+    let run = ostrya(
+        &[
+            &repo_arg,
+            "commit",
+            "-b",
+            "partial",
+            FIXED_TIMESTAMP,
+            "--consume",
+            &first_arg,
+            &second_arg,
+        ],
+        None,
+        &[],
+    );
+    std::fs::set_permissions(first.join("ro"), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "the run did not exit 1:\n{stderr}"
+    );
+    let commit = resolve(&repo, "partial").expect("the commit moved the branch");
+    assert_eq!(
+        run.stdout_trimmed(),
+        commit,
+        "the run did not print the commit"
+    );
+    let expected = format!(
+        "error: {}: unlinkat(only.txt): Permission denied",
+        first.display()
+    );
+    assert_eq!(stderr.trim(), expected, "the error line names other things");
+    assert!(
+        first.join("ro/only.txt").exists(),
+        "the entry that failed to go is gone"
+    );
+    assert!(!second.exists(), "the second source was not removed");
+}
+
+/// `commit --consume` removes a relative source from a working directory that
+/// gives search and write permission but no read permission.
+#[test]
+fn commit_consume_removes_the_source_from_an_unreadable_working_directory() {
+    // A root process reads a directory without read permission, so the test
+    // shows nothing.
+    if is_root() {
+        return;
+    }
+    let tmp = TmpDir::new("commit-consume-unreadable-cwd");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let work = base.join("work");
+    consume_source(&work.join("src"));
+    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o311)).unwrap();
+    let run = ostrya_in(
+        Some(&work),
+        &[
+            &repo_arg,
+            "commit",
+            "-b",
+            "unreadable",
+            FIXED_TIMESTAMP,
+            "--consume",
+            "src",
+        ],
+        None,
+        &[],
+    );
+    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "the run did not exit 0:\n{stderr}"
+    );
+    let commit = resolve(&repo, "unreadable").expect("the commit moved the branch");
+    assert_eq!(
+        run.stdout_trimmed(),
+        commit,
+        "the run did not print the commit"
+    );
+    assert!(!work.join("src").exists(), "the source was not removed");
+}
+
+/// A skip list that names the walk root prunes the whole walk. With `--base`
+/// the commit holds the base tree, and `--consume` removes the whole source.
+#[test]
+fn commit_consume_removes_the_source_under_a_pruned_walk_root_with_base() {
+    let tmp = TmpDir::new("commit-consume-pruned");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let seed = base.join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    std::fs::write(seed.join("base.txt"), "base\n").unwrap();
+    let seed_arg = format!("--tree=dir={}", seed.display());
+    let run = ostrya(
+        &[
+            &repo_arg,
+            "commit",
+            "-b",
+            "seed",
+            FIXED_TIMESTAMP,
+            &seed_arg,
+        ],
+        None,
+        &[],
+    );
+    assert!(run.status.success(), "the seed commit failed");
+
+    let src = base.join("src");
+    consume_source(&src);
+    let skip_list = base.join("skip-list");
+    std::fs::write(&skip_list, "/\n").unwrap();
+    let skip_arg = format!("--skip-list={}", skip_list.display());
+    let src_arg = format!("--tree=dir={}", src.display());
+    let run = ostrya(
+        &[
+            &repo_arg,
+            "commit",
+            "-b",
+            "pruned",
+            FIXED_TIMESTAMP,
+            "--base=seed",
+            "--consume",
+            &skip_arg,
+            &src_arg,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        run.status.success(),
+        "the pruned commit failed:\n{}",
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let listing = |branch: &str| {
+        ostrya(&[&repo_arg, "ls", "-R", branch], None, &[])
+            .ok()
+            .stdout_trimmed()
+    };
+    assert_eq!(
+        listing("pruned"),
+        listing("seed"),
+        "the commit is not the base"
+    );
+    assert!(!src.exists(), "the pruned run left the source behind");
 }
 
 /// A second ed25519 sign fixture, so that a run with two keys shows an order.

@@ -40796,6 +40796,509 @@ fn summary_gpg_engine_key_refusal_keeps_files() {
     }
 }
 
+/// The bytes that a test of `[core] auto-update-summary` writes into
+/// `summary.sig` before a run, so that a removal and a keep of the file are
+/// visible.
+const AUTO_MARKER: &[u8] = b"marker signature";
+
+/// The `warning:` line of a directory under `refs/mirrors/` whose name is not
+/// a collection id, for a run that writes the summaries.
+const INVALID_COLLECTION_DIR_LINE: &str = "warning: refs/mirrors/a..b: the directory name is not \
+                                           a collection id, and no summary holds its refs\n";
+
+/// Creates an archive repository at `base/repo` with `core` in `[core]` and
+/// `groups` after it, a source tree at `base/src`, and [`AUTO_MARKER`] in
+/// `summary.sig`. Returns the path of the repository.
+fn auto_summary_repo(base: &Path, core: &str, groups: &str) -> PathBuf {
+    let repo = create_repo(base, RepoMode::Archive);
+    let config = config_text(&repo).replacen("[core]\n", &format!("[core]\n{core}"), 1);
+    std::fs::write(repo.join("config"), config).unwrap();
+    append_config(&repo, groups);
+    write_at(&base.join("src/hello.txt"), b"hello\n");
+    std::fs::write(repo.join("summary.sig"), AUTO_MARKER).unwrap();
+    repo
+}
+
+/// Runs `ostrya commit` in `repo` over the source tree `base/src`, with
+/// `args` and a fixed timestamp.
+fn auto_commit(repo: &Path, args: &[&str]) -> Run {
+    let src = format!(
+        "--tree=dir={}",
+        repo.parent().unwrap().join("src").display()
+    );
+    let mut all = vec!["commit"];
+    all.extend_from_slice(args);
+    all.extend_from_slice(&[FIXED_TIMESTAMP, &src]);
+    ostrya_repo(repo, &all)
+}
+
+/// Returns the names of the refs in field 0 of the summary of `repo`.
+fn summary_ref_names(repo: &Path) -> Vec<String> {
+    let bytes = std::fs::read(repo.join("summary")).expect("summary exists");
+    ostrya::Summary::parse(&bytes)
+        .unwrap()
+        .refs
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect()
+}
+
+/// Asserts that `repo` has no `summary` and that `summary.sig` holds
+/// [`AUTO_MARKER`].
+fn assert_no_auto_summary(repo: &Path, case: &str) {
+    assert_eq!(
+        summary_files(repo),
+        (None, Some(AUTO_MARKER.to_vec())),
+        "{case}"
+    );
+}
+
+/// `commit -b` writes the summary when `auto-update-summary` or its alias
+/// `commit-update-summary` is true. The write removes the old `summary.sig`.
+/// With both keys false or absent, the run writes no summary and keeps
+/// `summary.sig`. `--fsync=false` does not stop the write.
+#[test]
+fn commit_auto_update_summary_follows_the_two_keys() {
+    let values = [None, Some("true"), Some("false")];
+    for key in values {
+        for alias in values {
+            let case = format!("auto-update-summary={key:?} commit-update-summary={alias:?}");
+            let tmp = TmpDir::new("commit-auto-keys");
+            let mut core = String::new();
+            if let Some(value) = key {
+                core.push_str(&format!("auto-update-summary={value}\n"));
+            }
+            if let Some(value) = alias {
+                core.push_str(&format!("commit-update-summary={value}\n"));
+            }
+            let repo = auto_summary_repo(tmp.path(), &core, "");
+            let run = auto_commit(&repo, &["-b", "main"]);
+            run.ok();
+            assert!(run.stderr.is_empty(), "{case}");
+            if key == Some("true") || alias == Some("true") {
+                assert_eq!(summary_ref_names(&repo), ["main"], "{case}");
+                assert!(!repo.join("summary.sig").exists(), "{case}");
+            } else {
+                assert_no_auto_summary(&repo, &case);
+            }
+        }
+    }
+
+    let tmp = TmpDir::new("commit-auto-no-fsync");
+    let repo = auto_summary_repo(tmp.path(), "auto-update-summary=true\n", "");
+    auto_commit(&repo, &["-b", "main", "--fsync=false"]).ok();
+    assert_eq!(summary_ref_names(&repo), ["main"]);
+    assert!(!repo.join("summary.sig").exists());
+}
+
+/// A value of either key that is not a boolean, also with the other key
+/// true: the commit writes the ref and prints the checksum. Then the command
+/// prints one `error:` line and exits 1. It writes no summary.
+#[test]
+fn commit_auto_update_summary_refuses_a_value_that_is_not_a_boolean() {
+    for core in [
+        "auto-update-summary=yes\n",
+        "commit-update-summary=yes\n",
+        "auto-update-summary=yes\ncommit-update-summary=true\n",
+        "auto-update-summary=true\ncommit-update-summary=yes\n",
+    ] {
+        let tmp = TmpDir::new("commit-auto-yes");
+        let repo = auto_summary_repo(tmp.path(), core, "");
+        let run = auto_commit(&repo, &["-b", "main"]);
+        assert_eq!(run.status.code(), Some(1), "{core}");
+        let commit = resolve(&repo, "main").expect("the commit moved the branch");
+        assert_eq!(run.stdout_trimmed(), commit, "{core}");
+        let key = if core.starts_with("auto-update-summary=yes") {
+            "auto-update-summary"
+        } else {
+            "commit-update-summary"
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            format!("error: keyfile: value 'yes' for core.{key} is not a boolean\n"),
+            "{core}"
+        );
+        assert_no_auto_summary(&repo, core);
+    }
+}
+
+/// `--skip-if-unchanged` with no new commit writes no summary. The run reads
+/// no key, so a value that is not a boolean does not stop it.
+#[test]
+fn commit_skip_if_unchanged_writes_no_auto_summary() {
+    for value in ["true", "yes"] {
+        let tmp = TmpDir::new("commit-auto-skip");
+        let repo = auto_summary_repo(tmp.path(), "", "");
+        auto_commit(&repo, &["-b", "main"]).ok();
+        let config = config_text(&repo).replacen(
+            "[core]\n",
+            &format!("[core]\nauto-update-summary={value}\n"),
+            1,
+        );
+        std::fs::write(repo.join("config"), config).unwrap();
+        let run = auto_commit(&repo, &["-b", "main", "--skip-if-unchanged"]);
+        run.ok();
+        assert!(run.stderr.is_empty(), "{value}");
+        assert_no_auto_summary(&repo, value);
+    }
+}
+
+/// `--orphan` with no ref writes no summary. `--orphan --tag` writes the tag
+/// and the summary, and `-b --tag` lists the branch and the tag.
+#[test]
+fn commit_auto_update_summary_follows_the_branch_and_the_tags() {
+    let tmp = TmpDir::new("commit-auto-orphan");
+    let repo = auto_summary_repo(tmp.path(), "auto-update-summary=true\n", "");
+    auto_commit(&repo, &["--orphan"]).ok();
+    assert_no_auto_summary(&repo, "--orphan");
+
+    auto_commit(&repo, &["--orphan", "--tag", "t"]).ok();
+    assert_eq!(summary_ref_names(&repo), ["t"]);
+    assert!(!repo.join("summary.sig").exists());
+
+    let tmp = TmpDir::new("commit-auto-tag");
+    let repo = auto_summary_repo(tmp.path(), "auto-update-summary=true\n", "");
+    auto_commit(&repo, &["-b", "main", "--tag", "t"]).ok();
+    assert_eq!(summary_ref_names(&repo), ["main", "t"]);
+    assert!(!repo.join("summary.sig").exists());
+}
+
+/// `-b REMOTE:REF` with no tag writes a remote ref alone, which no summary
+/// lists, so the run writes no summary.
+#[test]
+fn commit_to_a_remote_ref_writes_no_auto_summary() {
+    let tmp = TmpDir::new("commit-auto-remote");
+    let repo = auto_summary_repo(tmp.path(), "auto-update-summary=true\n", "");
+    let run = auto_commit(&repo, &["-b", "origin:x"]);
+    run.ok();
+    assert_eq!(
+        ref_file(&repo, "refs/remotes/origin/x"),
+        Some(run.stdout_trimmed())
+    );
+    assert_no_auto_summary(&repo, "-b origin:x");
+}
+
+/// In a repository with a collection id, `-b @OWN:NAME` writes the local ref
+/// `NAME`, and the summary lists it. `-b @OTHER:NAME` writes
+/// `refs/mirrors/OTHER/NAME`, and the summary lists it in the collection map
+/// under `OTHER`.
+#[test]
+fn commit_auto_update_summary_lists_a_collection_branch() {
+    let tmp = TmpDir::new("commit-auto-collection-branch");
+    let repo = auto_summary_repo(
+        tmp.path(),
+        &format!("auto-update-summary=true\ncollection-id={OWN_ID}\n"),
+        "",
+    );
+    let own = auto_commit(&repo, &["-b", &format!("@{OWN_ID}:ownref")])
+        .ok()
+        .stdout_trimmed();
+    assert_eq!(ref_file(&repo, "refs/heads/ownref"), Some(own));
+    assert_eq!(summary_ref_names(&repo), ["ownref"]);
+    assert!(!repo.join("summary.sig").exists());
+
+    std::fs::write(repo.join("summary.sig"), AUTO_MARKER).unwrap();
+    let other = auto_commit(&repo, &["-b", "@org.example.Other:otherref"])
+        .ok()
+        .stdout_trimmed();
+    assert_eq!(
+        ref_file(&repo, "refs/mirrors/org.example.Other/otherref").as_ref(),
+        Some(&other)
+    );
+    assert_eq!(summary_ref_names(&repo), ["ownref"]);
+    let bytes = std::fs::read(repo.join("summary")).unwrap();
+    let map = ostrya::Summary::parse(&bytes)
+        .unwrap()
+        .collection_map()
+        .unwrap();
+    let listed: Vec<(&str, Vec<(&str, String)>)> = map
+        .iter()
+        .map(|(id, refs)| {
+            let refs = refs
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.commit.to_hex()))
+                .collect();
+            (id.as_str(), refs)
+        })
+        .collect();
+    assert_eq!(listed, [("org.example.Other", vec![("otherref", other)])]);
+    assert!(!repo.join("summary.sig").exists());
+}
+
+/// `--orphan -b NAME` writes the branch, so the run writes the summary.
+#[test]
+fn commit_orphan_with_a_branch_writes_the_auto_summary() {
+    let tmp = TmpDir::new("commit-auto-orphan-branch");
+    let repo = auto_summary_repo(tmp.path(), "auto-update-summary=true\n", "");
+    auto_commit(&repo, &["--orphan", "-b", "orphref"]).ok();
+    assert_eq!(summary_ref_names(&repo), ["orphref"]);
+    assert!(!repo.join("summary.sig").exists());
+}
+
+/// `-b REMOTE:REF --tag T` writes the local ref `T`, so the run writes a
+/// summary that lists `T` and not the remote ref.
+#[test]
+fn commit_to_a_remote_ref_with_a_tag_writes_the_auto_summary() {
+    let tmp = TmpDir::new("commit-auto-remote-tag");
+    let repo = auto_summary_repo(tmp.path(), "auto-update-summary=true\n", "");
+    let run = auto_commit(&repo, &["-b", "origin:x", "--tag", "tagref"]);
+    run.ok();
+    let commit = run.stdout_trimmed();
+    assert_eq!(
+        ref_file(&repo, "refs/remotes/origin/x").as_ref(),
+        Some(&commit)
+    );
+    assert_eq!(summary_ref_names(&repo), ["tagref"]);
+    assert!(!repo.join("summary.sig").exists());
+}
+
+/// A run that writes no tag and no branch other than a remote ref does not
+/// read the key. With `auto-update-summary=yes`, `-b origin:x` and `--orphan`
+/// with no ref exit 0 and write no summary. The first writes the remote ref.
+#[test]
+fn commit_with_no_listed_ref_reads_no_auto_summary_key() {
+    let tmp = TmpDir::new("commit-auto-unread");
+    let repo = auto_summary_repo(tmp.path(), "auto-update-summary=yes\n", "");
+    let run = auto_commit(&repo, &["-b", "origin:x"]);
+    run.ok();
+    assert!(run.stderr.is_empty(), "-b origin:x");
+    assert_eq!(
+        ref_file(&repo, "refs/remotes/origin/x"),
+        Some(run.stdout_trimmed())
+    );
+    assert_no_auto_summary(&repo, "-b origin:x");
+
+    let run = auto_commit(&repo, &["--orphan"]);
+    run.ok();
+    assert!(run.stderr.is_empty(), "--orphan");
+    assert_no_auto_summary(&repo, "--orphan");
+}
+
+/// A client group with `summary=true` gets the summary of its auth item
+/// under `extensions/ostrya/summary/`, with the refs that its `allow` rule
+/// reads, as `summary -u` writes it.
+#[test]
+fn commit_auto_update_summary_writes_the_summaries_of_the_auth_items() {
+    let tmp = TmpDir::new("commit-auto-auth-items");
+    let repo = auto_summary_repo(
+        tmp.path(),
+        "auto-update-summary=true\n",
+        "[ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:main\nsummary=true\n",
+    );
+    auto_commit(&repo, &["-b", "side"]).ok();
+    auto_commit(&repo, &["-b", "main"]).ok();
+    assert_eq!(summary_ref_names(&repo), ["main", "side"]);
+
+    let stem = repo.join(format!(
+        "extensions/ostrya/summary/{}",
+        Checksum::sha256(b"ssh:ci").to_hex()
+    ));
+    let item = std::fs::read(&stem).expect("the summary of the auth item exists");
+    let names: Vec<String> = ostrya::Summary::parse(&item)
+        .unwrap()
+        .refs
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    assert_eq!(names, ["main"]);
+    assert!(stem.with_extension("access").exists());
+    assert!(!stem.with_extension("sig").exists());
+
+    // `summary -u` writes the same summary of the auth item.
+    ostrya_repo(&repo, &["summary", "-u"]).ok();
+    assert_eq!(std::fs::read(&stem).unwrap(), item);
+}
+
+/// The key group that `sign-summary` names signs the summary that `commit`
+/// writes. The new `summary.sig` holds its signature alone, and it verifies.
+#[test]
+fn commit_auto_update_summary_signs_with_the_sign_summary_groups() {
+    let tmp = TmpDir::new("commit-auto-sign");
+    let key = tmp.path().join("secret.ed25519");
+    write_at(&key, format!("{ED25519_SECRET_B64}\n").as_bytes());
+    let groups = format!(
+        "[ex-ostrya server]\nsign-summary=e\n\
+         [ex-ostrya key \"e\"]\ntype=ed25519\nsecret-key-file={}\n",
+        key.display()
+    );
+    let repo = auto_summary_repo(tmp.path(), "auto-update-summary=true\n", &groups);
+    auto_commit(&repo, &["-b", "main"]).ok();
+    let sigs = summary_signatures(&repo);
+    let keys: Vec<&str> = sigs.iter().map(|(key, _)| key.as_str()).collect();
+    assert_eq!(keys, ["ostree.sign.ed25519"]);
+    let public = base64::decode(ED25519_PUBLIC_B64).unwrap();
+    let trusted = ostrya::Ed25519Verifier::new([public], Vec::<Vec<u8>>::new()).unwrap();
+    let outcome = block_on(async {
+        let repo = Repo::open(&repo).await.unwrap();
+        repo.verify_summary(&[Arc::new(trusted)]).await.unwrap()
+    });
+    assert!(outcome.valid);
+}
+
+/// A failed summary write after a commit: a key group of `sign-summary`
+/// whose key file is absent. The command prints the checksum and one
+/// `error:` line, and exits 1. The commit and the ref stay, and the summary
+/// files do not change.
+#[test]
+fn commit_keeps_the_ref_when_the_auto_summary_fails() {
+    let tmp = TmpDir::new("commit-auto-fails");
+    let absent = tmp.path().join("absent.ed25519");
+    let groups = format!(
+        "[ex-ostrya server]\nsign-summary=a\n\
+         [ex-ostrya key \"a\"]\ntype=ed25519\nsecret-key-file={}\n",
+        absent.display()
+    );
+    let repo = auto_summary_repo(tmp.path(), "auto-update-summary=true\n", &groups);
+    let run = auto_commit(&repo, &["-b", "main"]);
+    assert_eq!(run.status.code(), Some(1));
+    let commit = resolve(&repo, "main").expect("the commit moved the branch");
+    assert_eq!(run.stdout_trimmed(), commit);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.starts_with("error: signature: [ex-ostrya key \"a\"]: "),
+        "{stderr}"
+    );
+    assert_no_auto_summary(&repo, "absent key file");
+}
+
+/// A directory under `refs/mirrors/` whose name is not a collection id gives
+/// the `warning:` line of `summary -u` in a run that writes the summary.
+#[test]
+fn commit_auto_update_summary_warns_for_an_invalid_collection_dir() {
+    let tmp = TmpDir::new("commit-auto-invalid-dir");
+    let repo = auto_summary_repo(tmp.path(), "auto-update-summary=true\n", "");
+    write_at(&repo.join("refs/mirrors/a..b/x"), b"no checksum\n");
+    let run = auto_commit(&repo, &["-b", "main"]);
+    run.ok();
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr),
+        INVALID_COLLECTION_DIR_LINE
+    );
+    assert_eq!(summary_ref_names(&repo), ["main"]);
+
+    let run = ostrya_repo(&repo, &["summary", "-u"]);
+    run.ok();
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr),
+        INVALID_COLLECTION_DIR_LINE
+    );
+}
+
+/// With a collection id, the summary of `commit` lists the new branch and
+/// lists `ostree-metadata` at its current commit. The run writes no new
+/// anchor commit.
+#[test]
+fn commit_auto_update_summary_writes_no_anchor_commit() {
+    let tmp = TmpDir::new("commit-auto-collection");
+    let repo = auto_summary_repo(
+        tmp.path(),
+        "auto-update-summary=true\ncollection-id=org.example.C\n",
+        "",
+    );
+    ostrya_repo(&repo, &["summary", "-u"]).ok();
+    let anchor = ref_file(&repo, "refs/heads/ostree-metadata").expect("summary -u wrote it");
+    std::fs::write(repo.join("summary.sig"), AUTO_MARKER).unwrap();
+
+    let run = auto_commit(&repo, &["-b", "main"]);
+    run.ok();
+    assert_eq!(
+        ref_file(&repo, "refs/heads/ostree-metadata").as_deref(),
+        Some(anchor.as_str())
+    );
+    assert_eq!(summary_ref_names(&repo), ["main", "ostree-metadata"]);
+    let bytes = std::fs::read(repo.join("summary")).unwrap();
+    let summary = ostrya::Summary::parse(&bytes).unwrap();
+    let listed = summary
+        .refs
+        .iter()
+        .find(|entry| entry.name == "ostree-metadata")
+        .unwrap();
+    assert_eq!(listed.commit.to_hex(), anchor);
+    assert!(!repo.join("summary.sig").exists());
+}
+
+/// `commit --consume` with a failed summary write removes the source first,
+/// then prints the `error:` line of the summary and exits 1. If the removal
+/// fails too, the command prints the line of the removal and then the line
+/// of the summary.
+#[test]
+fn commit_consume_with_a_failed_auto_summary_removes_the_source() {
+    let tmp = TmpDir::new("commit-auto-consume");
+    let base = tmp.path();
+    let absent = base.join("absent.ed25519");
+    let groups = format!(
+        "[ex-ostrya server]\nsign-summary=a\n\
+         [ex-ostrya key \"a\"]\ntype=ed25519\nsecret-key-file={}\n",
+        absent.display()
+    );
+    let repo = auto_summary_repo(base, "auto-update-summary=true\n", &groups);
+    let consumed = base.join("consumed");
+    consume_source(&consumed);
+    let consumed_arg = format!("--tree=dir={}", consumed.display());
+    let run = ostrya_repo(
+        &repo,
+        &[
+            "commit",
+            "-b",
+            "main",
+            "--consume",
+            FIXED_TIMESTAMP,
+            &consumed_arg,
+        ],
+    );
+    assert_eq!(run.status.code(), Some(1));
+    assert_eq!(run.stdout_trimmed(), resolve(&repo, "main").unwrap());
+    assert!(!consumed.exists(), "the source was not removed");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.starts_with("error: signature: [ex-ostrya key \"a\"]: "),
+        "{stderr}"
+    );
+    assert_no_auto_summary(&repo, "consume");
+
+    // A root process removes an entry from a directory without write
+    // permission, so the removal does not fail.
+    if is_root() {
+        return;
+    }
+    let kept = base.join("kept");
+    std::fs::create_dir_all(kept.join("ro")).unwrap();
+    std::fs::write(kept.join("ro/only.txt"), "x\n").unwrap();
+    std::fs::set_permissions(kept.join("ro"), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let kept_arg = format!("--tree=dir={}", kept.display());
+    let run = ostrya_repo(
+        &repo,
+        &[
+            "commit",
+            "-b",
+            "main",
+            "--consume",
+            FIXED_TIMESTAMP,
+            &kept_arg,
+        ],
+    );
+    std::fs::set_permissions(kept.join("ro"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(run.status.code(), Some(1));
+    assert_eq!(run.stdout_trimmed(), resolve(&repo, "main").unwrap());
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 2, "{stderr}");
+    assert_eq!(
+        lines[0],
+        format!(
+            "error: {}: unlinkat(only.txt): Permission denied",
+            kept.display()
+        )
+    );
+    assert!(
+        lines[1].starts_with("error: signature: [ex-ostrya key \"a\"]: "),
+        "{stderr}"
+    );
+    assert_no_auto_summary(&repo, "consume with a failed removal");
+}
+
 /// The report reads `ostree.summary.collection-map` as the `ostree` command
 /// reads it:
 ///

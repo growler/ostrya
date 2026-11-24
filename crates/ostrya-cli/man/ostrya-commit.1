@@ -11,6 +11,8 @@ Commit a tree into the repository and print the new commit checksum.
 The command reads one or more tree sources: a directory, a tar archive, or a committed tree. With no \%\-\-tree option and no PATH, it reads a tar stream from standard input. It writes the objects of the tree and the commit object. If signing options name keys, it signs the commit. Then it points the \%\-\-branch ref at the new commit, and creates each \%\-\-tag ref at the new commit.
 .PP
 The command needs \%\-\-branch or \%\-\-orphan. Without \%\-\-parent, the parent is the branch name resolved as a revision. On success, standard output carries the commit checksum, or the \%\-\-table\-output block. If the command refuses its input, it exits \%1, moves no ref, and creates no ref.
+.PP
+After a run that writes a tag or a branch that is not a remote ref, the command reads \fB\%[core] auto\-update\-summary\fR and its alias \fB\%commit\-update\-summary\fR\&. If one of the two is true, the command writes the root summary and each summary of an item again. The key groups of \fB\%sign\-summary\fR of \fB\%[ex\-ostrya server]\fR sign them. The command writes no new \fB\%ostree\-metadata\fR commit. A run that writes no such ref does not read the two keys. After a run that writes such a ref, a value that is not a boolean, or a failed write, makes the command exit \%1. The commit and the refs stay.
 .SH ARGUMENTS
 .TP
 \fIPATH...\fR

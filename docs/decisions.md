@@ -5491,6 +5491,39 @@ These alternatives were rejected:
   for an alias and one text for a directory. The CLI then holds a copy of
   the reason texts of the ref store.
 
+## The summary update of a command
+
+The `ostrya` command decides when a command writes the summaries again under
+`[core] auto-update-summary`. The ref writers of the library,
+`Transaction::commit`, `Repo::pull`, `Repo::pull_local`, `set_ref_immediate`,
+and `Repo::import_media`, do not read the key. A library caller thus keeps
+control of the summary write, as "The weak refs of a prune" states for the
+prune.
+
+`Repo::regenerate_summaries_if_configured` reads the key and its alias
+`commit-update-summary`. With both false or absent, it returns `None` and
+writes nothing. With one true, it builds the keys of each key group that
+`sign-summary` of `[ex-ostrya server]` names, and builds no other key group.
+The GPG keys sign first, and the order comes from one function, which the
+summary write of `ostrya receive` also calls. Then it writes the root summary
+and the summary of each auth item with `SummaryOptions::default()`. In a
+repository with a collection id, it writes no new `ostree-metadata` anchor
+commit, as the `ostree` command does under the same key
+(`conformance/cli-behavior.md`, `commit`, "The summary update"). `ostrya
+commit` calls it after a run that writes a tag or a branch that is not a
+remote ref. A run that writes no such ref does not read the key.
+
+Two alternatives were rejected:
+
+- The ref writers of the library read the key and write the summary. A
+  library caller that writes many refs in a sequence then writes the
+  summary one time for each write, and cannot hold the write until the
+  last ref.
+- The function writes a new anchor commit, as `Repo::regenerate_summaries`
+  does. Each commit then adds an `ostree-metadata` commit to the chain, and
+  the repository differs from the repository that the `ostree` command
+  writes for the same commands.
+
 ## The pull scheduler
 
 `crates/ostrya/src/pull/drive.rs` is a poll core of the port.

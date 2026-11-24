@@ -104,9 +104,18 @@ The root summary records the value as \fB\%ostree.summary.indexed\-deltas\fR.
 In an archive repository, the summary of each authentication item also records it, and \fB\%ostrya serve\fR copies the key into the \fB\%config\fR that it serves.
 .TP
 \fB\%auto\-update\-summary\fR (boolean, default false)
-Write each summary again after a push changes a ref, as \fB\%ostrya summary \-u\fR writes them.
-\fB\%ostrya receive\fR and \fB\%ostrya serve\fR read it.
-\fB\%ostrya commit\fR and \fB\%ostrya pull\fR do not write the summary.
+Write each summary again after a command that reads the key changes a ref, as \fB\%ostrya summary \-u\fR writes them.
+\fB\%ostrya receive\fR and \fB\%ostrya serve\fR read it after a push that changes a ref.
+\fB\%ostrya commit\fR reads it after a run that writes a tag or a branch that is not a remote ref.
+A run that writes no such ref does not read the key and writes no summary.
+The key groups that \fB\%sign\-summary\fR of \fB\%[ex\-ostrya server]\fR names sign each summary, the GPG keys first.
+With no \fB\%sign\-summary\fR, the summary has no signature, and the old \fB\%summary.sig\fR is removed.
+In a repository with a collection id, \fB\%ostrya commit\fR writes no new \fB\%ostree\-metadata\fR commit.
+\fB\%ostrya receive\fR and \fB\%ostrya serve\fR write one.
+After a run of \fB\%ostrya commit\fR that writes a tag or a branch that is not a remote ref, a value that is not a boolean, or a failed write, makes the command exit 1.
+The commit and the refs stay.
+\fB\%ostrya receive \-\-one\-way\fR writes no summary.
+\fB\%ostrya pull\fR does not write the summary.
 .TP
 \fB\%commit\-update\-summary\fR (boolean, default false)
 A deprecated name of \fB\%auto\-update\-summary\fR.
@@ -780,7 +789,7 @@ The number of object streams of a push session at the same time.
 The time in seconds that a response waits for the client to take its next bytes.
 .TP
 \fB\%sign\-summary\fR (list)
-The key groups whose keys sign each summary that a push writes again.
+The key groups whose keys sign each summary that a push writes again, and each summary that a command writes again under \fB\%auto\-update\-summary\fR.
 A name that occurs two times counts one time.
 \fB\%ostrya serve\fR has no option for the key, because \fB\%ostrya receive\fR reads it too.
 .PP

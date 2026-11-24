@@ -3643,6 +3643,36 @@ no revision reaches"). So the tree and the commit object stay in `objects/`
 (`cli-surface.md`, "P2", `commit`). Not observed: the order of this refusal and
 a key that cannot sign.
 
+#### The summary update
+
+These records come from libostree 2026.4, in an `archive` repository with a
+`summary` from `ostree summary -u`. Before each run, the probe writes marker
+bytes into `summary.sig`.
+
+With `[core] auto-update-summary=true`, each run exits 0:
+
+- `commit -b main` with a new commit writes `summary`.
+- `commit -b main --skip-if-unchanged` with no new commit writes no `summary`.
+- `commit --orphan`, which writes no ref, writes no `summary`.
+
+Each run that writes `summary` removes the existing `summary.sig`. Each run that
+writes no `summary` keeps it. The tool reads no key that names a signing key,
+so it never signs this summary.
+
+With `[core] collection-id` set, the results are the same, and no run writes a
+new `ostree-metadata` commit. `refs/heads/ostree-metadata` stays at the commit
+of the first `ostree summary -u`, and `ostree log ostree-metadata` shows one
+commit. The summary that the tool writes lists `ostree-metadata` at that
+commit.
+
+With `[core] auto-update-summary=yes`, `commit -b main` moves
+`refs/heads/main`, prints `error: Key file contains key “auto-update-summary”
+which has a value that cannot be interpreted.`, and exits 1. It writes no
+`summary` and keeps `summary.sig`.
+
+`cli-surface.md`, "P2", `commit`, records the two keys over their nine
+combinations and the port side.
+
 ### `refs`
 
 #### Listing and prefixes

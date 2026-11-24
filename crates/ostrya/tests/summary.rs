@@ -3518,3 +3518,311 @@ fn the_summary_files_take_the_shared_modes() {
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// The summary write under `[core] auto-update-summary`.
+// ---------------------------------------------------------------------------
+
+/// The bytes that a test writes into `summary.sig` before a call, so that a
+/// removal and a keep of the file are visible.
+const MARKER: &[u8] = b"marker signature";
+
+/// Copies the fixture `fixture`, appends `config` to its config, writes
+/// [`MARKER`] into `summary.sig`, and opens the copy.
+///
+/// The config of each summary fixture ends in `[core]`, so a key at the start
+/// of `config` goes into `[core]`.
+async fn auto_fixture(
+    fixture: &str,
+    tag: &str,
+    config: &str,
+) -> (TmpDir, std::path::PathBuf, Repo) {
+    let (tmp, repo_dir) = writable_fixture(fixture, tag);
+    std::fs::write(repo_dir.join("summary.sig"), MARKER).unwrap();
+    let repo = with_groups(&repo_dir, config).await;
+    (tmp, repo_dir, repo)
+}
+
+/// Writes the ed25519 secret key `secret_b64` to `path` as one line.
+fn write_secret(path: &Path, secret_b64: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, format!("\n{secret_b64}\n")).unwrap();
+}
+
+/// An ed25519 key group `name` whose key is `file`.
+fn ed25519_group(name: &str, file: &Path) -> String {
+    format!(
+        "[ex-ostrya key \"{name}\"]\ntype=ed25519\nsecret-key-file={}\n",
+        file.display()
+    )
+}
+
+/// Returns the keys of the dict in `summary.sig` of `repo_dir`, in stored
+/// order.
+fn signature_keys(repo_dir: &Path) -> Vec<String> {
+    let bytes = std::fs::read(repo_dir.join("summary.sig")).unwrap();
+    let dict = ostrya::from_bytes(&ostrya::Type::parse("a{sv}").unwrap(), &bytes).unwrap();
+    dict.as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.as_tuple().unwrap()[0].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// With the key absent or false, the call returns `None` and writes nothing.
+/// It reads no other group, so a `sign-summary` value that names no key
+/// group does not stop it.
+#[test]
+fn an_auto_update_with_the_key_off_writes_nothing() {
+    for (case, config) in [
+        ("absent", ""),
+        ("false", "auto-update-summary=false\n"),
+        ("alias-false", "commit-update-summary=false\n"),
+        (
+            "both-false",
+            "auto-update-summary=false\ncommit-update-summary=false\n",
+        ),
+    ] {
+        let config = format!("{config}[ex-ostrya server]\nsign-summary=nosuch\n");
+        block_on(async {
+            let (_tmp, repo_dir, repo) =
+                auto_fixture("summary", &format!("auto-off-{case}"), &config).await;
+            let report = repo.regenerate_summaries_if_configured().await.unwrap();
+            assert!(report.is_none(), "{case}");
+            assert!(!repo_dir.join("summary").exists(), "{case}");
+            assert_eq!(
+                std::fs::read(repo_dir.join("summary.sig")).unwrap(),
+                MARKER,
+                "{case}"
+            );
+        });
+    }
+}
+
+/// With the key true, or with the alias alone true, the call writes the
+/// summary of each ref and removes the old `summary.sig`.
+#[test]
+fn an_auto_update_with_the_key_on_writes_the_summary() {
+    for (case, config) in [
+        ("key", "auto-update-summary=true\n"),
+        ("alias", "commit-update-summary=true\n"),
+        (
+            "key-and-alias-false",
+            "auto-update-summary=true\ncommit-update-summary=false\n",
+        ),
+    ] {
+        block_on(async {
+            let (_tmp, repo_dir, repo) =
+                auto_fixture("summary", &format!("auto-on-{case}"), config).await;
+            let report = repo.regenerate_summaries_if_configured().await.unwrap();
+            let report = report.expect("the key is on");
+            assert!(report.invalid_collection_dirs.is_empty(), "{case}");
+            let summary =
+                Summary::parse(&std::fs::read(repo_dir.join("summary")).unwrap()).unwrap();
+            assert_eq!(ref_names(&summary), ["main", "other"], "{case}");
+            assert!(!repo_dir.join("summary.sig").exists(), "{case}");
+        });
+    }
+}
+
+/// A value of either key that is not a boolean is an `Error::Core`, also when
+/// the other key is true. The call writes nothing.
+#[test]
+fn an_auto_update_refuses_a_value_that_is_not_a_boolean() {
+    for (case, config) in [
+        ("key", "auto-update-summary=yes\n"),
+        ("alias", "commit-update-summary=yes\n"),
+        (
+            "key-alias-true",
+            "auto-update-summary=yes\ncommit-update-summary=true\n",
+        ),
+        (
+            "alias-key-true",
+            "auto-update-summary=true\ncommit-update-summary=yes\n",
+        ),
+    ] {
+        block_on(async {
+            let (_tmp, repo_dir, repo) =
+                auto_fixture("summary", &format!("auto-bad-{case}"), config).await;
+            let err = repo.regenerate_summaries_if_configured().await.unwrap_err();
+            assert!(matches!(err, ostrya::Error::Core(_)), "{case}: {err}");
+            assert!(!repo_dir.join("summary").exists(), "{case}");
+            assert_eq!(
+                std::fs::read(repo_dir.join("summary.sig")).unwrap(),
+                MARKER,
+                "{case}"
+            );
+        });
+    }
+}
+
+/// The key group that `sign-summary` names signs the summary. The new
+/// `summary.sig` holds its signature alone, and the signature verifies.
+#[test]
+fn an_auto_update_signs_with_the_sign_summary_groups() {
+    let tmp = TmpDir::new("auto-sign-key");
+    let key = tmp.path().join("secret.ed25519");
+    write_secret(&key, SECRET_B64);
+    let config = format!(
+        "auto-update-summary=true\n[ex-ostrya server]\nsign-summary=e\n{}",
+        ed25519_group("e", &key)
+    );
+    block_on(async {
+        let (_fixture, repo_dir, repo) = auto_fixture("summary", "auto-sign", &config).await;
+        repo.regenerate_summaries_if_configured()
+            .await
+            .unwrap()
+            .expect("the key is on");
+        assert_eq!(signature_keys(&repo_dir), ["ostree.sign.ed25519"]);
+        let public = base64::decode(PUBLIC_B64).unwrap();
+        let trusted = Ed25519Verifier::new([public], Vec::<Vec<u8>>::new()).unwrap();
+        let outcome = repo.verify_summary(&[Arc::new(trusted)]).await.unwrap();
+        assert!(outcome.valid);
+    });
+}
+
+/// A GPG key group signs before an ed25519 key group, also when
+/// `sign-summary` names the ed25519 group first.
+#[cfg(feature = "sign-gpg")]
+#[test]
+fn an_auto_update_signs_with_the_gpg_keys_first() {
+    if !common::gnupg_available(&["gpg", "gpgconf"]) {
+        return;
+    }
+    let tmp = TmpDir::new("auto-sign-gpg");
+    let home = common::GnupgHome::new(&tmp.path().join("gnupg"), "Signer <signer@example.org>");
+    let key = tmp.path().join("secret.ed25519");
+    write_secret(&key, SECRET_B64);
+    let config = format!(
+        "auto-update-summary=true\n[ex-ostrya server]\nsign-summary=e;g\n{}\
+         [ex-ostrya key \"g\"]\ntype=gpg\ngpg-key=signer@example.org\ngpg-homedir={}\n",
+        ed25519_group("e", &key),
+        home.dir.display()
+    );
+    block_on(async {
+        let (_fixture, repo_dir, repo) = auto_fixture("summary", "auto-gpg", &config).await;
+        repo.regenerate_summaries_if_configured()
+            .await
+            .unwrap()
+            .expect("the key is on");
+        assert_eq!(
+            signature_keys(&repo_dir),
+            ["ostree.gpgsigs", "ostree.sign.ed25519"]
+        );
+    });
+}
+
+/// A key group that `sign-summary` does not name is not built, so a broken
+/// definition of such a group does not stop the call.
+#[test]
+fn an_auto_update_builds_no_key_group_that_sign_summary_does_not_name() {
+    let tmp = TmpDir::new("auto-sign-other");
+    let key = tmp.path().join("secret.ed25519");
+    write_secret(&key, SECRET_B64);
+    let config = format!(
+        "auto-update-summary=true\n[ex-ostrya server]\nsign-summary=e\n{}\
+         [ex-ostrya key \"broken\"]\ntype=dummy\nsecret-key-file=/nonexistent\n\
+         [ex-ostrya key \"absent\"]\ntype=ed25519\nsecret-key-file=/nonexistent\n",
+        ed25519_group("e", &key)
+    );
+    block_on(async {
+        let (_fixture, repo_dir, repo) = auto_fixture("summary", "auto-other", &config).await;
+        repo.regenerate_summaries_if_configured()
+            .await
+            .unwrap()
+            .expect("the key is on");
+        assert_eq!(signature_keys(&repo_dir), ["ostree.sign.ed25519"]);
+    });
+}
+
+/// A `sign-summary` value that names no key group, and a named key group
+/// that cannot be built, are errors. The call writes nothing.
+#[test]
+fn an_auto_update_with_a_bad_sign_summary_group_writes_nothing() {
+    let tmp = TmpDir::new("auto-sign-bad");
+    let key = tmp.path().join("secret.ed25519");
+    write_secret(&key, SECRET_B64);
+    let absent = tmp.path().join("absent.ed25519");
+    let cases = [
+        (
+            "unknown",
+            "auto-update-summary=true\n[ex-ostrya server]\nsign-summary=nosuch\n".to_owned(),
+        ),
+        (
+            "no-key-file",
+            format!(
+                "auto-update-summary=true\n[ex-ostrya server]\nsign-summary=e;a\n{}{}",
+                ed25519_group("e", &key),
+                ed25519_group("a", &absent)
+            ),
+        ),
+    ];
+    for (case, config) in &cases {
+        block_on(async {
+            let (_fixture, repo_dir, repo) =
+                auto_fixture("summary", &format!("auto-bad-group-{case}"), config).await;
+            let err = repo.regenerate_summaries_if_configured().await.unwrap_err();
+            match *case {
+                "unknown" => assert!(
+                    matches!(&err, ostrya::Error::InvalidFormat(m) if m.contains("nosuch")),
+                    "{err}"
+                ),
+                _ => assert!(
+                    matches!(&err, ostrya::Error::Signature(m)
+                        if m.starts_with("[ex-ostrya key \"a\"]: ")),
+                    "{err}"
+                ),
+            }
+            assert!(!repo_dir.join("summary").exists(), "{case}");
+            assert_eq!(
+                std::fs::read(repo_dir.join("summary.sig")).unwrap(),
+                MARKER,
+                "{case}"
+            );
+        });
+    }
+}
+
+/// With a collection id, the call writes no new anchor commit. The
+/// `ostree-metadata` ref stays, no commit object is added, and the summary
+/// lists `ostree-metadata` at its current commit. A summary update with
+/// `regenerate_summaries` still writes a new anchor commit.
+#[test]
+fn an_auto_update_with_a_collection_id_writes_no_anchor_commit() {
+    block_on(async {
+        let (_tmp, repo_dir, repo) = auto_fixture(
+            "summary-collection",
+            "auto-collection",
+            "auto-update-summary=true\n",
+        )
+        .await;
+        repo.regenerate_summary(&fixed()).await.unwrap();
+        let anchor = Ref::local("ostree-metadata");
+        let tip = repo.resolve_ref_tip(&anchor).await.unwrap();
+        let tip = tip.expect("the anchor was written");
+        let objects = common::file_inventory(&repo_dir, "objects");
+        let refs = common::file_inventory(&repo_dir, "refs");
+        std::fs::write(repo_dir.join("summary.sig"), MARKER).unwrap();
+
+        repo.regenerate_summaries_if_configured()
+            .await
+            .unwrap()
+            .expect("the key is on");
+        assert_eq!(repo.resolve_ref_tip(&anchor).await.unwrap(), Some(tip));
+        assert_eq!(common::file_inventory(&repo_dir, "objects"), objects);
+        assert_eq!(common::file_inventory(&repo_dir, "refs"), refs);
+        assert!(!repo_dir.join("summary.sig").exists());
+        let summary = Summary::parse(&std::fs::read(repo_dir.join("summary")).unwrap()).unwrap();
+        let entry = summary
+            .refs
+            .iter()
+            .find(|entry| entry.name == "ostree-metadata")
+            .expect("the summary lists the anchor");
+        assert_eq!(entry.commit, tip);
+        assert!(ref_names(&summary).iter().any(|name| name == "main"));
+
+        repo.regenerate_summary(&fixed()).await.unwrap();
+        let next = repo.resolve_ref_tip(&anchor).await.unwrap();
+        assert!(next.is_some_and(|next| next != tip));
+    });
+}

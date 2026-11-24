@@ -33,20 +33,14 @@ use crate::related::{self, HeldAttachment, RelatedRule, RelationField};
 use crate::remote::proto::{CommitRequest, MAX_FRAME, Message};
 use crate::remote::{self, Expected, RefOutcome, RefUpdate};
 use crate::repo::Repo;
-use crate::sign::{Signer, SigningKey, append_signature};
+use crate::sign::{SigningKey, append_signature};
 use crate::summary::{
-    OSTREE_METADATA_REF, SummaryOptions, SummaryStep, parse_signature_dict,
+    OSTREE_METADATA_REF, SummaryOptions, SummaryStep, gpg_first, parse_signature_dict,
     serialize_signature_dict,
 };
 use crate::transaction::{Transaction, TransactionStats};
 use crate::verify::Payload;
 use crate::write::flat_name;
-
-/// The detached-metadata key of GPG signatures. The `ostree` command writes
-/// the summary signatures of this key first in `summary.sig`, and ostrya does
-/// the same. `docs/format-reference.md`, "Summary signature -- `a{sv}`",
-/// records this order.
-const GPG_KEY: &str = "ostree.gpgsigs";
 
 pub(super) type Checked<T> = std::result::Result<T, Failure>;
 
@@ -2414,13 +2408,7 @@ async fn write_summary(
     };
     let access = ClientAccess::from_config(repo.config())
         .map_err(|e| warning(ReceiveStep::SummaryBuild, "the summary build", e))?;
-    let is_gpg = |s: &&Arc<SigningKey>| s.signer().metadata_key() == GPG_KEY;
-    let ordered: Vec<&dyn Signer> = signers
-        .iter()
-        .filter(is_gpg)
-        .chain(signers.iter().filter(|s| !is_gpg(s)))
-        .map(|s| s.signer())
-        .collect();
+    let ordered = gpg_first(signers.iter().map(Arc::as_ref));
     repo.write_summaries(Arc::new(access), &SummaryOptions::default(), &ordered)
         .await
         .map(drop)

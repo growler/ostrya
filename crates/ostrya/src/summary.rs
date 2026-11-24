@@ -12,6 +12,9 @@
 //!   the summaries of the auth items alone. With
 //!   [`SummaryOptions::root_summary_only`], they write the root summary
 //!   alone.
+//! - [`Repo::regenerate_summaries_if_configured`] writes them again under
+//!   `[core] auto-update-summary`, signed by the key groups that
+//!   `sign-summary` names, with no new anchor commit.
 //! - [`Repo::sign_summary`] and [`Repo::sign_summary_all`] add signatures to
 //!   each summary. [`Repo::verify_summary`] verifies the signatures in
 //!   `summary.sig`.
@@ -49,7 +52,7 @@ use crate::repo::Repo;
 use crate::repo_fs::{
     FsError, FsResultExt, Publish, Reason, RepoDir, RepoLayout, RootFile, TempFile,
 };
-use crate::sign::{Signer, Verifier, VerifyOutcome, append_signature, verify_all};
+use crate::sign::{Signer, SigningKey, Verifier, VerifyOutcome, append_signature, verify_all};
 
 /// The GVariant type of the summary: `(refs, global_metadata)`.
 const SUMMARY_SIGNATURE: &str = "(a(s(taya{sv}))a{sv})";
@@ -89,6 +92,11 @@ pub(crate) const SUMMARY_SIG_FILE: &str = "summary.sig";
 
 /// The ref of the anchor commit of a collection.
 pub(crate) const OSTREE_METADATA_REF: &str = "ostree-metadata";
+/// The detached-metadata key of GPG signatures. The `ostree` command writes
+/// the summary signatures of this key first in `summary.sig`, and ostrya does
+/// the same. `docs/format-reference.md`, "Summary signature -- `a{sv}`",
+/// records this order.
+const GPG_KEY: &str = "ostree.gpgsigs";
 /// The mode of the empty root directory of the anchor commit: `S_IFDIR | 0755`.
 const ANCHOR_DIR_MODE: u32 = 0o40755;
 
@@ -953,6 +961,82 @@ impl Repo {
         opts: &SummaryOptions,
         signers: &[&dyn Signer],
     ) -> Result<SummaryReport> {
+        self.regenerate_summaries_with(opts, signers, None, true)
+            .await
+    }
+
+    /// Writes the summaries again if `[core] auto-update-summary` or its alias
+    /// `commit-update-summary` is true, and signs each one with the key
+    /// groups that `sign-summary` of `[ex-ostrya server]` names.
+    ///
+    /// The call first reads the two keys with
+    /// [`RepoConfig::auto_update_summary`](crate::RepoConfig::auto_update_summary).
+    /// If both keys are false or absent, the call returns `None`. It then
+    /// reads no other key and writes no file.
+    ///
+    /// If one key is true, the call reads the client groups and the server
+    /// group with [`ClientAccess::from_config`]. It builds the keys of each
+    /// key group that [`ServerSettings::sign_summary`] names, in the order of
+    /// the value, with [`SigningKey::from_key_group`]. It builds no other key
+    /// group. It builds each key before it writes a file, so a failure writes
+    /// nothing. Then it writes the summaries as
+    /// [`regenerate_summaries`](Repo::regenerate_summaries) does with
+    /// [`SummaryOptions::default`], and returns the report. Each GPG key
+    /// signs first, and then each other key. Each of the two parts keeps the
+    /// order of `sign-summary`. With no `sign-summary`, the summaries have no
+    /// signature, and the call removes each old signature file. The write
+    /// follows `[core] fsync`.
+    ///
+    /// In a repository with a collection id, the call writes no new anchor
+    /// commit, as the `ostree` command does under the same key. The
+    /// `ostree-metadata` ref does not move, and a summary that lists
+    /// `ostree-metadata` lists its current commit.
+    ///
+    /// The call does not examine the refs. The caller calls it after it
+    /// changes a ref that a summary lists. The locks are the locks of
+    /// [`regenerate_summaries`](Repo::regenerate_summaries).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Core`] if either key is not a boolean, also when the other
+    ///   key is true. The call writes nothing.
+    /// - [`Error::InvalidFormat`] if a client group or the server group is
+    ///   malformed, or if `sign-summary` names a key group that the config
+    ///   does not hold ([`ClientAccess::from_config`]). The call writes
+    ///   nothing.
+    /// - The errors of [`SigningKey::from_key_group`] for a key group that
+    ///   `sign-summary` names. The call writes nothing.
+    /// - The errors of [`regenerate_summaries`](Repo::regenerate_summaries)
+    ///   for the write, except the errors of the anchor commit.
+    ///
+    /// [`ServerSettings::sign_summary`]: crate::access::ServerSettings::sign_summary
+    pub async fn regenerate_summaries_if_configured(&self) -> Result<Option<SummaryReport>> {
+        if !self.config().auto_update_summary()? {
+            return Ok(None);
+        }
+        let access = ClientAccess::from_config(self.config())?;
+        let mut keys = Vec::new();
+        for name in access.server().sign_summary.iter().flatten() {
+            keys.extend(SigningKey::from_key_group(self, name).await?);
+        }
+        let signers = gpg_first(&keys);
+        self.regenerate_summaries_with(&SummaryOptions::default(), &signers, Some(access), false)
+            .await
+            .map(Some)
+    }
+
+    /// Writes the summaries as
+    /// [`regenerate_summaries`](Repo::regenerate_summaries) states. With
+    /// `access` `None`, the call reads the client groups from the config
+    /// after it checks `opts`. With `anchor` false, the call writes no anchor
+    /// commit in a repository with a collection id.
+    async fn regenerate_summaries_with(
+        &self,
+        opts: &SummaryOptions,
+        signers: &[&dyn Signer],
+        access: Option<ClientAccess>,
+        anchor: bool,
+    ) -> Result<SummaryReport> {
         if opts.auth_items_only && opts.root_summary_only {
             return Err(Error::InvalidInput(
                 "a summary update cannot write the auth items alone and the root summary alone"
@@ -982,17 +1066,21 @@ impl Repo {
         }
         // The client groups give the items. A malformed group is refused
         // before the anchor advances.
-        let access = Arc::new(ClientAccess::from_config(self.config())?);
+        let access = Arc::new(match access {
+            Some(access) => access,
+            None => ClientAccess::from_config(self.config())?,
+        });
         self.config().fsync()?;
 
         // The repository lock comes before the update lock. The anchor
         // transaction takes the repository lock shared too, before the update
         // lock, so its staging directory is made outside the update lock. A
-        // run that writes the summaries of the auth items alone, or the root
-        // summary alone, writes no anchor.
+        // run with `anchor` false, a run that writes the summaries of the auth
+        // items alone, and a run that writes the root summary alone write no
+        // anchor.
         let repo_lock = self.lock_repo(LockKind::Shared).await?;
         let txn = match &collection_id {
-            Some(_) if !opts.auth_items_only && !opts.root_summary_only => {
+            Some(_) if anchor && !opts.auth_items_only && !opts.root_summary_only => {
                 Some(self.transaction().await?)
             }
             _ => None,
@@ -3053,6 +3141,21 @@ const _: fn() = || {
     };
 };
 
+/// Returns the signers of `keys` in the order of the signatures of a summary:
+/// each GPG key first, and then each other key.
+///
+/// Each of the two parts keeps the order of `keys`. A key is a GPG key when
+/// its signer writes [`GPG_KEY`].
+pub(crate) fn gpg_first<'a>(keys: impl IntoIterator<Item = &'a SigningKey>) -> Vec<&'a dyn Signer> {
+    let keys: Vec<&SigningKey> = keys.into_iter().collect();
+    let is_gpg = |key: &&SigningKey| key.signer().metadata_key() == GPG_KEY;
+    keys.iter()
+        .filter(|key| is_gpg(key))
+        .chain(keys.iter().filter(|key| !is_gpg(key)))
+        .map(|key| key.signer())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use ostrya_core::loose_path;
@@ -4367,5 +4470,61 @@ mod tests {
                 "{ty}: {outcome:?}"
             );
         }
+    }
+
+    /// A signer and a verifier of one detached-metadata key, named by a
+    /// tag, for the order of `gpg_first`.
+    struct Tagged {
+        tag: &'static str,
+        key: &'static str,
+    }
+
+    impl Signer for Tagged {
+        fn name(&self) -> &str {
+            self.tag
+        }
+
+        fn metadata_key(&self) -> &str {
+            self.key
+        }
+
+        fn sign<'a>(&'a self, _data: &'a [u8]) -> crate::sign::SignFuture<'a> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    impl Verifier for Tagged {
+        fn metadata_key(&self) -> &str {
+            self.key
+        }
+
+        fn verify(
+            &self,
+            _data: &[u8],
+            _signatures: &[Vec<u8>],
+        ) -> ostrya_sign::Result<VerifyOutcome> {
+            Ok(VerifyOutcome::default())
+        }
+    }
+
+    /// Returns a signing key whose signer has the name `tag` and writes `key`.
+    fn tagged(tag: &'static str, key: &'static str) -> SigningKey {
+        SigningKey::new(Box::new(Tagged { tag, key }), Box::new(Tagged { tag, key })).unwrap()
+    }
+
+    /// `gpg_first` puts each GPG key first and each other key after them. Each
+    /// part keeps the input order.
+    #[test]
+    fn gpg_first_puts_the_gpg_keys_first_in_input_order() {
+        const ED: &str = "ostree.sign.ed25519";
+        let keys = [
+            tagged("ed_a", ED),
+            tagged("gpg_a", GPG_KEY),
+            tagged("ed_b", ED),
+            tagged("gpg_b", GPG_KEY),
+        ];
+        let names: Vec<&str> = gpg_first(&keys).iter().map(|s| s.name()).collect();
+        assert_eq!(names, ["gpg_a", "gpg_b", "ed_a", "ed_b"]);
+        assert!(gpg_first(Vec::<&SigningKey>::new()).is_empty());
     }
 }

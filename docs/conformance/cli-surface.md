@@ -2110,17 +2110,44 @@ a name the ref-name rule refuses. `-b 'bad//name' --sign=zzz` reports
 `error: Invalid refspec bad//name` in both, and so do `-b 'bad name'
 --sign=zzz` and `-b 'a^b' --sign=zzz`.
 
-`[core] auto-update-summary` and its deprecated alias `commit-update-summary`
-part the two on `commit`. The tool reads the two keys together. Over the nine
-combinations of each key absent, `true`, and `false`, `ostree commit -b x` into
-an archive repository writes `summary` exactly when one of the two keys is
-`true`. So `auto-update-summary=false` with `commit-update-summary=true` writes
-it, and so does the reverse. A value that is not a boolean in either key, `yes`
-for example, makes the commit exit 1 with `error: Key file contains key
+On `commit`, the tool reads `[core] auto-update-summary` and its deprecated
+alias `commit-update-summary` together. Over the nine combinations of each key
+absent, `true`, and `false`, `ostree commit -b x` into an archive repository
+writes `summary` exactly when one of the two keys is `true`. So
+`auto-update-summary=false` with `commit-update-summary=true` writes it, and
+so does the reverse. A value that is not a boolean in either key, `yes` for
+example, makes the commit exit 1 with `error: Key file contains key
 “auto-update-summary” which has a value that cannot be interpreted.`, also when
 the other key is `true`. The ref is written and the summary is not.
-`ostrya commit` and `ostrya pull` read neither key and write no `summary`, so
-the port leaves `summary` as it stands and exits 0 over each of these values.
+
+`ostrya commit` reads the two keys by the rule of the tool after a run that
+writes a tag or a branch that is not a remote ref. It reads them after it
+writes the refs and prints its output. A run that writes no such ref does not
+read the two keys and writes no summary. So `--skip-if-unchanged` with no new
+commit and `--orphan` with no ref write no summary, as in the tool. With no
+`sign-summary`, each write removes the old `summary.sig`, as in the tool.
+After a run that writes such a ref, a value that is not a boolean in either
+key makes both commands exit 1, with the ref written and no summary. The port
+reports `error: keyfile: value 'yes' for core.auto-update-summary is not a
+boolean`, and the same text with `core.commit-update-summary` for the alias.
+The two commands differ in these points:
+
+- The port signs the summary with the key groups that `sign-summary` of
+  `[ex-ostrya server]` names, the GPG keys first. The tool never signs this
+  summary.
+- The port also writes the summary of each auth item under
+  `extensions/ostrya/summary/`, as `ostrya summary -u` does.
+- `-b REMOTE:REF` with no `--tag` writes a remote ref alone, and the port then
+  reads neither key and writes no summary. No record observes the tool for
+  this case.
+
+In a repository with a collection id, neither command writes a new
+`ostree-metadata` commit on a commit, and the summary lists `ostree-metadata`
+at its current commit. `ostrya receive` and `ostrya serve` write a new
+`ostree-metadata` commit on a push.
+
+`ostrya pull` reads neither key and writes no `summary`, so the port leaves
+`summary` as it stands and exits 0 over each of these values.
 `ostrya receive` and `ostrya serve` read the two keys by the rule of the
 tool. They refuse a value that is not a boolean in either one
 (`ostrya-config(1)`).

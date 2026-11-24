@@ -1608,8 +1608,12 @@ the directory when `[core] add-remotes-config-dir` of `config` is not
 `config`, with one blank line between two groups.
 
 `RepoConfig::auto_update_summary` reads `auto-update-summary` and
-`commit-update-summary` together. Its caller in the port is the reader of the
-receive policies, `ReceivePolicies::from_config`.
+`commit-update-summary` together. Its callers in the port are the reader of
+the receive policies, `ReceivePolicies::from_config`, and
+`Repo::regenerate_summaries_if_configured`. `ostrya commit` calls
+`Repo::regenerate_summaries_if_configured` after a run that writes a tag or a
+branch that is not a remote ref. A run that writes no such ref does not read
+the two keys.
 `conformance/cli-surface.md`, "P2", `commit`, records the effect of the two
 keys on a commit.
 
@@ -3393,7 +3397,10 @@ group that the key names. A pull with `PullOptions::trust_group`, which
 field names, and does not read the key `trust`.
 `TrustedKeys::from_trust_group` reads the one trust group that its argument
 names. `SigningKey::from_key_group` reads the one key group that its argument
-names.
+names. `Repo::regenerate_summaries_if_configured` reads
+`[core] auto-update-summary` and `commit-update-summary`. When one of the two
+keys is true, it also reads the client groups, the server group, and each key
+group that `sign-summary` names.
 
 The key `[ex-ostrya] remotes-config-dir` names the remotes directory of the
 repository: a directory of `.conf` files that hold remotes. A library create
@@ -6546,7 +6553,11 @@ update lock").
 With `[core] auto-update-summary=true`, a push through `ostrya serve` or
 `ostrya receive` that changes a ref writes the root summary and each
 summary of an item again, as `ostrya summary -u` does. The key groups of `sign-summary` sign them, GPG
-keys first. A one-way stream writes no summary.
+keys first. A one-way stream writes no summary. `ostrya commit` writes the
+same summaries after a run that writes a tag or a branch that is not a remote
+ref, through `Repo::regenerate_summaries_if_configured`, signed by the same
+key groups. In a repository with a collection id, it writes no new anchor
+commit, and the summaries list `ostree-metadata` at its current commit.
 
 A mirror pull that writes `summary` writes no file under
 `extensions/ostrya/summary/`. It writes `summary` and `summary.sig` through

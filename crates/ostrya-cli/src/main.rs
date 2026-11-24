@@ -210,6 +210,16 @@ enum Command {
     /// carries the commit checksum, or the --table-output block. If the
     /// command refuses its input, it exits 1, moves no ref, and creates no
     /// ref.
+    ///
+    /// After a run that writes a tag or a branch that is not a remote ref,
+    /// the command reads `[core] auto-update-summary` and its alias
+    /// `commit-update-summary`. If one of the two is true, the command writes
+    /// the root summary and each summary of an item again. The key groups of
+    /// `sign-summary` of `[ex-ostrya server]` sign them. The command writes
+    /// no new `ostree-metadata` commit. A run that writes no such ref does
+    /// not read the two keys. After a run that writes such a ref, a value
+    /// that is not a boolean, or a failed write, makes the command exit 1.
+    /// The commit and the refs stay.
     Commit(CommitArgs),
     /// Check a commit out onto the file system, or write its composefs image.
     ///
@@ -9893,12 +9903,28 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     } else {
         println!("{}", checksum.to_hex());
     }
-    // The output comes first, and then the removal. A failed removal exits 1,
-    // and the commit and the refs stay.
-    if !remove_consumed_sources(&consumed).await {
+    // The output comes first, then the removal, and then the summary. A
+    // failed removal or a failed summary exits 1, and the commit and the refs
+    // stay. A tag is a local ref or a collection ref, and a summary lists
+    // both. A remote branch alone changes no ref that a summary lists.
+    let removed = remove_consumed_sources(&consumed).await;
+    let listed = !args.tags.is_empty()
+        || args
+            .branch
+            .as_deref()
+            .is_some_and(|branch| !matches!(branch.parse::<Ref>(), Ok(Ref::Remote { .. })));
+    let summary = if listed {
+        update_summary_if_configured(&repo).await
+    } else {
+        Ok(())
+    };
+    if !removed {
+        if let Err(err) = &summary {
+            eprintln!("error: {}", error_line(err));
+        }
         exit_process(1);
     }
-    Ok(())
+    summary
 }
 
 /// Returns the refusal of the `--tag` names of a commit, or `None` if each
@@ -16340,7 +16366,17 @@ async fn summary_update(repo: &Repo, args: &SummaryArgs) -> Result<()> {
     let report = repo
         .regenerate_summaries(&opts, &signer_refs(&signers))
         .await?;
-    for name in &report.invalid_collection_dirs {
+    print_invalid_collection_dirs(&report.invalid_collection_dirs);
+    Ok(())
+}
+
+/// Writes one `warning:` line to standard error for each directory under
+/// `refs/mirrors/` whose name is not a collection id.
+///
+/// `names` holds the names of the directories. Each ASCII control character
+/// of a name is written as its escape sequence.
+fn print_invalid_collection_dirs(names: &[String]) {
+    for name in names {
         let name: String = name
             .chars()
             .map(|c| {
@@ -16355,6 +16391,20 @@ async fn summary_update(repo: &Repo, args: &SummaryArgs) -> Result<()> {
             "warning: refs/mirrors/{name}: the directory name is not a collection id, and no \
              summary holds its refs"
         );
+    }
+}
+
+/// Writes each summary again if `[core] auto-update-summary` or its alias
+/// `commit-update-summary` is true.
+///
+/// A command calls this function after it changes a ref that a summary
+/// lists. The key groups that `sign-summary` of `[ex-ostrya server]` names
+/// sign the summaries. Each directory under `refs/mirrors/` whose name is not
+/// a collection id gets one `warning:` line on standard error. The function
+/// holds no state between calls and does not end the process.
+async fn update_summary_if_configured(repo: &Repo) -> Result<()> {
+    if let Some(report) = repo.regenerate_summaries_if_configured().await? {
+        print_invalid_collection_dirs(&report.invalid_collection_dirs);
     }
     Ok(())
 }

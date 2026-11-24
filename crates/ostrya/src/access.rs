@@ -520,7 +520,10 @@ pub struct ServerSettings {
     /// seconds, 1 or more.
     pub body_timeout: Option<u64>,
     /// `sign-summary`: the key groups that sign a summary that a push writes
-    /// again, each one time. An empty value is refused.
+    /// again, or that a command writes again under
+    /// `[core] auto-update-summary` through
+    /// [`Repo::regenerate_summaries_if_configured`](crate::Repo::regenerate_summaries_if_configured),
+    /// each one time. An empty value is refused.
     pub sign_summary: Option<Vec<String>>,
 }
 

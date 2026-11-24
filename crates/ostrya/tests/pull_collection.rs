@@ -1505,6 +1505,155 @@ fn an_http_remote_and_a_file_remote_each_give_the_newer_commit() {
     });
 }
 
+/// The pull lists the refs that it changed, in the order of the remotes
+/// that it pulled from: the ref from an HTTP remote, then the ref from a
+/// `file://` remote. A second pull at the same commits lists nothing. After
+/// each remote moves its ref, a third pull lists each ref with its old
+/// commit. Into a repository whose own collection id is the pulled id, the
+/// entry is a local ref.
+#[test]
+fn a_collection_pull_lists_the_refs_that_it_changed() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-changed");
+        let next_bound = Bind {
+            collection: Some(ID),
+            refs: Some(&["os/next"]),
+        };
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let a_stable = commit(&a, dir.path(), "a1", None, REF, FIXED_TS + 10, BOUND).await;
+        summarize(&a).await;
+        let b = create(dir.path(), "b", Some(OTHER)).await;
+        let b_next = commit(
+            &b,
+            dir.path(),
+            "b2",
+            Some(ID),
+            "os/next",
+            FIXED_TS + 10,
+            next_bound,
+        )
+        .await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let remotes = [("a", server_a.url()), ("b", file_url(dir.path(), "b"))];
+        let remotes: Vec<(&str, &str, &str)> = remotes
+            .iter()
+            .map(|(name, url)| (*name, url.as_str(), ""))
+            .collect();
+        let dest = dest(dir.path(), None, &remotes).await;
+
+        let (opts, _) = options(&["os/next", REF]);
+        let pulled = dest.pull_collection(ID, &["a", "b"], opts).await.unwrap();
+        let got: Vec<(Ref, Option<Checksum>, Checksum)> = pulled
+            .changed_refs
+            .iter()
+            .map(|c| (c.name.clone(), c.old, c.new))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Ref::collection(ID, REF), None, a_stable),
+                (Ref::collection(ID, "os/next"), None, b_next),
+            ]
+        );
+
+        let (opts, _) = options(&["os/next", REF]);
+        let pulled = dest.pull_collection(ID, &["a", "b"], opts).await.unwrap();
+        assert!(pulled.changed_refs.is_empty(), "{pulled:?}");
+
+        let a_moved = commit(&a, dir.path(), "a3", None, REF, FIXED_TS + 20, BOUND).await;
+        summarize(&a).await;
+        let b_moved = commit(
+            &b,
+            dir.path(),
+            "b3",
+            Some(ID),
+            "os/next",
+            FIXED_TS + 20,
+            next_bound,
+        )
+        .await;
+        let (opts, _) = options(&["os/next", REF]);
+        let pulled = dest.pull_collection(ID, &["a", "b"], opts).await.unwrap();
+        let got: Vec<(Ref, Option<Checksum>, Checksum)> = pulled
+            .changed_refs
+            .iter()
+            .map(|c| (c.name.clone(), c.old, c.new))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Ref::collection(ID, REF), Some(a_stable), a_moved),
+                (Ref::collection(ID, "os/next"), Some(b_next), b_moved),
+            ]
+        );
+
+        let own = Repo::create(
+            &dir.path().join("own"),
+            CreateOptions::new(RepoMode::Archive).collection_id(ID),
+        )
+        .await
+        .unwrap();
+        drop(own);
+        let config = dir.path().join("own/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!(
+            "\n[remote \"a\"]\nurl={}\ngpg-verify=false\ncollection-id={ID}\n",
+            server_a.url()
+        ));
+        std::fs::write(&config, text).unwrap();
+        let own = Repo::open(&dir.path().join("own")).await.unwrap();
+        let (opts, _) = options(&[REF]);
+        let pulled = own.pull_collection(ID, &["a"], opts).await.unwrap();
+        let got: Vec<(Ref, Option<Checksum>, Checksum)> = pulled
+            .changed_refs
+            .iter()
+            .map(|c| (c.name.clone(), c.old, c.new))
+            .collect();
+        assert_eq!(got, [(Ref::local(REF), None, a_moved)]);
+    });
+}
+
+/// A pull whose second remote fails after the pull from the first remote
+/// wrote its ref returns the error and no list. The tip of the `file://`
+/// remote has no collection binding, so its pull fails.
+#[test]
+fn a_collection_pull_that_fails_after_a_ref_write_returns_the_error() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-changed-fails");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let a_stable = commit(&a, dir.path(), "a1", None, REF, FIXED_TS, BOUND).await;
+        summarize(&a).await;
+        let b = create(dir.path(), "b", Some(OTHER)).await;
+        let unbound = Bind {
+            collection: None,
+            refs: None,
+        };
+        commit(&b, dir.path(), "b1", Some(ID), "os/next", FIXED_TS, unbound).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let dest = dest(
+            dir.path(),
+            None,
+            &[
+                ("a", &server_a.url(), ""),
+                ("b", &file_url(dir.path(), "b"), ""),
+            ],
+        )
+        .await;
+
+        let (opts, _) = options(&[REF, "os/next"]);
+        let err = dest
+            .pull_collection(ID, &["a", "b"], opts)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("no collection binding")),
+            "{err:?}"
+        );
+        assert_eq!(mirror(&dest, REF).await, Some(a_stable));
+        assert_eq!(mirror(&dest, "os/next").await, None);
+    });
+}
+
 /// A `file://` address with a host part, `localhost` included, with no
 /// path, or with `%`, `?`, or `#` stops the pull before the request to the
 /// first remote. The pull writes nothing.

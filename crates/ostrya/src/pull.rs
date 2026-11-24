@@ -995,6 +995,44 @@ pub struct PullStats {
     pub elapsed: Duration,
 }
 
+/// One ref that a pull wrote with a new commit.
+///
+/// The ref is new, or it moved from an old commit to a new commit. A ref that
+/// the pull wrote again with the commit that it named before is not a change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RefChange {
+    /// The ref, in its canonical form.
+    ///
+    /// A ref of the `[core] collection-id` of the repository is a
+    /// [`Ref::Local`].
+    pub name: Ref,
+    /// The commit that the ref named before the pull, or `None`.
+    ///
+    /// The value is `None` for a new ref. It is also `None` if the old ref
+    /// file did not parse, was too large, or could not be read.
+    pub old: Option<Checksum>,
+    /// The commit that the pull wrote to the ref.
+    pub new: Checksum,
+}
+
+/// The result of [`Repo::pull_with_report`] and
+/// [`Repo::pull_local_with_report`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PullReport {
+    /// The counts of what the pull imported and fetched.
+    pub stats: PullStats,
+    /// Each ref that the pull changed, in the order in which the pull queued
+    /// the refs.
+    ///
+    /// The list holds one entry for each ref, at the first place of the ref
+    /// in the queue. A pull that writes no ref, for
+    /// example a pull with [`no_ref_writes`](PullOptions::no_ref_writes) or a
+    /// pull of `CHECKSUM` operands alone, gives an empty list.
+    pub changed_refs: Vec<RefChange>,
+}
+
 /// The live counters of pulls from a remote.
 ///
 /// A caller reads the counters while the pulls run. The caller sets a clone of
@@ -1270,7 +1308,8 @@ impl Repo {
     /// The pull writes the refs last, after the objects are published. So no
     /// ref of this repository names a commit with objects that are not durable.
     /// Under [`no_ref_writes`](PullOptions::no_ref_writes) the pull writes no
-    /// ref.
+    /// ref. [`pull_local_with_report`](Repo::pull_local_with_report) also
+    /// returns the refs that the pull changed.
     ///
     /// [`verify`](PullOptions::verify) selects the signature policy, as
     /// [`PullVerify`] states. The module [`pull`](self) states the rules of
@@ -1956,7 +1995,44 @@ impl Repo {
     ///   `src` fails, for example with `EACCES`, or if the path of a requested
     ///   ref names a directory or goes through a file, before the pull writes
     ///   an object.
-    pub async fn pull_local(&self, src: &Repo, mut opts: PullOptions) -> Result<PullStats> {
+    pub async fn pull_local(&self, src: &Repo, opts: PullOptions) -> Result<PullStats> {
+        self.pull_local_named(src, opts, false)
+            .await
+            .map(|report| report.stats)
+    }
+
+    /// Pulls refs and their objects from another local repository as
+    /// [`pull_local`](Repo::pull_local) does, and returns the statistics and
+    /// the refs that the pull changed.
+    ///
+    /// [`PullReport::changed_refs`] holds each ref that is new and each ref
+    /// that moved. A ref that the pull wrote again with the commit that it
+    /// named before is not in the list. A pull that fails returns the error
+    /// and no list.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`pull_local`](Repo::pull_local).
+    pub async fn pull_local_with_report(
+        &self,
+        src: &Repo,
+        opts: PullOptions,
+    ) -> Result<PullReport> {
+        self.pull_local_named(src, opts, true).await
+    }
+
+    /// Runs the pull of [`pull_local`](Repo::pull_local) from the local
+    /// repository `src`.
+    ///
+    /// If `record` is `true`, the pull reads the old commit of each ref that
+    /// it writes, and the report holds each ref that the pull changed. Else
+    /// the pull reads no old commit, and the list of the report is empty.
+    async fn pull_local_named(
+        &self,
+        src: &Repo,
+        mut opts: PullOptions,
+        record: bool,
+    ) -> Result<PullReport> {
         let started = Instant::now();
         // A local pull copies whole trees. The `ostree pull-local` command
         // takes no subpath either.
@@ -2004,6 +2080,7 @@ impl Repo {
             LocalWanted::Named(&operands),
             edges,
             started,
+            record,
         )
         .await
     }
@@ -2017,7 +2094,8 @@ impl Repo {
     /// the [`Pinned`]. With [`LocalWanted::Named`], they are at
     /// [`RefPlace::Operands`] of [`remote`](PullOptions::remote) and of the
     /// `[core] collection-id` of this repository. `started` is the start of
-    /// [`PullStats::elapsed`].
+    /// [`PullStats::elapsed`]. If `record` is `true`, the report holds each
+    /// ref that the commit of the transaction changed, else no ref.
     #[allow(clippy::too_many_arguments)]
     async fn pull_local_from(
         &self,
@@ -2028,7 +2106,8 @@ impl Repo {
         wanted: LocalWanted<'_>,
         edges: Option<chain::Edges>,
         started: Instant,
-    ) -> Result<PullStats> {
+        record: bool,
+    ) -> Result<PullReport> {
         let verification = verify::Verification::from_trust(trust);
         // A pull that requires static deltas reads the source as a fetch
         // reads a remote: the summary, then the deltas that it advertises. A
@@ -2586,11 +2665,11 @@ impl Repo {
                     }
                 }
             }
-            txn.commit().await
+            txn.commit_reporting(record).await
         }
         .await;
-        let stats = match published {
-            Ok(stats) => stats,
+        let (stats, changed_refs) = match published {
+            Ok(published) => published,
             Err(e) => {
                 self.clear_markers_for_absent_commits(&marked, marker_fsync)
                     .await;
@@ -2605,16 +2684,19 @@ impl Repo {
                 .await?;
         }
 
-        Ok(PullStats {
-            metadata_imported: stats.metadata_written,
-            content_imported: stats.content_written,
-            content_bytes_written: stats.content_bytes_written,
-            content_bytes_unpacked: stats.content_bytes_unpacked,
-            metadata_fetched: counters.metadata(),
-            content_fetched: counters.content(),
-            delta_parts: counters.parts(),
-            bytes_transferred: counters.bytes(),
-            elapsed: started.elapsed(),
+        Ok(PullReport {
+            stats: PullStats {
+                metadata_imported: stats.metadata_written,
+                content_imported: stats.content_written,
+                content_bytes_written: stats.content_bytes_written,
+                content_bytes_unpacked: stats.content_bytes_unpacked,
+                metadata_fetched: counters.metadata(),
+                content_fetched: counters.content(),
+                delta_parts: counters.parts(),
+                bytes_transferred: counters.bytes(),
+                elapsed: started.elapsed(),
+            },
+            changed_refs,
         })
     }
 
@@ -4307,8 +4389,10 @@ impl Repo {
             LocalWanted::Pinned(&pinned),
             None,
             Instant::now(),
+            false,
         )
         .await
+        .map(|report| report.stats)
     }
 }
 

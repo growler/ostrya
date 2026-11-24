@@ -348,6 +348,59 @@ pub(crate) fn check_resolved_refs_blocking(root: &RepoDir, refs: &[ResolvedRef])
     Ok(())
 }
 
+/// Returns each ref that the resolved refs `refs` of a transaction change, on
+/// the blocking pool.
+///
+/// The caller holds the update lock, and calls this after
+/// [`check_resolved_refs_blocking`] and before the first write. The result
+/// holds one entry for each ref path, at the place of its first entry in
+/// `refs`, with the last commit that `refs` queues for it. A path whose last
+/// entry is a removal gives no entry.
+///
+/// The old commit is the expected commit of a conditional entry at the path,
+/// which the check confirmed. Else the call reads the path one time with
+/// [`RepoDir::read_capped`] and the cap [`REF_READ_CAP`], and parses the
+/// content with [`parse_ref_content`]. The check passed, so a path whose last
+/// entry is a write is absent or a regular file, and the call does not
+/// `lstat` it again. The read follows no symlink and does not wait on a
+/// FIFO. Each error of the read or of the parse gives no old commit, so the
+/// read never fails the commit. An entry whose old commit is its new commit
+/// is not in the result.
+pub(crate) fn ref_changes_blocking(
+    root: &RepoDir,
+    refs: &[ResolvedRef],
+) -> Vec<crate::pull::RefChange> {
+    // For each path: its first entry, its last queued commit, and the
+    // expected commit of a conditional entry at it.
+    let mut paths = Vec::with_capacity(refs.len());
+    let mut index: HashMap<&str, usize> = HashMap::with_capacity(refs.len());
+    for r in refs {
+        let at = *index.entry(r.relpath.as_str()).or_insert_with(|| {
+            paths.push((r, None, None));
+            paths.len() - 1
+        });
+        let path = &mut paths[at];
+        path.1 = r.checksum;
+        path.2 = path.2.or(r.expected);
+    }
+    paths
+        .into_iter()
+        .filter_map(|(first, new, expected)| {
+            let new = new?;
+            let old = expected.unwrap_or_else(|| {
+                root.read_capped(&first.relpath, REF_READ_CAP)
+                    .ok()
+                    .and_then(|bytes| parse_ref_content(&bytes).ok())
+            });
+            (old != Some(new)).then(|| crate::pull::RefChange {
+                name: first.name.clone(),
+                old,
+                new,
+            })
+        })
+        .collect()
+}
+
 /// Returns the parent directories of the ref path `path`, nearest first:
 /// `a/b` and `a` for `a/b/c`.
 fn parent_paths(path: &str) -> impl Iterator<Item = &str> {

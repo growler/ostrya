@@ -32,6 +32,8 @@ API documentation: <https://docs.rs/ostrya>
 - `Repo::checkout_at` writes the tree of a commit into a directory.
 - `Repo::pull` copies commits from a remote, and `Repo::pull_local` from a local
   repository.
+- `Repo::pull_with_report` and `Repo::pull_local_with_report` also list the refs
+  that the pull changed.
 - `Repo::pull_with_session` copies commits from a remote through a session of the
   caller.
 - `Repo::pull_collection` copies the refs of a collection from the remotes that

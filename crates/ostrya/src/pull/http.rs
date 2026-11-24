@@ -65,7 +65,7 @@ use super::subpath::{Scope, Subpaths};
 use super::verify::Verification;
 use super::{
     CheckedMeta, ChecksumTargets, ModeChecks, Operand, Pinned, PullCounters, PullFlags,
-    PullOptions, PullStats, PullVerify, READ_CHUNK, RefPlace, TimestampBase, TipChecks,
+    PullOptions, PullReport, PullStats, PullVerify, READ_CHUNK, RefPlace, TimestampBase, TipChecks,
     apply_durability, check_commit_operands, check_commit_signatures_filtered, check_depth,
     check_one_place, check_remote_operands, check_remote_option, check_static_deltas,
     check_tip_refs, commit_operands_alone, completes_marked, operand_collection,
@@ -99,6 +99,8 @@ impl Repo {
     /// the proxy, and [`overrides`](PullOptions::overrides) changes them. The
     /// pull fetches the objects into one transaction, publishes them, and then
     /// writes the refs. It returns the statistics of the pull.
+    /// [`pull_with_report`](Repo::pull_with_report) also returns the refs that
+    /// the pull changed.
     ///
     /// The module [`pull`](mod@crate::pull) states the rules of the
     /// `.commitpartial` markers. It also states the concurrency, the write
@@ -928,7 +930,57 @@ impl Repo {
     /// println!("{} content objects fetched", stats.content_fetched);
     /// # Ok(()) }
     /// ```
-    pub async fn pull(&self, remote: &str, mut opts: PullOptions) -> Result<PullStats> {
+    pub async fn pull(&self, remote: &str, opts: PullOptions) -> Result<PullStats> {
+        self.pull_remote(remote, opts, false)
+            .await
+            .map(|report| report.stats)
+    }
+
+    /// Pulls refs and their objects from a remote as [`pull`](Repo::pull)
+    /// does, and returns the statistics and the refs that the pull changed.
+    ///
+    /// [`PullReport::changed_refs`] holds each ref that is new and each ref
+    /// that moved, remote refs too. A ref that the pull wrote again with the
+    /// commit that it named before is not in the list. A pull that fails
+    /// returns the error and no list.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`pull`](Repo::pull).
+    ///
+    /// # Examples
+    ///
+    /// Pull one ref from the remote `origin` of the config, and print each
+    /// ref that changed:
+    ///
+    /// ```no_run
+    /// # async fn run() -> ostrya::Result<()> {
+    /// let repo = ostrya::Repo::open("/srv/repo".as_ref()).await?;
+    /// let opts = ostrya::PullOptions {
+    ///     refs: vec!["exampleos/stable".to_owned()],
+    ///     ..Default::default()
+    /// };
+    /// let report = repo.pull_with_report("origin", opts).await?;
+    /// for change in &report.changed_refs {
+    ///     println!("{} is at {}", change.name, change.new);
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn pull_with_report(&self, remote: &str, opts: PullOptions) -> Result<PullReport> {
+        self.pull_remote(remote, opts, true).await
+    }
+
+    /// Runs the pull of [`pull`](Repo::pull) from the remote `remote`.
+    ///
+    /// If `record` is `true`, the pull reads the old commit of each ref that
+    /// it writes, and the report holds each ref that the pull changed. Else
+    /// the pull reads no old commit, and the list of the report is empty.
+    async fn pull_remote(
+        &self,
+        remote: &str,
+        mut opts: PullOptions,
+        record: bool,
+    ) -> Result<PullReport> {
         let started = Instant::now();
         // A subpath the walk cannot read is refused before anything else, so it
         // costs no request and opens no transaction.
@@ -1002,6 +1054,7 @@ impl Repo {
             subpaths,
             edges,
             started,
+            record,
         )
         .await
     }
@@ -1176,8 +1229,10 @@ impl Repo {
             subpaths,
             edges,
             started,
+            false,
         )
         .await
+        .map(|report| report.stats)
     }
 
     /// Runs a pull through the session of `connection` to its end, under
@@ -1187,7 +1242,8 @@ impl Repo {
     /// [`remote`](PullOptions::remote) gives the prefix of the written refs,
     /// and the session gives the number of steps in flight. `edges` is the
     /// index of the list of static deltas that the caller took out of `opts`.
-    /// `started` is the start of [`PullStats::elapsed`].
+    /// `started` is the start of [`PullStats::elapsed`]. If `record` is
+    /// `true`, the report holds each ref that the pull changed, else no ref.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_session(
         &self,
@@ -1199,7 +1255,8 @@ impl Repo {
         subpaths: Option<Subpaths>,
         edges: Option<Edges>,
         started: Instant,
-    ) -> Result<PullStats> {
+        record: bool,
+    ) -> Result<PullReport> {
         let counters = PullCounters::new(opts.progress.as_ref());
         let source = RemoteSource::new(connection, counters.transferred_sinks());
         let verification = Verification::from_trust(trust);
@@ -1215,13 +1272,15 @@ impl Repo {
             edges,
             &counters,
             started,
+            record,
         ))
         .await
     }
 
     /// Runs a pull from `source` to its end: fetches what the refs reach into
     /// a transaction, ends the source, commits the transaction, and writes the
-    /// refs.
+    /// refs. If `record` is `true`, the report holds each ref that the commit
+    /// changed, else no ref.
     #[allow(clippy::too_many_arguments)]
     async fn pull_from(
         &self,
@@ -1234,7 +1293,8 @@ impl Repo {
         edges: Option<Edges>,
         counters: &PullCounters,
         started: Instant,
-    ) -> Result<PullStats> {
+        record: bool,
+    ) -> Result<PullReport> {
         let mirror = opts.flags.contains(PullFlags::MIRROR);
         // A mirror pull writes a plain name as a local ref. Its targets name
         // the ref of a collection as `@ID:NAME`.
@@ -1284,11 +1344,13 @@ impl Repo {
                         place.queue(&txn, name, tip);
                     }
                 }
-                txn.commit().await.map(|stats| (stats, summary, signature))
+                txn.commit_reporting(record)
+                    .await
+                    .map(|(stats, changed)| (stats, changed, summary, signature))
             }
             Err(e) => Err(e),
         };
-        let (stats, summary_bytes, signature) = match published {
+        let (stats, changed_refs, summary_bytes, signature) = match published {
             Ok(published) => published,
             Err(e) => {
                 self.clear_markers_for_absent_commits(&marked, marker_fsync)
@@ -1345,16 +1407,19 @@ impl Repo {
             .await?;
         }
 
-        Ok(PullStats {
-            metadata_imported: stats.metadata_written,
-            content_imported: stats.content_written,
-            content_bytes_written: stats.content_bytes_written,
-            content_bytes_unpacked: stats.content_bytes_unpacked,
-            metadata_fetched: counters.metadata(),
-            content_fetched: counters.content(),
-            delta_parts: counters.parts(),
-            bytes_transferred: counters.bytes(),
-            elapsed: started.elapsed(),
+        Ok(PullReport {
+            stats: PullStats {
+                metadata_imported: stats.metadata_written,
+                content_imported: stats.content_written,
+                content_bytes_written: stats.content_bytes_written,
+                content_bytes_unpacked: stats.content_bytes_unpacked,
+                metadata_fetched: counters.metadata(),
+                content_fetched: counters.content(),
+                delta_parts: counters.parts(),
+                bytes_transferred: counters.bytes(),
+                elapsed: started.elapsed(),
+            },
+            changed_refs,
         })
     }
 
@@ -4341,6 +4406,7 @@ pub(crate) async fn check_stream_end<R: AsyncRead + Unpin>(
 const _: fn() = || {
     fn assert_send<T: Send>(_: &T) {}
     let _ = |repo: &Repo| assert_send(&repo.pull("origin", PullOptions::default()));
+    let _ = |repo: &Repo| assert_send(&repo.pull_with_report("origin", PullOptions::default()));
     let _ = |repo: &Repo, session: PullSession| {
         assert_send(&repo.pull_with_session(
             session,
@@ -4349,6 +4415,9 @@ const _: fn() = || {
         ))
     };
     let _ = |repo: &Repo, src: &Repo| assert_send(&repo.pull_local(src, PullOptions::default()));
+    let _ = |repo: &Repo, src: &Repo| {
+        assert_send(&repo.pull_local_with_report(src, PullOptions::default()))
+    };
 };
 
 /// The in-process byte pipe of the integration tests, for the unit tests of a

@@ -67,8 +67,9 @@ use super::source::{Connection, RemoteSource};
 use super::subpath::Subpaths;
 use super::verify::Verification;
 use super::{
-    LocalWanted, Operand, Pinned, PullFlags, PullOptions, PullStats, PullVerify, RefPlace,
-    check_commit_operands, check_depth, check_hash, check_one_place, read_checked_local_summary,
+    LocalWanted, Operand, Pinned, PullFlags, PullOptions, PullReport, PullStats, PullVerify,
+    RefChange, RefPlace, check_commit_operands, check_depth, check_hash, check_one_place,
+    read_checked_local_summary,
 };
 
 /// The path of the ref listing under the base URL of a remote.
@@ -236,6 +237,13 @@ pub struct CollectionPullStats {
     /// [`elapsed`](PullStats::elapsed) is the sum of the run times of those
     /// pulls. Each count is zero if the pull selected no local repository.
     pub local: PullStats,
+    /// Each ref that the pull changed.
+    ///
+    /// The list joins the lists of the pulls from the selected remotes, in
+    /// the order of the candidate remotes. Each list has the rules of
+    /// [`PullReport::changed_refs`]. A pull that fails returns the error and
+    /// no list, also after the pull from an earlier remote wrote its refs.
+    pub changed_refs: Vec<RefChange>,
 }
 
 /// One ref of a collection pull, and the remote that the pull selected for
@@ -1055,6 +1063,7 @@ impl Repo {
         let candidate_names: Vec<&str> = candidates.iter().map(|c| c.name).collect();
         let mut stats = PullStats::default();
         let mut local = PullStats::default();
+        let mut changed_refs = Vec::new();
         for (index, candidate) in candidates.into_iter().enumerate() {
             // The find step gives no session for a remote that it did not
             // probe.
@@ -1124,6 +1133,7 @@ impl Repo {
                         subpaths.clone(),
                         None,
                         Instant::now(),
+                        true,
                     )
                     .await
                 }
@@ -1137,12 +1147,16 @@ impl Repo {
                 }
             };
             match pulled {
-                Ok(pulled) => {
+                Ok(PullReport {
+                    stats: pulled,
+                    changed_refs: changed,
+                }) => {
                     add_stats(&mut stats, &pulled);
                     if from_local {
                         add_stats(&mut local, &pulled);
                         local.elapsed += pulled.elapsed;
                     }
+                    changed_refs.extend(changed);
                 }
                 Err(e) => {
                     end_sessions(sessions.into_iter().flatten()).await;
@@ -1176,7 +1190,12 @@ impl Repo {
         }
         // A pull with no operand selected each listed ref.
         refs.extend(selected);
-        Ok(CollectionPullStats { refs, stats, local })
+        Ok(CollectionPullStats {
+            refs,
+            stats,
+            local,
+            changed_refs,
+        })
     }
 
     /// Lists the refs of the collection `collection_id` that the remote
@@ -1463,7 +1482,7 @@ impl Repo {
         related: RelatedRule,
         run: PullOptions,
         pinned: &Pinned<'_>,
-    ) -> Result<PullStats> {
+    ) -> Result<PullReport> {
         let started = Instant::now();
         let flags = if trust.checks_signatures() {
             run.flags | PullFlags::UNTRUSTED
@@ -1479,6 +1498,7 @@ impl Repo {
             LocalWanted::Pinned(pinned),
             None,
             started,
+            true,
         )
         .await
     }
@@ -3123,6 +3143,7 @@ mod tests {
         let related = RelatedRule::of(dst.config()).unwrap();
         dst.pull_local_candidate(src, trust, related, run, &pinned)
             .await
+            .map(|report| report.stats)
     }
 
     /// The refs `listed` of a local candidate in [`LOCAL_ID`], at the place
@@ -3279,7 +3300,8 @@ mod tests {
             let stats = dst
                 .pull_local_candidate(&src, trust.clone(), related, run.clone(), &pinned)
                 .await
-                .unwrap();
+                .unwrap()
+                .stats;
             assert!(stats.delta_parts > 0, "{stats:?}");
             let cref = crate::Ref::collection(LOCAL_ID, "os/a");
             assert_eq!(dst.resolve_ref_tip(&cref).await.unwrap(), Some(tip));

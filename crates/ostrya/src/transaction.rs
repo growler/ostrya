@@ -21,6 +21,7 @@ use crate::config::Tristate;
 use crate::error::{Error, Result};
 use crate::jobs::{Jobs, Tracked};
 use crate::lock::{LockGuard, UpdateLockHeld};
+use crate::pull::RefChange;
 use crate::repo::Repo;
 use crate::repo_fs::{RepoDir, TempFile};
 use crate::staging::StagingDir;
@@ -1530,17 +1531,33 @@ impl Transaction {
     ///   and no ref.
     /// - [`Error::Io`] if a rename, a sync, or a write of a ref or of the
     ///   detached metadata fails.
-    pub async fn commit(mut self) -> Result<TransactionStats> {
+    pub async fn commit(self) -> Result<TransactionStats> {
+        self.commit_reporting(false).await.map(|(stats, _)| stats)
+    }
+
+    /// Commits the transaction as [`commit`](Transaction::commit) does.
+    ///
+    /// If `record` is `true`, the call also returns each ref that the commit
+    /// changed. Under the update lock, after the check of the refs and
+    /// before the first write, it reads the old commit of each queued ref.
+    /// The list and its rules are those of
+    /// [`PullReport::changed_refs`](crate::PullReport::changed_refs). If
+    /// `record` is `false`, the call reads no old commit and returns an empty
+    /// list.
+    pub(crate) async fn commit_reporting(
+        mut self,
+        record: bool,
+    ) -> Result<(TransactionStats, Vec<RefChange>)> {
         let refs = self.resolve_ref_queue()?;
         self.check_queued_related()?;
         let synced = self.publish().await?;
         if refs.is_empty() && self.detached.lock().unwrap().edits.is_empty() {
             let stats = self.staged.lock().unwrap().stats;
             self.reap_staging().await;
-            return Ok(stats);
+            return Ok((stats, Vec::new()));
         }
         let held = self.repo.lock_update().await?;
-        self.write_tail(refs, synced, Some(held)).await
+        self.write_tail(refs, synced, Some(held), record).await
     }
 
     /// Commits the transaction as [`commit`](Transaction::commit) does, under
@@ -1556,7 +1573,9 @@ impl Transaction {
         let refs = self.resolve_ref_queue()?;
         self.check_queued_related()?;
         let synced = self.publish().await?;
-        self.write_tail(refs, synced, None).await
+        self.write_tail(refs, synced, None, false)
+            .await
+            .map(|(stats, _)| stats)
     }
 
     /// Checks each `ostrya.related` entry in each dict that
@@ -1581,7 +1600,10 @@ impl Transaction {
     /// removes the staging directory, and releases the locks, in one trip to
     /// the blocking pool.
     ///
-    /// `synced` is `true` if the publication step ran its `syncfs`. The staging
+    /// `synced` is `true` if the publication step ran its `syncfs`. If
+    /// `record` is `true`, the call reads the old commit of each ref after the
+    /// check and before the first write, and returns each ref that changes.
+    /// Else it returns an empty list. The staging
     /// directory, the repository lock, and `held`, if given, move into the
     /// blocking closure. The closure releases the update lock after the last
     /// ref write, then removes the staging directory, then releases the
@@ -1594,7 +1616,8 @@ impl Transaction {
         refs: Vec<crate::refs::ResolvedRef>,
         synced: bool,
         held: Option<UpdateLockHeld>,
-    ) -> Result<TransactionStats> {
+        record: bool,
+    ) -> Result<(TransactionStats, Vec<RefChange>)> {
         let detached = self.detached_job(synced)?;
         let (fsync, _) = self.fsync_flags()?;
         let root = self.repo.root_dir().clone();
@@ -1604,19 +1627,28 @@ impl Transaction {
             .take()
             .expect("staging directory present during the transaction");
         let lock = self.lock;
-        ostrya_rt::unblock(move || {
+        let changed = ostrya_rt::unblock(move || {
             #[cfg(test)]
             test_tail::pass(root.as_fd());
             let written = crate::refs::check_resolved_refs_blocking(&root, &refs)
-                .and_then(|()| detached.run())
-                .and_then(|()| crate::refs::write_resolved_refs_blocking(&root, &refs, fsync));
+                .map(|()| {
+                    if record {
+                        crate::refs::ref_changes_blocking(&root, &refs)
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .and_then(|changed| detached.run().map(|()| changed))
+                .and_then(|changed| {
+                    crate::refs::write_resolved_refs_blocking(&root, &refs, fsync).map(|()| changed)
+                });
             drop(held);
             drop(staging);
             drop(lock);
             written
         })
         .await?;
-        Ok(stats)
+        Ok((stats, changed))
     }
 
     /// Makes the objects staged so far durable before
@@ -3111,6 +3143,225 @@ mod tests {
             txn.commit().await.unwrap();
             assert!(std::fs::symlink_metadata(&fanout).unwrap().is_dir());
             assert_eq!(std::fs::read(commitmeta(&root, &commit)).unwrap(), staged);
+        });
+    }
+
+    /// A change of the ref `name` from `old` to `new`.
+    fn change(name: &str, old: Option<Checksum>, new: Checksum) -> crate::RefChange {
+        crate::RefChange {
+            name: Ref::local(name),
+            old,
+            new,
+        }
+    }
+
+    /// The report of a commit lists a new ref with no old commit, and a ref
+    /// that moves with its old commit, in queue order. A ref written again
+    /// with its commit is not in the list.
+    #[test]
+    fn the_report_lists_a_new_ref_and_a_moved_ref() {
+        let scratch = Scratch::new("report-new-moved");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            let b = Checksum::from_bytes([0x42; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            repo.set_ref_immediate(&Ref::local("moved"), Some(&a))
+                .await
+                .unwrap();
+            repo.set_ref_immediate(&Ref::local("same"), Some(&b))
+                .await
+                .unwrap();
+
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("new"), Some(&c));
+            txn.set_ref(&Ref::local("same"), Some(&b));
+            txn.set_ref(&Ref::local("moved"), Some(&c));
+            let (_, changed) = txn.commit_reporting(true).await.unwrap();
+            assert_eq!(
+                changed,
+                [change("new", None, c), change("moved", Some(a), c)]
+            );
+            assert_eq!(tip(&repo, "new").await, Some(c));
+            assert_eq!(tip(&repo, "moved").await, Some(c));
+        });
+    }
+
+    /// A commit that writes no ref, and a removal, give no entry.
+    #[test]
+    fn the_report_lists_no_removal() {
+        let scratch = Scratch::new("report-removal");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            repo.set_ref_immediate(&Ref::local("gone"), Some(&a))
+                .await
+                .unwrap();
+
+            let txn = repo.transaction().await.unwrap();
+            let (_, changed) = txn.commit_reporting(true).await.unwrap();
+            assert!(changed.is_empty(), "{changed:?}");
+
+            // A write, then a removal of the same ref: the last entry wins.
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("gone"), None);
+            txn.set_ref(&Ref::local("brief"), Some(&c));
+            txn.set_ref(&Ref::local("brief"), None);
+            let (_, changed) = txn.commit_reporting(true).await.unwrap();
+            assert!(changed.is_empty(), "{changed:?}");
+            assert_eq!(tip(&repo, "gone").await, None);
+            assert_eq!(tip(&repo, "brief").await, None);
+        });
+    }
+
+    /// A ref queued two times gives one entry, at the place of its first
+    /// entry, with the last commit of the queue.
+    #[test]
+    fn the_report_lists_a_ref_queued_two_times_once() {
+        let scratch = Scratch::new("report-twice");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            let b = Checksum::from_bytes([0x42; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            repo.set_ref_immediate(&Ref::local("main"), Some(&a))
+                .await
+                .unwrap();
+
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("main"), Some(&b));
+            txn.set_ref(&Ref::local("other"), Some(&b));
+            txn.set_ref(&Ref::local("main"), Some(&c));
+            let (_, changed) = txn.commit_reporting(true).await.unwrap();
+            assert_eq!(
+                changed,
+                [change("main", Some(a), c), change("other", None, b)]
+            );
+
+            // A removal and then a write of the commit that the ref names
+            // gives no entry.
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("main"), None);
+            txn.set_ref(&Ref::local("main"), Some(&c));
+            let (_, changed) = txn.commit_reporting(true).await.unwrap();
+            assert!(changed.is_empty(), "{changed:?}");
+            assert_eq!(tip(&repo, "main").await, Some(c));
+        });
+    }
+
+    /// An old ref file that does not parse, or that is larger than the read
+    /// cap, gives an entry with no old commit. The commit writes the ref.
+    #[test]
+    fn a_bad_old_ref_file_gives_no_old_commit() {
+        let scratch = Scratch::new("report-bad-old");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let c = Checksum::from_bytes([0x43; 32]);
+            std::fs::write(root.join("refs/heads/junk"), "not a checksum\n").unwrap();
+            std::fs::write(root.join("refs/heads/large"), vec![b'a'; 5000]).unwrap();
+
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("junk"), Some(&c));
+            txn.set_ref(&Ref::local("large"), Some(&c));
+            let (_, changed) = txn.commit_reporting(true).await.unwrap();
+            assert_eq!(changed, [change("junk", None, c), change("large", None, c)]);
+            assert_eq!(tip(&repo, "junk").await, Some(c));
+            assert_eq!(tip(&repo, "large").await, Some(c));
+        });
+    }
+
+    /// An old ref file that the permissions do not let the process read
+    /// gives an entry with no old commit. The commit replaces the file and
+    /// writes the ref. The root user reads a file whatever its mode, so the
+    /// test does not run as root.
+    #[test]
+    fn an_unreadable_old_ref_file_gives_no_old_commit() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipped: the root user reads a ref file with mode 000");
+            return;
+        }
+        let scratch = Scratch::new("report-unreadable-old");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            repo.set_ref_immediate(&Ref::local("locked"), Some(&a))
+                .await
+                .unwrap();
+            let path = scratch.0.join("repo/refs/heads/locked");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("locked"), Some(&c));
+            let (_, changed) = txn.commit_reporting(true).await.unwrap();
+            assert_eq!(changed, [change("locked", None, c)]);
+            assert_eq!(tip(&repo, "locked").await, Some(c));
+        });
+    }
+
+    /// A conditional entry gives its expected commit as the old commit. A
+    /// conditional entry that keeps the commit gives no entry.
+    #[test]
+    fn a_conditional_entry_gives_its_expected_commit() {
+        let scratch = Scratch::new("report-expected");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            repo.set_ref_immediate(&Ref::local("main"), Some(&a))
+                .await
+                .unwrap();
+
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref_expecting(&Ref::local("main"), Some(&a), Some(&c));
+            txn.set_ref_expecting(&Ref::local("new"), None, Some(&c));
+            let (_, changed) = txn.commit_reporting(true).await.unwrap();
+            assert_eq!(
+                changed,
+                [change("main", Some(a), c), change("new", None, c)]
+            );
+
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref_expecting(&Ref::local("main"), Some(&c), Some(&c));
+            let (_, changed) = txn.commit_reporting(true).await.unwrap();
+            assert!(changed.is_empty(), "{changed:?}");
+        });
+    }
+
+    /// A ref of the own collection id is in the report as a local ref.
+    #[test]
+    fn the_report_names_a_ref_of_the_own_collection_id_as_local() {
+        let scratch = Scratch::new("report-own-id");
+        block_on(async {
+            let root = scratch.0.join("repo");
+            drop(
+                crate::Repo::create(
+                    &root,
+                    CreateOptions::new(RepoMode::Archive).collection_id("org.example.Own"),
+                )
+                .await
+                .unwrap(),
+            );
+            let repo = crate::Repo::open(&root).await.unwrap();
+            let c = Checksum::from_bytes([0x43; 32]);
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::collection("org.example.Own", "main"), Some(&c));
+            txn.set_ref(&Ref::collection("org.example.Other", "main"), Some(&c));
+            let (_, changed) = txn.commit_reporting(true).await.unwrap();
+            assert_eq!(
+                changed,
+                [
+                    change("main", None, c),
+                    crate::RefChange {
+                        name: Ref::collection("org.example.Other", "main"),
+                        old: None,
+                        new: c,
+                    },
+                ]
+            );
         });
     }
 }

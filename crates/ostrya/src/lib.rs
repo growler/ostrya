@@ -23,6 +23,7 @@
 //! - [`StagingTree`] and [`MutableTree`] build the tree of a new commit.
 //! - [`Repo::checkout_at`] writes the tree of a commit into a directory.
 //! - [`Repo::pull`] copies commits from a remote, and [`Repo::pull_local`] from a local repository.
+//! - [`Repo::pull_with_report`] and [`Repo::pull_local_with_report`] also list the refs that the pull changed.
 //! - [`Repo::pull_with_session`] copies commits from a remote through a session of the caller.
 //! - [`Repo::pull_collection`] copies the refs of a collection from the remotes that serve it.
 //! - [`Repo::export_media`] copies the commits of collection refs onto removable media.
@@ -227,8 +228,8 @@ pub use prune::{PruneOptions, PruneStats, WeakRefFilter, WeakRefFilterFn};
 #[doc(hidden)]
 pub use pull::{
     CollectionPullEvent, CollectionPullOptions, CollectionPullRef, CollectionPullStats, PullFlags,
-    PullOptions, PullProgress, PullProgressSnapshot, PullStats, PullVerify, TimestampCheck,
-    commit_operand,
+    PullOptions, PullProgress, PullProgressSnapshot, PullReport, PullStats, PullVerify, RefChange,
+    TimestampCheck, commit_operand,
 };
 #[cfg(feature = "push")]
 pub use push_repo::{ExportStreamOptions, PushOntoOptions, RepoPushOptions, is_push_address};

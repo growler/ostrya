@@ -684,11 +684,15 @@ enum Command {
     /// address, the command makes the commit itself and writes the bucket
     /// repository.
     ///
+    /// With --consume, the command removes DIR after it prints the commit.
+    ///
     /// On success, standard output carries the commit checksum alone. Under
     /// --verbose, one statistics line goes to standard error. On a terminal,
     /// standard error shows the progress bar of `push` while the push runs. On
     /// failure, the command writes `error: MESSAGE` to standard error and
-    /// nothing to standard output, and exits 1.
+    /// nothing to standard output, and exits 1. If the removal of --consume
+    /// fails, standard output carries the commit checksum, and the command
+    /// exits 1.
     #[cfg(feature = "push")]
     #[command(name = "push-tree")]
     PushTree(PushTreeArgs),
@@ -5231,6 +5235,21 @@ struct PushTreeArgs {
     /// --owner-uid or --owner-gid.
     #[arg(long)]
     canonical_permissions: bool,
+    /// Remove DIR after the push.
+    ///
+    /// The command first pushes the tree. The server writes the commit and
+    /// the refs, or the push writes the ref file of the bucket repository.
+    /// The command prints the commit. Then it removes DIR, with all files in
+    /// it. If the last component of DIR is `.`, for example `.`, `./`, or
+    /// `a/.`, the command removes the contents and keeps the directory. If
+    /// the push fails, the command keeps DIR. If the push fails at or after
+    /// the write of the refs, the command also writes a warning line that
+    /// states that DIR is kept. If the removal fails, the command prints the
+    /// path and the error, and exits 1. The commit and the refs stay. If DIR
+    /// names a symbolic link, the command keeps it, writes the error, and
+    /// exits 1 after the push.
+    #[arg(long)]
+    consume: bool,
     /// Send the content objects deflated at LEVEL, 1 to 9.
     ///
     /// The value needs the `=` form, and --compress alone gives level 6.
@@ -6745,6 +6764,16 @@ fn absolute_option(option: &str, path: Option<PathBuf>) -> Option<PathBuf> {
 /// statistics line goes to standard error. A failure writes nothing to
 /// standard output. On a terminal, standard error shows the progress bar of
 /// [`PushBar`] while the push runs.
+///
+/// With `--consume`, the command removes DIR after it prints the commit. If
+/// the removal fails, the command prints the path and the error, and exits 1
+/// with the commit on standard output. A push that fails keeps DIR. If the
+/// push fails at or after the write of the refs, the error line is followed
+/// by the line `warning: DIR: kept, because the push can have written the
+/// refs`.
+/// This occurs when the outcome of the server commit is unknown, or when a
+/// push to a bucket repository fails in the phase
+/// [`Committing`](ostrya::remote::PushPhase::Committing).
 #[cfg(feature = "push")]
 async fn push_tree(
     repo: RepoArgs<'_>,
@@ -6827,6 +6856,15 @@ async fn push_tree(
     let onto = onto.parse::<Ref>()?;
     let tags = parse_refs(&args.tags)?;
     let (progress, bar) = PushBar::start();
+    // After an error, `--consume` reads the phase of a bucket push, so a
+    // bucket push with `--consume` always gets a progress handle.
+    #[cfg(feature = "s3")]
+    let (progress, phase) = if args.consume && matches!(target, TreeTarget::Bucket(_)) {
+        let progress = progress.unwrap_or_else(ostrya::remote::PushProgress::new);
+        (Some(progress.clone()), Some(progress))
+    } else {
+        (progress, None)
+    };
     let opts = ostrya::remote::TreePushOptions {
         onto,
         tags,
@@ -6854,7 +6892,19 @@ async fn push_tree(
             // The bar is cleared before any line of the result or of the
             // error.
             bar.finish();
-            let pushed = pushed?;
+            let pushed = match pushed {
+                Ok(pushed) => pushed,
+                Err(err) => {
+                    // From the phase `Committing` on, the push can have
+                    // written the ref file.
+                    if phase.is_some_and(|progress| {
+                        progress.snapshot().phase == ostrya::remote::PushPhase::Committing
+                    }) {
+                        exit_keeping_consumed_dir(dir, &err);
+                    }
+                    return Err(err);
+                }
+            };
             if let Some(holder) = &pushed.broken_lock {
                 eprintln!("warning: removed the writer lock of {holder}");
             }
@@ -6865,10 +6915,39 @@ async fn push_tree(
             // The bar is cleared before any line of the result or of the
             // error.
             bar.finish();
-            pushed?
+            match pushed {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    let unknown = matches!(err, ostrya::remote::Error::CommitOutcomeUnknown { .. });
+                    let err = Error::from(err);
+                    if args.consume && unknown {
+                        exit_keeping_consumed_dir(dir, &err);
+                    }
+                    return Err(err);
+                }
+            }
         }
     };
-    print_server_commit(verbose, outcome)
+    // If the write of the commit fails, DIR stays.
+    print_server_commit(verbose, outcome)?;
+    // The output comes first, and then the removal. A failed removal exits 1,
+    // and the commit and the refs stay.
+    if args.consume && !remove_consumed_sources(&[dir]).await {
+        exit_process(1);
+    }
+    Ok(())
+}
+
+/// Prints the error of a `push-tree --consume` that can have written the
+/// refs, and the line that states that DIR is kept, then exits 1.
+#[cfg(feature = "push")]
+fn exit_keeping_consumed_dir(dir: &Path, err: &Error) -> ! {
+    eprintln!("error: {}", error_line(err));
+    eprintln!(
+        "warning: {}: kept, because the push can have written the refs",
+        dir.display()
+    );
+    exit_process(1);
 }
 
 /// The destination of `push-tree`: a transport that is ready, or a bucket
@@ -11046,17 +11125,19 @@ async fn overlay_source(
     }
 }
 
-/// Removes each source of `commit --consume`, in order, after the commit.
+/// Removes each source of `commit --consume`, in order, after the commit, or
+/// DIR of `push-tree --consume` after the push.
 ///
 /// A path is read against the working directory. If a removal fails, the
 /// function prints the path and the error, and goes on with the next path.
 /// It returns `false` if a removal failed.
-async fn remove_consumed_sources(paths: &[PathBuf]) -> bool {
+async fn remove_consumed_sources<P: AsRef<Path>>(paths: &[P]) -> bool {
     if paths.is_empty() {
         return true;
     }
     let mut removed = true;
     for path in paths {
+        let path = path.as_ref();
         if let Err(err) = ostrya::remove_source_tree(rustix::fs::CWD, path).await {
             eprintln!("error: {}: {}", path.display(), error_line(&err));
             removed = false;

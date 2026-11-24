@@ -2206,6 +2206,101 @@ mod cli {
         silent.assert_untouched();
     }
 
+    /// The regular files under `root`, with their contents, in path order.
+    fn files_of(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files = Vec::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    let content = std::fs::read(&path).unwrap();
+                    files.push((path.strip_prefix(root).unwrap().to_owned(), content));
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// `ostrya push-tree --consume` over HTTP prints the commit, moves the
+    /// branch to it, and removes DIR.
+    #[test]
+    fn push_tree_over_http_with_consume_removes_dir() {
+        let setup = Setup::new("cli-tree-consume");
+        let src = tree(setup.tmp.path(), "tree", 2, 100);
+        let server = setup.init("server", "archive");
+        add_config(
+            &server,
+            "[ex-ostrya client \"push\"]\nauth=anonymous\nallow=c:**\n",
+        );
+        let serving = Serving::start(&server, &[]);
+        let out = ostrya(&[
+            "push-tree",
+            &serving.url,
+            src.to_str().unwrap(),
+            "--onto=main",
+            "--consume",
+        ]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stderr(&out), "");
+        let commit = stdout(&out).trim().to_owned();
+        assert_eq!(rev_parse(&server, "main"), commit);
+        assert!(!src.exists(), "the push kept DIR");
+    }
+
+    /// If the response to the commit is lost, the outcome of the push is
+    /// unknown. `push-tree --consume` then keeps DIR, writes the error line
+    /// and a line that states that DIR is kept, and exits 1. The server
+    /// applied the commit.
+    #[test]
+    fn a_lost_commit_response_with_consume_keeps_dir_and_says_so() {
+        let setup = Setup::new("cli-tree-consume-lost");
+        let src = tree(setup.tmp.path(), "tree", 2, 100);
+        let before = files_of(&src);
+        let server = setup.init("server", "archive");
+        add_config(
+            &server,
+            "[ex-ostrya client \"push\"]\nauth=anonymous\nallow=c:**\n",
+        );
+        let serving = Serving::start(&server, &[]);
+        let addr: SocketAddr = serving
+            .url
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .parse()
+            .unwrap();
+        let proxy = CountingProxy::start(addr, CommitResponse::Drop);
+        let out = ostrya(&[
+            "push-tree",
+            &proxy.url,
+            src.to_str().unwrap(),
+            "--onto=main",
+            "--consume",
+        ]);
+        let err = stderr(&out);
+        assert_eq!(out.status.code(), Some(1), "{err}");
+        assert_eq!(stdout(&out), "");
+        let lines: Vec<&str> = err.lines().collect();
+        assert_eq!(lines.len(), 2, "{err}");
+        assert!(
+            lines[0].starts_with("error: the outcome of the commit of [\"main\"] is unknown: "),
+            "{err}"
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "warning: {}: kept, because the push can have written the refs",
+                src.display()
+            )
+        );
+        assert_eq!(proxy.seen.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(files_of(&src), before);
+        assert_eq!(rev_parse(&server, "main").len(), 64);
+    }
+
     /// Returns `true` if the `ostree` command and `openssl` are installed.
     /// `openssl` makes the certificates of the check. If [`REQUIRE_OSTREE`]
     /// is set and either program is absent, the test fails. If it is not

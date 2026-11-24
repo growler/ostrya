@@ -3012,5 +3012,223 @@ mod cli {
             assert_failed(&out, "error: invalid input: ");
             assert!(!dest.join("refs/mirrors/org.example.Os/u").exists());
         }
+
+        /// Returns `true` if the test process runs with the effective user
+        /// id 0. The value is the second field of the `Uid:` line of
+        /// `/proc/self/status`.
+        fn is_root() -> bool {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:"))
+                .and_then(|ids| ids.split_whitespace().nth(1))
+                .is_some_and(|euid| euid == "0")
+        }
+
+        /// Asserts that `tree` holds the files of [`tree`].
+        fn assert_tree_kept(tree: &Path) {
+            assert_eq!(
+                std::fs::read_to_string(tree.join("a")).unwrap(),
+                "alpha\n",
+                "{}",
+                tree.display()
+            );
+            assert_eq!(
+                std::fs::read_to_string(tree.join("dir/b")).unwrap(),
+                "beta\n",
+                "{}",
+                tree.display()
+            );
+            assert!(tree.join("link").is_symlink(), "{}", tree.display());
+        }
+
+        /// A tree push with `--consume` prints the commit, moves the branch
+        /// to it, and removes DIR.
+        #[test]
+        fn a_tree_push_with_consume_removes_dir() {
+            let setup = Setup::without_client("tree-consume");
+            let tree = tree(&setup.base, "tree", 0o644, 0o755);
+            let dest = receiver(&setup.base, RepoMode::Archive);
+            let out = push_tree_to(&setup, &dest, &tree, &["--onto", "main", "--consume"]);
+            let c = pushed(&out);
+            assert_eq!(stderr(&out), "");
+            assert_eq!(server_tip(&dest, "main"), Some(c));
+            assert!(!tree.exists(), "the push kept DIR");
+            tool_fsck(&dest);
+        }
+
+        /// A push that the server refuses keeps DIR, and writes the error
+        /// line alone: a client group with no `c` gets `ref-denied`, and a
+        /// tag that exists gets `ref-mismatch`.
+        #[test]
+        fn a_refused_tree_push_with_consume_keeps_dir() {
+            let setup = Setup::without_client("tree-consume-refused");
+            let tree = tree(&setup.base, "tree", 0o644, 0o755);
+            let dest = receiver(&setup.base, RepoMode::Archive);
+
+            client_group(&dest, "w:**");
+            let out = push_tree_to(&setup, &dest, &tree, &["--onto", "main", "--consume"]);
+            assert_failed(&out, "error: ref-denied: ");
+            assert_eq!(stderr(&out).lines().count(), 1, "{}", stderr(&out));
+            assert_eq!(server_tip(&dest, "main"), None);
+            assert_tree_kept(&tree);
+
+            client_group(&dest, "wct:**");
+            let tagged = pushed(&push_tree_to(
+                &setup,
+                &dest,
+                &tree,
+                &["--onto", "t1", "--tag", "t"],
+            ));
+            let out = push_tree_to(
+                &setup,
+                &dest,
+                &tree,
+                &["--onto", "t2", "--tag", "t", "--consume"],
+            );
+            assert_failed(&out, "error: ref-mismatch: ");
+            assert_eq!(stderr(&out).lines().count(), 1, "{}", stderr(&out));
+            assert_eq!(server_tip(&dest, "t2"), None);
+            assert_eq!(server_tip(&dest, "t"), Some(tagged));
+            assert_tree_kept(&tree);
+        }
+
+        /// A walk error with `--consume` exits 1 before ssh starts, and
+        /// keeps DIR.
+        #[test]
+        fn a_walk_error_with_consume_keeps_dir() {
+            use std::os::unix::ffi::OsStrExt;
+            let setup = Setup::without_client("tree-consume-walk");
+            let tree = tree(&setup.base, "tree", 0o644, 0o755);
+            let bad = tree.join(std::ffi::OsStr::from_bytes(b"bad\xff"));
+            std::fs::write(&bad, "bad\n").unwrap();
+            let dest = receiver(&setup.base, RepoMode::Archive);
+            let out = push_tree_to(&setup, &dest, &tree, &["--onto", "main", "--consume"]);
+            assert_failed(&out, "error: ");
+            let err = stderr(&out);
+            assert!(err.ends_with(": the name is not valid UTF-8\n"), "{err}");
+            assert_eq!(err.lines().count(), 1, "{err}");
+            assert!(!setup.ssh_started());
+            assert_eq!(server_tip(&dest, "main"), None);
+            assert_tree_kept(&tree);
+            assert!(bad.exists());
+        }
+
+        /// A DIR whose last component is `.` keeps the directory and loses
+        /// its contents. An absolute path to the working directory removes
+        /// the directory.
+        #[test]
+        fn a_tree_push_with_consume_keeps_a_directory_spelled_dot() {
+            let setup = Setup::without_client("tree-consume-dot");
+            let dest = receiver(&setup.base, RepoMode::Archive);
+            let ssh = setup.ssh_command();
+            let receive = receive_command();
+            let address = address(&dest);
+            let cases: [(&str, bool, &str); 4] = [
+                ("dot", true, "."),
+                ("dot-slash", true, "./"),
+                ("parent-dot", false, "parent-dot/."),
+                ("absolute", true, ""),
+            ];
+            for (name, inside, spelling) in cases {
+                let tree = tree(&setup.base, name, 0o644, 0o755);
+                let absolute = tree.display().to_string();
+                let spelling = if spelling.is_empty() {
+                    absolute.as_str()
+                } else {
+                    spelling
+                };
+                let cwd = if inside {
+                    tree.as_path()
+                } else {
+                    &setup.base.0
+                };
+                let out = ostrya(
+                    cwd,
+                    &[
+                        "push-tree",
+                        &ssh,
+                        &receive,
+                        &address,
+                        spelling,
+                        "--onto",
+                        name,
+                        "--consume",
+                    ],
+                    &[("SOURCE_DATE_EPOCH", EPOCH)],
+                );
+                let c = pushed(&out);
+                assert_eq!(server_tip(&dest, name), Some(c), "`{spelling}`");
+                if name == "absolute" {
+                    assert!(!tree.exists(), "`{spelling}` kept the directory");
+                } else {
+                    assert_eq!(stderr(&out), "", "`{spelling}`");
+                    assert_eq!(
+                        std::fs::read_dir(&tree).map(Iterator::count).ok(),
+                        Some(0),
+                        "`{spelling}` did not keep an empty directory",
+                    );
+                }
+            }
+        }
+
+        /// A DIR that names a symbolic link to a directory is pushed, and the
+        /// removal refuses the link: the command prints the commit, writes
+        /// the error, and exits 1. The link, its target, and the branch stay.
+        #[test]
+        fn a_tree_push_with_consume_keeps_a_symlink_to_dir() {
+            let setup = Setup::without_client("tree-consume-symlink");
+            let tree = tree(&setup.base, "tree", 0o644, 0o755);
+            let link = setup.base.0.join("link");
+            std::os::unix::fs::symlink("tree", &link).unwrap();
+            let dest = receiver(&setup.base, RepoMode::Archive);
+            let out = push_tree_to(
+                &setup,
+                &dest,
+                Path::new("link/"),
+                &["--onto", "main", "--consume"],
+            );
+            assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+            let commit = server_tip(&dest, "main").expect("the push moved the branch");
+            assert_eq!(stdout(&out), format!("{commit}\n"));
+            assert_eq!(
+                stderr(&out),
+                "error: link/: unlinkat(link): Not a directory\n"
+            );
+            assert!(link.is_symlink());
+            assert_tree_kept(&tree);
+        }
+
+        /// If the removal fails, the push prints the commit, names the path
+        /// and the entry, and exits 1. The branch stays at the commit.
+        #[test]
+        fn a_failed_removal_after_a_tree_push_prints_the_commit_and_exits_one() {
+            // A root process removes an entry from a directory without write
+            // permission, so the removal does not fail.
+            if is_root() {
+                return;
+            }
+            let setup = Setup::without_client("tree-consume-partial");
+            let tree = tree(&setup.base, "tree", 0o644, 0o755);
+            std::fs::create_dir(tree.join("ro")).unwrap();
+            std::fs::write(tree.join("ro/only.txt"), "x\n").unwrap();
+            set_mode(&tree.join("ro/only.txt"), 0o644);
+            set_mode(&tree.join("ro"), 0o500);
+            let dest = receiver(&setup.base, RepoMode::Archive);
+            let out = push_tree_to(&setup, &dest, &tree, &["--onto", "main", "--consume"]);
+            set_mode(&tree.join("ro"), 0o700);
+
+            assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+            let commit = server_tip(&dest, "main").expect("the push moved the branch");
+            assert_eq!(stdout(&out), format!("{commit}\n"));
+            assert_eq!(
+                stderr(&out),
+                format!(
+                    "error: {}: unlinkat(only.txt): Permission denied\n",
+                    tree.display()
+                )
+            );
+            assert!(tree.join("ro/only.txt").exists());
+        }
     }
 }

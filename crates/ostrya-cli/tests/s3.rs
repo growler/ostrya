@@ -1147,6 +1147,141 @@ fn push_tree_to_an_s3_address_refuses_a_tag() {
     assert!(server.state().requests.is_empty());
 }
 
+/// `push-tree --consume` to an `s3://` address writes the ref file, prints
+/// the commit, and removes DIR.
+#[cfg(feature = "push")]
+#[test]
+fn push_tree_with_consume_to_an_s3_address_removes_the_directory() {
+    let scratch = Scratch::new("push-tree-consume");
+    let server = StandIn::start();
+    init(&scratch, &server, None);
+    let endpoint = endpoint_of(&server);
+    let dir = tree(&scratch, "one");
+    let out = scratch.run(&[
+        "push-tree",
+        ADDRESS,
+        &dir,
+        "--onto=main",
+        "--consume",
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
+    assert_eq!(
+        stdout(&out).trim(),
+        ref_of(&server, "repo/refs/heads/main").unwrap()
+    );
+    assert!(!Path::new(&dir).exists(), "the push kept DIR");
+    assert!(object(&server, LOCK).is_none());
+}
+
+/// `push-tree --consume` with `--tag` to an `s3://` address is refused
+/// before any request, and keeps DIR.
+#[cfg(feature = "push")]
+#[test]
+fn push_tree_with_consume_and_a_tag_to_an_s3_address_keeps_the_directory() {
+    let scratch = Scratch::new("push-tree-consume-tag");
+    let server = StandIn::start();
+    init(&scratch, &server, None);
+    server.state().requests.clear();
+    let endpoint = endpoint_of(&server);
+    let dir = tree(&scratch, "one");
+    let message = scratch.fails(&[
+        "push-tree",
+        ADDRESS,
+        &dir,
+        "--onto=main",
+        "--tag=v1",
+        "--consume",
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    assert_eq!(
+        message,
+        "error: invalid input: a push to an s3:// address creates no tag, and the push names \
+         tags\n"
+    );
+    assert!(server.state().requests.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&dir).join("a")).unwrap(),
+        "one\n"
+    );
+    assert!(Path::new(&dir).join("dir/b").exists());
+}
+
+/// If the upload of an object fails, the push writes no ref file.
+/// `push-tree --consume` then keeps DIR, writes the error line alone, and
+/// exits 1.
+#[cfg(feature = "push")]
+#[test]
+fn push_tree_with_consume_keeps_the_directory_when_an_upload_fails() {
+    let scratch = Scratch::new("push-tree-consume-upload");
+    let server = StandIn::start();
+    init(&scratch, &server, None);
+    server.state().refuse = Some(("PUT", "repo/objects/".to_owned()));
+    let endpoint = endpoint_of(&server);
+    let dir = tree(&scratch, "one");
+    let out = scratch.run(&[
+        "push-tree",
+        ADDRESS,
+        &dir,
+        "--onto=main",
+        "--consume",
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    let message = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{message}");
+    assert_eq!(stdout(&out), "");
+    assert_eq!(message.lines().count(), 1, "{message}");
+    assert!(message.starts_with("error: "), "{message}");
+    assert!(!message.contains("warning:"), "{message}");
+    assert!(ref_of(&server, "repo/refs/heads/main").is_none());
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&dir).join("a")).unwrap(),
+        "one\n"
+    );
+    assert!(Path::new(&dir).join("dir/b").exists());
+}
+
+/// If the release of the writer lock fails after the push wrote the ref
+/// file, `push-tree --consume` keeps DIR, writes the error line and a line
+/// that states that DIR is kept, and exits 1.
+#[cfg(feature = "push")]
+#[test]
+fn push_tree_with_consume_keeps_the_directory_when_the_lock_release_fails() {
+    let scratch = Scratch::new("push-tree-consume-lock");
+    let server = StandIn::start();
+    init(&scratch, &server, None);
+    server.state().refuse = Some(("DELETE", LOCK.to_owned()));
+    let endpoint = endpoint_of(&server);
+    let dir = tree(&scratch, "one");
+    let message = scratch.fails(&[
+        "push-tree",
+        ADDRESS,
+        &dir,
+        "--onto=main",
+        "--consume",
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    let lines: Vec<&str> = message.lines().collect();
+    assert_eq!(lines.len(), 2, "{message}");
+    assert!(lines[0].starts_with("error: "), "{message}");
+    assert!(lines[0].contains("AccessDenied"), "{message}");
+    assert_eq!(
+        lines[1],
+        format!("warning: {dir}: kept, because the push can have written the refs")
+    );
+    assert!(ref_of(&server, "repo/refs/heads/main").is_some());
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&dir).join("a")).unwrap(),
+        "one\n"
+    );
+    assert!(Path::new(&dir).join("dir/b").exists());
+}
+
 /// The S3 options and `--break-lock` of `push-tree` are refused for an HTTP
 /// or an ssh destination, with the name of the option.
 #[cfg(feature = "push")]

@@ -116,10 +116,12 @@ fn a_push_tree_to_an_s3_address_names_the_feature() {
             "s3://bkt/repo",
             tree.to_str().unwrap(),
             "--onto=main",
+            "--consume",
         ],
     );
     assert!(!out.status.success());
     assert!(stderr(&out).contains(FEATURE), "{}", stderr(&out));
+    assert_eq!(std::fs::read(tree.join("a")).unwrap(), b"a\n");
     for args in [
         &["push-tree", "--break-lock", "r", "dir", "--onto=main"][..],
         &[

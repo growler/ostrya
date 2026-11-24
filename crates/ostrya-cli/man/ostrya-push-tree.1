@@ -14,7 +14,9 @@ The client group needs \fB\%c\fR on the branch, and \fB\%t\fR or \fB\%w\fR on ea
 .PP
 The command makes its checks before the ssh client starts or the first HTTP request goes. It resolves REMOTE before it reads \%\-\-body\-file. A refusal of the remote thus reads no body file. For an \fB\%s3://\fR push address, the command makes the commit itself and writes the bucket repository.
 .PP
-On success, standard output carries the commit checksum alone. Under \%\-\-verbose, one statistics line goes to standard error. On a terminal, standard error shows the progress bar of \fB\%push\fR while the push runs. On failure, the command writes \fB\%error: MESSAGE\fR to standard error and nothing to standard output, and exits \%1.
+With \%\-\-consume, the command removes DIR after it prints the commit.
+.PP
+On success, standard output carries the commit checksum alone. Under \%\-\-verbose, one statistics line goes to standard error. On a terminal, standard error shows the progress bar of \fB\%push\fR while the push runs. On failure, the command writes \fB\%error: MESSAGE\fR to standard error and nothing to standard output, and exits \%1. If the removal of \%\-\-consume fails, standard output carries the commit checksum, and the command exits \%1.
 .SH ARGUMENTS
 .TP
 \fIREMOTE\fR
@@ -103,6 +105,11 @@ The value applies to the root directory too. A negative value keeps the group id
 Force owner \%0:0, canonicalize modes to \fB\%perm & 0755\fR, and drop xattrs.
 .IP
 The commit then does not depend on the owner or on the host. A symlink keeps its mode. The command refuses this switch with a \%non\-zero \%\-\-owner\-uid or \%\-\-owner\-gid.
+.TP
+\fB\-\-consume\fR
+Remove DIR after the push.
+.IP
+The command first pushes the tree. The server writes the commit and the refs, or the push writes the ref file of the bucket repository. The command prints the commit. Then it removes DIR, with all files in it. If the last component of DIR is \fB\%\&.\fR, for example \fB\%\&.\fR, \fB\%\&./\fR, or \fB\%a/.\fR, the command removes the contents and keeps the directory. If the push fails, the command keeps DIR. If the push fails at or after the write of the refs, the command also writes a warning line that states that DIR is kept. If the removal fails, the command prints the path and the error, and exits \%1. The commit and the refs stay. If DIR names a symbolic link, the command keeps it, writes the error, and exits \%1 after the push.
 .TP
 \fB\-\-compress\fR[=\fILEVEL\fR]
 Send the content objects deflated at LEVEL, \%1 to \%9.

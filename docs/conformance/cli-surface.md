@@ -6671,7 +6671,7 @@ ostrya push-tree [--repo=PATH] REMOTE DIR --onto=NAME|@ID:NAME
                  [--add-metadata-string=KEY=VALUE]... [--add-metadata=KEY=VALUE]...
                  [--timestamp=TIME]
                  [--owner-uid=UID] [--owner-gid=GID] [--canonical-permissions]
-                 [--compress[=LEVEL]]
+                 [--consume] [--compress[=LEVEL]]
                  [--ssh-command=CMD] [--receive-command=CMD]
                  [--push-token-file=FILE] [--push-user=NAME]
                  [--tls-client-cert-path=FILE] [--tls-client-key-path=FILE]
@@ -6789,6 +6789,36 @@ ostrya push-tree [--repo=PATH] REMOTE DIR --onto=NAME|@ID:NAME
 - On success the command writes the checksum of the new commit as one line
   to standard output and exits 0. Under `-v` it writes the statistics line
   of `push` to standard error.
+- `--consume` removes `DIR` after the server answers that the commit and the
+  refs are written, or after the push to a bucket repository writes the ref
+  file, and after the command writes the commit to standard output. The
+  removal removes `DIR` with all entries in it. When the last component of
+  `DIR` is `.`, for example `.`, `./`, or `a/.`, it removes the contents and
+  keeps the directory, as the paragraph on `--consume` of `commit` in "P2 --
+  options missing from commands that exist" states. An absolute path to the
+  working directory removes the directory. A removal that fails writes
+  `error: DIR: unlinkat(NAME): REASON` to standard error, and the command
+  exits 1. The commit and the refs stay. If `DIR` names a symbolic link,
+  the command keeps it, writes the error, and exits 1 after the push. A
+  push that fails keeps `DIR`. When the outcome of the server commit is
+  unknown, or when a push to a bucket repository fails at the write of the
+  ref file or at a later step, the error line is followed by `warning: DIR:
+  kept, because the push can have written the refs`
+  (`a_tree_push_with_consume_removes_dir`,
+  `a_refused_tree_push_with_consume_keeps_dir`,
+  `a_walk_error_with_consume_keeps_dir`,
+  `a_tree_push_with_consume_keeps_a_directory_spelled_dot`,
+  `a_tree_push_with_consume_keeps_a_symlink_to_dir`, and
+  `a_failed_removal_after_a_tree_push_prints_the_commit_and_exits_one` in
+  `crates/ostrya-cli/tests/push_ssh.rs`;
+  `push_tree_over_http_with_consume_removes_dir` and
+  `a_lost_commit_response_with_consume_keeps_dir_and_says_so` in
+  `crates/ostrya-cli/tests/push_http.rs`;
+  `push_tree_with_consume_to_an_s3_address_removes_the_directory`,
+  `push_tree_with_consume_and_a_tag_to_an_s3_address_keeps_the_directory`,
+  `push_tree_with_consume_keeps_the_directory_when_an_upload_fails`, and
+  `push_tree_with_consume_keeps_the_directory_when_the_lock_release_fails`
+  in `crates/ostrya-cli/tests/s3.rs`).
 - To an `s3://` destination, the command writes the bucket repository that
   `remote init` created, through `BucketRepo::push_tree`
   (`../format-reference.md`, "The tree push to a bucket repository"). The
@@ -6825,7 +6855,9 @@ ostrya push-tree [--repo=PATH] REMOTE DIR --onto=NAME|@ID:NAME
   shows nothing during the walk and the hash pass.
 - On failure the command writes `error: MESSAGE` to standard error and
   nothing to standard output, and exits 1. A refusal of the server gives
-  its wire code first, for example `error: mode-refused: ...`.
+  its wire code first, for example `error: mode-refused: ...`. A removal of
+  `--consume` that fails is the one failure after the commit is written to
+  standard output.
 - The commit checksum equals the checksum of `ostree commit --no-xattrs -b
   BRANCH` over the same tree with the same options and the same parent.
   Each `--tag` and each `--bind-ref` is one `--bind-ref` of the tool, and

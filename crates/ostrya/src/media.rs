@@ -109,8 +109,11 @@ pub struct MediaImportReport {
     /// import, with that commit. The import did not pull it, and did not
     /// write a ref for it. [`Repo::import_media`] states the current ref.
     pub unchanged: Vec<(Ref, Checksum)>,
-    /// Each ref that the import refused, with the reason. The import did
-    /// not change the ref.
+    /// Each ref that the import refused, with the reason. A refusal before
+    /// the pull of the ref changes no ref. A pull that fails can have
+    /// written the ref: for example, the pull fails after its transaction
+    /// wrote the ref when the removal of a `state/COMMIT.commitpartial`
+    /// marker fails.
     pub refused: Vec<(Ref, Error)>,
 }
 

@@ -5551,6 +5551,23 @@ writes or removes a ref that is not a remote ref. An alias under
 - A write or a removal of remote refs alone writes no summary, by the rule
   of a pull.
 
+`ostrya media import` calls it after a run that writes a ref. Each ref that
+the import writes is under `refs/heads/` or `refs/mirrors/`, so a summary
+lists it. These rules apply to `media import`:
+
+- The command calls it one time, after the last pull, the output lines, and
+  the `error:` lines of the refused refs. The reason: one run writes one
+  summary, also when the run pulls many refs.
+- If the command refuses a ref and writes another ref, it writes the
+  summary, and then exits 1. The reason: the refs that the run wrote stay,
+  so a summary that the run does not write again lists their old commits.
+
+One rule applies to the one-way stream:
+
+- `ostrya receive --one-way` writes no summary, also when the key is true.
+  The reason: the command reads no server group and no key group, so
+  `sign-summary` does not apply to it.
+
 Five alternatives were rejected:
 
 - The ref writers of the library read the key and write the summary. A

@@ -1617,8 +1617,9 @@ after a run that creates or moves a ref that is not a remote ref, except
 `ostrya pull --mirror` with no ref. `ostrya refs --create` and `ostrya refs
 --delete` call it after a run that writes or removes a ref that is not a
 remote ref. For `ostrya refs --delete`, a removal that fails with an I/O
-error counts as a removal of the ref. A run that writes or removes no such
-ref does not read the two keys.
+error counts as a removal of the ref. `ostrya media import` calls it after
+the last pull of a run that writes a ref, also when the run refuses other
+refs. A run that writes or removes no such ref does not read the two keys.
 `conformance/cli-surface.md`, "P2", `commit` and `pull`, records the effect
 of the two keys on a commit and on a pull, and "P1", `refs`, records it on
 `refs`.
@@ -5277,7 +5278,8 @@ applies. The server runs the other `Commit` checks after the end of the
 input, or at `Commit` if it stops at `Commit`. Check 6 checks the
 attachments of the staged commits as in a push session. A one-way stream
 adds no server signature, writes no anchor commit, and does not regenerate
-the summary. It calls no hook of a host application.
+the summary, also when `[core] auto-update-summary` is true. It calls no hook
+of a host application.
 
 A one-way stream keeps rules of its own, and a client group does not apply to
 it. A host application gives the rules in code, or `ostrya receive --one-way`
@@ -6343,7 +6345,9 @@ A read of the current ref that fails refuses its ref, and so does a pull
 that fails. The import then continues with the next ref. The result of the
 import holds the written refs, the unchanged refs, and each refused ref
 with its error. The import also reads a media repository on a read-only
-mount.
+mount. The import writes no summary of the client. `ostrya media import`
+writes the summaries of the client under `[core] auto-update-summary` after
+the last pull ("The write of the summaries").
 
 ### The file systems of the media
 
@@ -6559,10 +6563,11 @@ update lock").
 With `[core] auto-update-summary=true`, a push through `ostrya serve` or
 `ostrya receive` that changes a ref writes the root summary and each
 summary of an item again, as `ostrya summary -u` does. The key groups of `sign-summary` sign them, GPG
-keys first. A one-way stream writes no summary. `ostrya commit` writes the
-same summaries after a run that writes a tag or a branch that is not a remote
-ref, through `Repo::regenerate_summaries_if_configured`, signed by the same
-key groups. In a repository with a collection id, it writes no new anchor
+keys first. A one-way stream writes no summary, also when the key is true.
+`ostrya commit` writes the same summaries after a run that writes a tag or a
+branch that is not a remote ref, through
+`Repo::regenerate_summaries_if_configured`, signed by the same key groups. In
+a repository with a collection id, it writes no new anchor
 commit, and the summaries list `ostree-metadata` at its current commit.
 `ostrya pull` and `ostrya pull-local` write the same summaries in the same
 way after a run that creates or moves a ref that is not a remote ref. The
@@ -6574,7 +6579,10 @@ a pull with no `--collection` calls `Repo::pull` or `Repo::pull_local`,
 which read no old ref. `ostrya refs --create` and `ostrya refs --delete` write
 the same summaries in the same way after a run that writes or removes a ref
 that is not a remote ref. An alias under `refs/heads/` or `refs/mirrors/` is
-such a ref. They compare no old ref.
+such a ref. They compare no old ref. `ostrya media import` writes the same
+summaries in the same way after the last pull of a run that writes a ref. The
+written refs come from `MediaImportReport::written`. A run that also refuses
+a ref writes the summaries, and then exits 1.
 
 A mirror pull that writes `summary` writes no file under
 `extensions/ostrya/summary/`. It writes `summary` and `summary.sig` through

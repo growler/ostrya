@@ -2192,6 +2192,8 @@ at its current commit. `ostrya receive` and `ostrya serve` write a new
 after a run that creates or moves a ref that is not a remote ref ("P2",
 `pull`). `ostrya refs --create` and `ostrya refs --delete` read them by the
 same rule after a run that writes or removes such a ref ("P1", `refs`).
+`ostrya media import` reads them by the same rule after the last pull of a
+run that writes a ref ("Port extensions", `media import`).
 `ostrya receive` and `ostrya serve` read the two keys by the rule of the
 tool. They refuse a value that is not a boolean in either one
 (`ostrya-config(1)`).
@@ -5251,6 +5253,9 @@ No matrix cell needs these. The shell suite invokes them.
     `@ID:NAME CHECKSUM` line for each written ref. The tool prints the
     report of the finders and `Pulled N/N refs successfully.`, and
     `error: Failed to pull some refs from the remotes: (ID, REF)` at exit 1.
+  - No record observes `find-remotes --pull` of the tool with `[core]
+    auto-update-summary`. The port writes the summaries after a run that
+    writes a ref ("Port extensions", `media import`).
   - The port has no `--cache-dir` and no `--disable-fsync`.
 - `create-usb` -- `--disable-fsync`, `--destination-repo=DEST`,
   `--commit=COMMIT`. The port does not carry the command. `ostrya media
@@ -6042,8 +6047,9 @@ ostrya receive [--repo=PATH] --one-way [--allow-remote=REMOTE]...
   Unless the config sets `locking=false`, the command holds the repository
   lock as shared from `Hello` to the end. With `locking=false`, it holds no
   repository lock. The commit takes the update lock, which ignores
-  `[core] locking`. The command adds no server signature and does not write
-  the summary again.
+  `[core] locking`. The command adds no server signature. It does not read
+  `[core] auto-update-summary` and writes no summary, also when the key is
+  true.
 - The command builds one `StreamPolicy`. The default rule of the policy
   takes a fast-forward update of a plain ref. Each `--allow-remote=REMOTE`
   adds the pattern rule `REMOTE:**` with the same rule, and
@@ -7539,8 +7545,25 @@ ostrya media import [--repo=PATH] [--mount=PATH] [-c|--collection ID] [REF...]
   the media is not written and prints no line. A refused ref does not stop
   the import. After the last pull, the command writes one line
   `error: @ID:NAME: TEXT` to standard error for each refused ref, then exits
-  1 with no other line. A run that writes no ref and refuses no ref exits 0
-  with no output.
+  1. A run that writes no ref and refuses no ref exits 0 with no output.
+- After the last pull, if the command wrote a ref, it reads `[core]
+  auto-update-summary` and its alias `commit-update-summary`, as `ostrya
+  commit` does ("P2", `commit`). If one of the two is true, the command
+  writes the root summary and each summary of an item again, after the
+  output lines and the `error:` lines of the refused refs. The key groups of
+  `sign-summary` of `[ex-ostrya server]` sign them, the GPG keys first. With
+  no `sign-summary`, each write removes the old `summary.sig`. The command
+  writes no new `ostree-metadata` commit. Each written ref is under
+  `refs/heads/` or `refs/mirrors/ID/`, so each written ref counts. A run that
+  writes no ref does not read the two keys. A run that refuses a ref and
+  writes another ref writes the summaries, and then exits 1. After a run
+  that writes a ref, a value that is not a boolean, or a failed write,
+  prints one `error:` line after the lines of the refused refs, and the
+  command exits 1. The refs stay.
+- A refused ref writes no summary, also after its pull wrote the ref: a
+  pull can fail after its transaction wrote the ref, for example when the
+  removal of a `state/COMMIT.commitpartial` marker fails. If the run writes
+  no other ref, the command writes no summary.
 - `crates/ostrya/tests/media_import.rs` and
   `crates/ostrya-cli/tests/cli.rs` hold the tests.
 

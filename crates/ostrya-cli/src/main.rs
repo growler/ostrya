@@ -593,8 +593,9 @@ enum Command {
     /// command reads no client group, no server group, no key group, and no
     /// `LOGNAME`. It reads the trust group of --trust alone. Unless the
     /// config sets `[core] locking=false`, it holds the repository lock as
-    /// shared from `Hello` to the end. It adds no server signature and does
-    /// not write the summary again.
+    /// shared from `Hello` to the end. It adds no server signature. It does
+    /// not read `[core] auto-update-summary` and writes no summary, also when
+    /// the key is true.
     ///
     /// A plain ref takes a fast-forward update. A remote ref needs
     /// --allow-remote, and a ref of a collection other than the collection id
@@ -5510,6 +5511,17 @@ enum MediaCommand {
     /// After the last pull, the command writes one line
     /// `error: @ID:NAME: TEXT` to standard error for each refused ref, then
     /// exits 1.
+    ///
+    /// After the last pull, if the command wrote a ref, it reads `[core]
+    /// auto-update-summary` and its alias `commit-update-summary`. If one of
+    /// the two is true, the command writes the root summary and each summary
+    /// of an item again, after the output lines and the `error:` lines of the
+    /// refused refs. The key groups of `sign-summary` of `[ex-ostrya server]`
+    /// sign them. The command writes no new `ostree-metadata` commit. A run
+    /// that writes no ref does not read the two keys. If the command refuses
+    /// a ref and writes another ref, it writes the summaries and then exits 1.
+    /// After a run that writes a ref, a value that is not a boolean, or a
+    /// failed write, makes the command exit 1. The objects and the refs stay.
     Import(MediaImportArgs),
 }
 
@@ -8164,6 +8176,14 @@ fn media_refs(texts: &[String], collection: Option<&str>) -> Result<Vec<Ref>> {
 
 /// Pulls the refs of `args` from the media repository, and prints each
 /// written ref and the error of each refused ref.
+///
+/// After the last pull and the output, the command writes the summaries
+/// again if it wrote a ref and `[core] auto-update-summary` is true. A run
+/// that writes no ref does not read the key. If the run also refused a ref,
+/// the command writes the summaries and then exits 1. If the summary write
+/// fails too, its error line comes after the error lines of the refused
+/// refs. A failed write of standard output returns its error before the
+/// summary write.
 async fn media_import(repo: Repo, args: MediaImportArgs) -> Result<()> {
     let (refs, collections) = media_import_operands(&args.refs, args.collection.as_deref())?;
     let options = ostrya::MediaImportOptions {
@@ -8185,20 +8205,34 @@ async fn media_import(repo: Repo, args: MediaImportArgs) -> Result<()> {
         }
     };
     use std::io::Write;
-    let mut out = std::io::stdout().lock();
-    let written = report
-        .written
-        .iter()
-        .try_for_each(|(r, commit)| writeln!(out, "{r} {commit}"))
-        .and_then(|()| out.flush());
+    let written = {
+        let mut out = std::io::stdout().lock();
+        report
+            .written
+            .iter()
+            .try_for_each(|(r, commit)| writeln!(out, "{r} {commit}"))
+            .and_then(|()| out.flush())
+    };
     for (r, err) in &report.refused {
         eprintln!("error: {r}: {}", error_line(err));
     }
     written.map_err(Error::Io)?;
+    // The output lines and the error lines come first, and then the summary.
+    // A failed summary exits 1, and the refs stay. Each written ref is a
+    // collection ref, and a summary lists it. A run that also refused a ref
+    // writes the summary before it exits 1, because the written refs stay.
+    let summary = if report.written.iter().any(|(r, _)| summary_lists(r)) {
+        update_summary_if_configured(&repo).await
+    } else {
+        Ok(())
+    };
     if !report.refused.is_empty() {
+        if let Err(err) = &summary {
+            eprintln!("error: {}", error_line(err));
+        }
         exit_process(1);
     }
-    Ok(())
+    summary
 }
 
 /// Returns the reason why the media finder skipped a repository, as

@@ -295,7 +295,7 @@ The temporary files of a write are in \fB\%tmp/\fR, so \fB\%deltas/\fR, \fB\%del
 The root summary: each ref and its commit, the static deltas, and the repository metadata.
 It holds each local ref and each collection ref, whatever the client groups, and states the mode of the repository.
 \fB\%ostrya summary \-u\fR writes it, and \fB\%ostrya summary \-u \-c\fR leaves it as it is.
-Under the key \fB\%auto\-update\-summary\fR, \fB\%ostrya receive\fR, \fB\%ostrya serve\fR, \fB\%ostrya commit\fR, \fB\%ostrya pull\fR, \fB\%ostrya pull\-local\fR, and \fB\%ostrya refs\fR also write it after a change of a ref, as \fB\%ostrya\-config\fR(1) states.
+Under the key \fB\%auto\-update\-summary\fR, \fB\%ostrya receive\fR, \fB\%ostrya serve\fR, \fB\%ostrya commit\fR, \fB\%ostrya pull\fR, \fB\%ostrya pull\-local\fR, \fB\%ostrya refs\fR, and \fB\%ostrya media import\fR also write it after a change of a ref, as \fB\%ostrya\-config\fR(1) states.
 \fB\%ostrya pull \-\-mirror\fR with no ref copies the \fB\%summary\fR of the remote to it.
 \fB\%ostrya summary \-v\fR and a local pull read it.
 A local pull reads \fB\%summary\fR and \fB\%summary.sig\fR of its source repository with no symbolic link followed, and refuses a file that is not a regular file.

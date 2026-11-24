@@ -50634,6 +50634,30 @@ fn receive_one_way_allow_privileged_as_root() {
     assert!(setuid, "no object carries the setuid bit");
 }
 
+/// `receive --one-way` with `auto-update-summary=true` writes the ref and no
+/// summary, and keeps `summary.sig`. The command does not read the key, so
+/// `auto-update-summary=yes` does not stop it.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_writes_no_auto_summary() {
+    let tmp = TmpDir::new("receive-one-way-auto-summary");
+    let source = commit_fixture(&tmp.path().join("source"));
+    let stream = send_stream(tmp.path(), "stream", &source, &[BRANCH]);
+    for value in ["true", "yes"] {
+        let guest = guest(tmp.path(), value, "bare-user");
+        let config = config_text(&guest).replacen(
+            "[core]\n",
+            &format!("[core]\nauto-update-summary={value}\n"),
+            1,
+        );
+        std::fs::write(guest.join("config"), config).unwrap();
+        std::fs::write(guest.join("summary.sig"), AUTO_MARKER).unwrap();
+        received(&receive_from(&guest, Some(&stream), &[]), value);
+        assert_eq!(resolve(&guest, BRANCH).as_deref(), Some(COMMIT), "{value}");
+        assert_no_auto_summary(&guest, value);
+    }
+}
+
 // --- the @ID:NAME operands of commit, refs, prune, and pull-local ---------
 
 /// The `[core] collection-id` of a repository of the tests of the `@ID:NAME`
@@ -53078,4 +53102,340 @@ fn media_import_volumes_subprocess() {
         ref_file(&client, "refs/mirrors/org.example.X/a").as_ref(),
         Some(&commits[0])
     );
+}
+
+/// Exports the refs `a` of [`OWN_ID`], `@org.example.X:a`, and
+/// `@org.example.Y:b` onto the directory `base/mnt`. Returns the `--mount`
+/// option of the directory and the commit of each ref, in that order.
+fn auto_media(base: &Path) -> (String, Vec<String>) {
+    build_fixture_source(base);
+    let refs = ["a", "@org.example.X:a", "@org.example.Y:b"];
+    let (src, commits) = media_source(base, &refs);
+    let mount = base.join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let mut argv = vec!["media", "export", mount.to_str().unwrap()];
+    argv.extend_from_slice(&refs);
+    ostrya_at(&src, &argv).ok();
+    (format!("--mount={}", mount.display()), commits)
+}
+
+/// Creates a client of [`media_client`] at `path` with the collection id
+/// [`OWN_ID`] and one remote for each of [`OWN_ID`], `org.example.X`, and
+/// `org.example.Y`. Then puts `core` in `[core]`, appends `groups`, and
+/// writes [`AUTO_MARKER`] into `summary.sig`. Returns the path of the client.
+fn auto_media_client(path: &Path, core: &str, groups: &str) -> PathBuf {
+    let client = media_client(
+        path,
+        Some(OWN_ID),
+        &[OWN_ID, "org.example.X", "org.example.Y"],
+    );
+    let config = config_text(&client).replacen("[core]\n", &format!("[core]\n{core}"), 1);
+    std::fs::write(client.join("config"), config).unwrap();
+    append_config(&client, groups);
+    std::fs::write(client.join("summary.sig"), AUTO_MARKER).unwrap();
+    client
+}
+
+/// Returns the collection map of the summary of `repo`, with the name and
+/// the commit of each ref of each id.
+fn summary_collection_refs(repo: &Path) -> Vec<(String, Vec<(String, String)>)> {
+    let bytes = std::fs::read(repo.join("summary")).expect("summary exists");
+    ostrya::Summary::parse(&bytes)
+        .unwrap()
+        .collection_map()
+        .unwrap()
+        .into_iter()
+        .map(|(id, refs)| {
+            let refs = refs
+                .into_iter()
+                .map(|entry| (entry.name, entry.commit.to_hex()))
+                .collect();
+            (id, refs)
+        })
+        .collect()
+}
+
+/// `media import` that writes a ref under `refs/heads/` and a ref under
+/// `refs/mirrors/` writes the summary after its output lines. The summary
+/// lists both refs, and the write removes the old `summary.sig`. A second
+/// import, whose refs are all unchanged, writes no summary and does not read
+/// the key, so `auto-update-summary=yes` does not stop it.
+#[test]
+fn media_import_writes_the_auto_summary() {
+    let tmp = TmpDir::new("media-import-auto");
+    let base = tmp.path();
+    let (mount_arg, commits) = auto_media(base);
+    let [own_a, xa, _] = commits.as_slice() else {
+        unreachable!()
+    };
+    let client = auto_media_client(&base.join("client"), "auto-update-summary=true\n", "");
+    let argv = ["media", "import", &mount_arg, "a", "@org.example.X:a"];
+
+    let run = ostrya_at(&client, &argv);
+    run.ok();
+    assert!(run.stderr.is_empty());
+    let stdout = String::from_utf8(run.stdout.clone()).unwrap();
+    let mut lines: Vec<&str> = stdout.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(
+        lines,
+        [
+            format!("@org.example.Own:a {own_a}"),
+            format!("@org.example.X:a {xa}"),
+        ]
+    );
+    assert_eq!(summary_ref_names(&client), ["a"]);
+    assert_eq!(
+        summary_collection_refs(&client),
+        [(
+            "org.example.X".to_owned(),
+            vec![("a".to_owned(), xa.clone())]
+        )]
+    );
+    assert!(!client.join("summary.sig").exists());
+
+    reset_auto_summary(&client);
+    let config =
+        config_text(&client).replacen("auto-update-summary=true\n", "auto-update-summary=yes\n", 1);
+    std::fs::write(client.join("config"), config).unwrap();
+    let run = ostrya_at(&client, &argv);
+    run.ok();
+    assert!(run.stdout.is_empty());
+    assert!(run.stderr.is_empty());
+    assert_no_auto_summary(&client, "unchanged");
+}
+
+/// With `auto-update-summary` absent or false, `media import` writes the ref,
+/// writes no summary, and keeps `summary.sig`.
+#[test]
+fn media_import_writes_no_auto_summary_with_the_key_off() {
+    let tmp = TmpDir::new("media-import-auto-off");
+    let base = tmp.path();
+    let (mount_arg, commits) = auto_media(base);
+    for (case, core) in [("absent", ""), ("false", "auto-update-summary=false\n")] {
+        let client = auto_media_client(&base.join(case), core, "");
+        let run = ostrya_at(&client, &["media", "import", &mount_arg, "a"]);
+        run.ok();
+        assert!(run.stderr.is_empty(), "{case}");
+        assert_eq!(
+            ref_file(&client, "refs/heads/a").as_ref(),
+            Some(&commits[0]),
+            "{case}"
+        );
+        assert_no_auto_summary(&client, case);
+    }
+}
+
+/// `media import` that writes one ref and refuses another prints the output
+/// line and the `error:` line, writes the summary of the written ref, and
+/// exits 1. A directory at the place of the refused ref fails the read of
+/// its current ref.
+#[test]
+fn media_import_writes_the_auto_summary_when_it_refuses_another_ref() {
+    let tmp = TmpDir::new("media-import-auto-refused");
+    let base = tmp.path();
+    let (mount_arg, commits) = auto_media(base);
+    let xa = &commits[1];
+    let client = auto_media_client(&base.join("client"), "auto-update-summary=true\n", "");
+    std::fs::create_dir_all(client.join("refs/mirrors/org.example.Y/b/inner")).unwrap();
+
+    let run = ostrya_at(
+        &client,
+        &[
+            "media",
+            "import",
+            &mount_arg,
+            "@org.example.X:a",
+            "@org.example.Y:b",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(1), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        format!("@org.example.X:a {xa}\n")
+    );
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.starts_with("error: @org.example.Y:b: "), "{stderr}");
+    assert_eq!(
+        summary_collection_refs(&client),
+        [(
+            "org.example.X".to_owned(),
+            vec![("a".to_owned(), xa.clone())]
+        )]
+    );
+    assert!(!client.join("summary.sig").exists());
+}
+
+/// `media import` that refuses each ref and writes no ref prints the `error:`
+/// line of the refused ref alone, writes no summary, and exits 1. The run
+/// does not read the key, so `auto-update-summary=yes` adds no line.
+#[test]
+fn media_import_writes_no_auto_summary_when_it_refuses_every_ref() {
+    let tmp = TmpDir::new("media-import-auto-all-refused");
+    let base = tmp.path();
+    let (mount_arg, _) = auto_media(base);
+    for value in ["true", "yes"] {
+        let core = format!("auto-update-summary={value}\n");
+        let client = auto_media_client(&base.join(value), &core, "");
+        std::fs::create_dir_all(client.join("refs/mirrors/org.example.Y/b/inner")).unwrap();
+        let run = ostrya_at(
+            &client,
+            &["media", "import", &mount_arg, "@org.example.Y:b"],
+        );
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(1), "{value}: {stderr}");
+        assert!(run.stdout.is_empty(), "{value}");
+        assert_eq!(stderr.lines().count(), 1, "{value}: {stderr}");
+        assert!(
+            stderr.starts_with("error: @org.example.Y:b: "),
+            "{value}: {stderr}"
+        );
+        assert_no_auto_summary(&client, value);
+    }
+}
+
+/// `media import` whose standard output is on `/dev/full` writes the ref,
+/// prints the `error:` line of the failed write, and exits 1. The failed
+/// write returns before the summary write, so the run writes no summary.
+#[cfg(target_os = "linux")]
+#[test]
+fn media_import_writes_no_auto_summary_after_a_failed_write_of_the_output() {
+    let tmp = TmpDir::new("media-import-auto-dev-full");
+    let base = tmp.path();
+    let (mount_arg, commits) = auto_media(base);
+    let client = auto_media_client(&base.join("client"), "auto-update-summary=true\n", "");
+    let repo_arg = format!("--repo={}", client.display());
+    let out = Command::new(env!("CARGO_BIN_EXE_ostrya"))
+        .env("OSTREE_GPG_HOME", empty_gpg_home())
+        .args(["media", &repo_arg, "import", &mount_arg, "a"])
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create("/dev/full").unwrap())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.starts_with("error: "), "{stderr}");
+    assert!(stderr.contains("os error 28"), "{stderr}");
+    assert_eq!(
+        ref_file(&client, "refs/heads/a").as_ref(),
+        Some(&commits[0])
+    );
+    assert_no_auto_summary(&client, "dev-full");
+}
+
+/// `media import` that writes a ref, with `auto-update-summary=yes` or with
+/// a key group of `sign-summary` whose key file is absent: the command
+/// prints the output line, then one `error:` line, and exits 1. The ref
+/// stays, and the summary files do not change. When the run also refuses a
+/// ref, the `error:` line of the refused ref comes first, and the `error:`
+/// line of the summary comes second.
+#[test]
+fn media_import_keeps_the_refs_when_the_auto_summary_fails() {
+    let tmp = TmpDir::new("media-import-auto-fails");
+    let base = tmp.path();
+    let (mount_arg, commits) = auto_media(base);
+    let absent = base.join("absent.ed25519");
+    let groups = format!(
+        "[ex-ostrya server]\nsign-summary=a\n\
+         [ex-ostrya key \"a\"]\ntype=ed25519\nsecret-key-file={}\n",
+        absent.display()
+    );
+    let key_prefix = "error: signature: [ex-ostrya key \"a\"]: ";
+    let cases = [
+        (
+            "yes",
+            "auto-update-summary=yes\n",
+            String::new(),
+            "error: keyfile: value 'yes' for core.auto-update-summary is not a boolean",
+        ),
+        (
+            "absent key",
+            "auto-update-summary=true\n",
+            groups.clone(),
+            key_prefix,
+        ),
+    ];
+    for (case, core, groups, prefix) in cases {
+        let client = auto_media_client(&base.join(case), core, &groups);
+        let run = ostrya_at(&client, &["media", "import", &mount_arg, "a"]);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(1), "{case}: {stderr}");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            format!("@org.example.Own:a {}\n", commits[0]),
+            "{case}"
+        );
+        assert_eq!(stderr.lines().count(), 1, "{case}: {stderr}");
+        assert!(stderr.starts_with(prefix), "{case}: {stderr}");
+        assert_eq!(
+            ref_file(&client, "refs/heads/a").as_ref(),
+            Some(&commits[0]),
+            "{case}"
+        );
+        assert_no_auto_summary(&client, case);
+    }
+
+    let client = auto_media_client(&base.join("refused"), "auto-update-summary=true\n", &groups);
+    std::fs::create_dir_all(client.join("refs/mirrors/org.example.Y/b/inner")).unwrap();
+    let run = ostrya_at(
+        &client,
+        &["media", "import", &mount_arg, "a", "@org.example.Y:b"],
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(1), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        format!("@org.example.Own:a {}\n", commits[0])
+    );
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 2, "{stderr}");
+    assert!(
+        lines[0].starts_with("error: @org.example.Y:b: "),
+        "{stderr}"
+    );
+    assert!(lines[1].starts_with(key_prefix), "{stderr}");
+    assert_eq!(
+        ref_file(&client, "refs/heads/a").as_ref(),
+        Some(&commits[0])
+    );
+    assert_no_auto_summary(&client, "refused");
+}
+
+/// In a client with a collection id, `media import` writes the summary,
+/// which lists the written ref and lists `ostree-metadata` at its current
+/// commit. The run writes no new anchor commit.
+#[test]
+fn media_import_auto_summary_writes_no_anchor_commit() {
+    let tmp = TmpDir::new("media-import-auto-anchor");
+    let base = tmp.path();
+    let (mount_arg, commits) = auto_media(base);
+    let client = auto_media_client(&base.join("client"), "auto-update-summary=true\n", "");
+    ostrya_at(&client, &["summary", "-u"]).ok();
+    let anchor = ref_file(&client, "refs/heads/ostree-metadata").expect("summary -u wrote it");
+    std::fs::write(client.join("summary.sig"), AUTO_MARKER).unwrap();
+
+    let run = ostrya_at(&client, &["media", "import", &mount_arg, "a"]);
+    run.ok();
+    assert!(run.stderr.is_empty());
+    assert_eq!(
+        ref_file(&client, "refs/heads/a").as_ref(),
+        Some(&commits[0])
+    );
+    assert_eq!(
+        ref_file(&client, "refs/heads/ostree-metadata").as_ref(),
+        Some(&anchor)
+    );
+    assert_eq!(summary_ref_names(&client), ["a", "ostree-metadata"]);
+    let bytes = std::fs::read(client.join("summary")).unwrap();
+    let summary = ostrya::Summary::parse(&bytes).unwrap();
+    let listed = summary
+        .refs
+        .iter()
+        .find(|entry| entry.name == "ostree-metadata")
+        .unwrap();
+    assert_eq!(listed.commit.to_hex(), anchor);
+    assert!(!client.join("summary.sig").exists());
 }

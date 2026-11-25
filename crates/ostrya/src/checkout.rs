@@ -10,6 +10,7 @@ use std::future::Future;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures_lite::AsyncReadExt;
 use ostrya_core::{Checksum, Commit, DirMeta, ObjectType, RepoMode, Xattrs, loose_path};
@@ -421,6 +422,22 @@ impl Repo {
     /// directory that the link resolves to stays. This rule does not apply to
     /// the destination directory of a file subpath or to a passthrough
     /// whiteout device.
+    ///
+    /// # Cancellation
+    ///
+    /// To cancel the checkout, drop the returned future. The checkout stops at
+    /// the point where it waits. The destination keeps each change that the
+    /// checkout made before the drop. A step that already runs on the blocking
+    /// pool runs to its end. With the `tokio` feature, a step that waits for a
+    /// thread of the pool also runs. So one more step can change the
+    /// destination after the drop. That step can write, replace, or remove an
+    /// entry, clear a directory, or change the metadata of a directory.
+    ///
+    /// If the file system does not support `O_TMPFILE`, a copy writes a named
+    /// temp file in the destination directory. The checkout removes that file
+    /// when the future drops, or shortly after on the blocking pool. A process
+    /// that exits or is killed before that can leave a file whose name starts
+    /// with `.ostrya-tmp-` in the destination.
     ///
     /// # Errors
     ///
@@ -1084,6 +1101,12 @@ fn reason(err: Error) -> String {
 /// Writes a regular file. The function hardlinks the loose object if the object
 /// inode is already the target inode. Otherwise it copies the object, with a
 /// reflink if possible.
+///
+/// A copy writes a temp file in `dir_fd` and then puts it in place under
+/// `name`. The guard of a named temp file removes it on each error and when the
+/// caller drops the future during the copy. After the copy, the guard moves into
+/// the finish step on the blocking pool and removes the file when that step
+/// fails or drops without a run.
 async fn place_regular(
     repo: &Repo,
     opts: &mut CheckoutOptions,
@@ -1125,18 +1148,18 @@ async fn place_regular(
         }
     }
 
-    let dir = dir_fd.try_clone_to_owned()?;
-    let (temp, kind) = crate::write::open_temp(dir_fd)?;
+    let dir = Arc::new(dir_fd.try_clone_to_owned()?);
+    // The drop of `kind` removes a named temp file on each error return below
+    // and when the caller drops the future during the copy.
+    let (temp, kind) = crate::write::open_temp(&dir)?;
     // A loose object of a bare-family mode holds the raw payload. So a
     // recorded size of zero is the `st_size` of the object, and the empty temp
     // file already holds all bytes of the destination. An `archive` object
     // records the declared uncompressed size of its header. That size is not
     // proof of the payload, so that mode always copies.
     if !(policy.repo_mode != RepoMode::Archive && matches!(obj.kind, FileKind::Regular { size: 0 }))
-        && let Err(e) = copy_object(repo, obj, payload, &temp, policy).await
     {
-        remove_named_temp(dir_fd, &kind);
-        return Err(e);
+        copy_object(repo, obj, payload, &temp, policy).await?;
     }
     let plan = FinishCopy {
         dir,
@@ -1565,8 +1588,11 @@ async fn copy_object(
 }
 
 /// The data that the blocking pool needs to finish a copied regular file.
+///
+/// The plan owns the temp file. A drop of a plan that has a named temp file
+/// removes that file, unless the rename put it in place.
 struct FinishCopy {
-    dir: OwnedFd,
+    dir: Arc<OwnedFd>,
     name: String,
     temp: OwnedFd,
     kind: TempKind,
@@ -1583,13 +1609,10 @@ struct FinishCopy {
 /// it to its destination name. If the plan says so, it fsyncs the inode first.
 ///
 /// Returns the destination `(dev, ino)`. If a step up to and including the
-/// link fails, the function removes the named temp file.
-fn finish_copy_blocking(plan: FinishCopy) -> Result<(u64, u64)> {
-    if let Err(e) = prepare_copy_blocking(&plan) {
-        remove_named_temp(plan.dir.as_fd(), &plan.kind);
-        return Err(e);
-    }
-    match &plan.kind {
+/// link fails, the drop of the plan removes the named temp file.
+fn finish_copy_blocking(mut plan: FinishCopy) -> Result<(u64, u64)> {
+    prepare_copy_blocking(&plan)?;
+    match &mut plan.kind {
         TempKind::Anonymous => {
             let proc = format!("/proc/self/fd/{}", plan.temp.as_raw_fd());
             match rustix::fs::linkat(
@@ -1614,7 +1637,7 @@ fn finish_copy_blocking(plan: FinishCopy) -> Result<(u64, u64)> {
             let result = if !plan.remove_existing {
                 match rustix::fs::renameat_with(
                     plan.dir.as_fd(),
-                    tmp.as_str(),
+                    tmp.name(),
                     plan.dir.as_fd(),
                     &plan.name,
                     RenameFlags::NOREPLACE,
@@ -1624,23 +1647,23 @@ fn finish_copy_blocking(plan: FinishCopy) -> Result<(u64, u64)> {
                     // against a concurrent writer.
                     Err(Errno::INVAL | Errno::NOSYS) => rustix::fs::renameat(
                         plan.dir.as_fd(),
-                        tmp.as_str(),
+                        tmp.name(),
                         plan.dir.as_fd(),
                         &plan.name,
                     ),
                     other => other,
                 }
             } else {
-                rustix::fs::renameat(plan.dir.as_fd(), tmp.as_str(), plan.dir.as_fd(), &plan.name)
+                rustix::fs::renameat(plan.dir.as_fd(), tmp.name(), plan.dir.as_fd(), &plan.name)
             };
             if let Err(e) = result {
-                let _ = rustix::fs::unlinkat(plan.dir.as_fd(), tmp.as_str(), AtFlags::empty());
                 return Err(if e == Errno::EXIST {
                     collision(&plan.name)
                 } else {
                     e.into()
                 });
             }
+            tmp.disarm();
         }
     }
     let st = rustix::fs::statat(plan.dir.as_fd(), &plan.name, AtFlags::SYMLINK_NOFOLLOW)?;
@@ -1666,15 +1689,6 @@ fn prepare_copy_blocking(plan: &FinishCopy) -> Result<()> {
         remove_dir_entry(plan.dir.as_fd(), &plan.name)?;
     }
     Ok(())
-}
-
-/// Removes the named temp file of a failed copy. An anonymous temp inode goes
-/// away when its fd closes, so it needs no removal. The function ignores an
-/// error of the removal, because the caller returns the first error.
-fn remove_named_temp(dir_fd: BorrowedFd<'_>, kind: &TempKind) {
-    if let TempKind::Named(tmp) = kind {
-        let _ = rustix::fs::unlinkat(dir_fd, tmp.as_str(), AtFlags::empty());
-    }
 }
 
 /// Applies the checkout-mode metadata of a regular file to its inode fd.
@@ -2109,6 +2123,7 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::write::NamedTemp;
 
     fn policy(repo_mode: RepoMode, mode: CheckoutMode, force_copy: bool) -> Policy {
         Policy::new(
@@ -2322,7 +2337,7 @@ mod tests {
     fn named_none_plan(scratch: &Scratch) -> FinishCopy {
         use std::io::Write as _;
 
-        let dir_fd: OwnedFd = std::fs::File::open(scratch.path()).unwrap().into();
+        let dir_fd = Arc::new(OwnedFd::from(std::fs::File::open(scratch.path()).unwrap()));
         let tmp_name = ".ostrya-test-tmp".to_owned();
         let mut tmp = std::fs::OpenOptions::new()
             .write(true)
@@ -2331,10 +2346,10 @@ mod tests {
             .unwrap();
         tmp.write_all(b"NEW").unwrap();
         FinishCopy {
-            dir: dir_fd,
+            dir: Arc::clone(&dir_fd),
             name: "dest".to_owned(),
             temp: tmp.into(),
-            kind: TempKind::Named(tmp_name),
+            kind: TempKind::Named(NamedTemp::adopt(dir_fd, tmp_name)),
             effective: CheckoutMode::User,
             uid: 0,
             gid: 0,
@@ -2376,6 +2391,22 @@ mod tests {
         assert_eq!(std::fs::read(scratch.path().join("dest")).unwrap(), b"NEW");
     }
 
+    /// A drop of a plan that does not run removes the named temp file.
+    #[test]
+    fn named_temp_removed_when_finish_plan_drops_unrun() {
+        let scratch = Scratch::new("co-named-drop");
+        let plan = named_none_plan(&scratch);
+        assert!(
+            scratch.path().join(".ostrya-test-tmp").exists(),
+            "the named temp file exists"
+        );
+        drop(plan);
+        assert!(
+            !scratch.path().join(".ostrya-test-tmp").exists(),
+            "the drop removes the named temp file"
+        );
+    }
+
     /// A failed metadata apply removes the named temp file. The plan keeps the
     /// owner of the temp file, so the chown succeeds for each user. The xattr
     /// name is longer than the 255-byte name limit of the kernel. The kernel
@@ -2407,6 +2438,153 @@ mod tests {
         assert!(
             !scratch.path().join("dest").exists(),
             "no destination is written"
+        );
+    }
+
+    /// Forces the named temp path of `open_temp` on this thread until the
+    /// value drops.
+    struct ForceNamedTemp;
+
+    impl ForceNamedTemp {
+        fn new() -> ForceNamedTemp {
+            crate::write::FORCE_NAMED_TEMP.set(true);
+            ForceNamedTemp
+        }
+    }
+
+    impl Drop for ForceNamedTemp {
+        fn drop(&mut self) {
+            crate::write::FORCE_NAMED_TEMP.set(false);
+        }
+    }
+
+    /// The payload size of the test object, 8 MiB.
+    const BIG: usize = 8 << 20;
+
+    /// Creates an `archive` repository in `scratch` with one regular file of
+    /// `BIG` bytes. Returns the repository and the checksum of the file.
+    async fn archive_repo_with_file(scratch: &Scratch) -> (Repo, Checksum) {
+        let repo = Repo::create(
+            &scratch.path().join("repo"),
+            crate::repo::CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let meta = FileMeta {
+            uid: 0,
+            gid: 0,
+            mode: 0o100644,
+            xattrs: Xattrs::empty(),
+        };
+        let payload: Vec<u8> = (0..BIG).map(|i| (i % 251) as u8).collect();
+        let checksum = txn
+            .write_regfile_inline(None, &meta, &payload)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        (repo, checksum)
+    }
+
+    /// Returns the names in `dir` that start with `.ostrya-tmp-`.
+    fn temp_names(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with(".ostrya-tmp-"))
+            .collect()
+    }
+
+    /// A failed copy removes its named temp file. The test truncates the
+    /// `.filez` object, so the inflate of the copy fails.
+    #[test]
+    fn place_regular_removes_named_temp_when_copy_fails() {
+        let scratch = Scratch::new("co-named-copy-fail");
+        let dest = scratch.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        let _force = ForceNamedTemp::new();
+        ostrya_rt::block_on(async {
+            let (repo, checksum) = archive_repo_with_file(&scratch).await;
+            let (obj, payload) = repo.open_file(&checksum).await.unwrap();
+            let object = scratch.path().join("repo/objects").join(loose_path(
+                &checksum,
+                ObjectType::File,
+                RepoMode::Archive,
+            ));
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&object)
+                .unwrap()
+                .set_len(obj.stored_size() / 2)
+                .unwrap();
+            let mut opts = CheckoutOptions::new(CheckoutMode::User);
+            let policy = Policy::new(RepoMode::Archive, &opts);
+            let dir_fd = std::fs::File::open(&dest).unwrap();
+            let entry = Entry { obj: &obj, payload };
+            let result =
+                place_regular(&repo, &mut opts, policy, dir_fd.as_fd(), "file", entry).await;
+            assert!(
+                matches!(result, Err(Error::Io(_))),
+                "the copy of a truncated object fails, got {result:?}"
+            );
+        });
+        assert!(
+            temp_names(&dest).is_empty(),
+            "the failed copy removes the named temp file"
+        );
+        assert!(!dest.join("file").exists(), "no destination is written");
+    }
+
+    /// A drop of the future during the copy removes the named temp file. The
+    /// test polls the future until the temp file exists. Then it checks that
+    /// the copy is still in progress: the temp file holds less than the
+    /// payload, and the destination name does not exist.
+    #[test]
+    fn place_regular_removes_named_temp_when_dropped_during_copy() {
+        let scratch = Scratch::new("co-named-copy-drop");
+        let dest = scratch.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        let _force = ForceNamedTemp::new();
+        ostrya_rt::block_on(async {
+            let (repo, checksum) = archive_repo_with_file(&scratch).await;
+            let (obj, payload) = repo.open_file(&checksum).await.unwrap();
+            let mut opts = CheckoutOptions::new(CheckoutMode::User);
+            let policy = Policy::new(RepoMode::Archive, &opts);
+            let dir_fd = std::fs::File::open(&dest).unwrap();
+            let entry = Entry { obj: &obj, payload };
+            let mut fut = Box::pin(place_regular(
+                &repo,
+                &mut opts,
+                policy,
+                dir_fd.as_fd(),
+                "file",
+                entry,
+            ));
+            let temp = loop {
+                let poll =
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(fut.as_mut().poll(cx))).await;
+                assert!(
+                    poll.is_pending(),
+                    "the copy ended before the test saw its temp file, got {poll:?}"
+                );
+                if let [name] = temp_names(&dest).as_slice() {
+                    break dest.join(name);
+                }
+            };
+            let len = std::fs::metadata(&temp).unwrap().len();
+            assert!(
+                len < BIG as u64,
+                "the copy is in progress, but the temp file holds {len} bytes"
+            );
+            assert!(
+                !dest.join("file").exists(),
+                "the copy has not put the file in place"
+            );
+            drop(fut);
+        });
+        assert!(
+            temp_names(&dest).is_empty(),
+            "the drop removes the named temp file"
         );
     }
 }

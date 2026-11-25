@@ -18,6 +18,7 @@ use std::future::poll_fn;
 use std::io::{self, SeekFrom, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use async_compression::futures::write::DeflateDecoder;
@@ -180,10 +181,62 @@ fn canonical_dirmeta(meta: &DirMeta) -> DirMeta {
 #[derive(Debug)]
 pub(crate) enum TempKind {
     /// An `O_TMPFILE` anonymous inode, linked into place through
-    /// `/proc/self/fd`.
+    /// `/proc/self/fd`. The inode goes away when its last fd closes.
     Anonymous,
-    /// A named temp file, renamed into place.
-    Named(String),
+    /// A named temp file, renamed into place. The guard removes the name when
+    /// it drops.
+    Named(NamedTemp),
+}
+
+/// A guard on the name of a named temp file of [`open_temp`].
+///
+/// A drop unlinks the name until [`disarm`](NamedTemp::disarm) is called. The
+/// caller disarms the guard after the rename that puts the file in place. A
+/// failed or cancelled copy then leaves no temp name in the directory.
+#[derive(Debug)]
+pub(crate) struct NamedTemp {
+    dir: Arc<OwnedFd>,
+    name: String,
+    armed: bool,
+}
+
+impl NamedTemp {
+    /// Returns an armed guard on the existing entry `name` in `dir`.
+    #[cfg(test)]
+    pub(crate) fn adopt(dir: Arc<OwnedFd>, name: String) -> NamedTemp {
+        NamedTemp {
+            dir,
+            name,
+            armed: true,
+        }
+    }
+
+    /// Returns the name of the temp file in its directory.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Disarms the guard, because the file is in place under its final name.
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for NamedTemp {
+    /// The unlink runs only on an error path or a drop path. It runs on the
+    /// thread that drops the guard, an executor thread or a thread of the
+    /// blocking pool, as the inline `statat` and `openat` of the copy path do.
+    /// The function ignores an error of the unlink, because a drop cannot
+    /// report it.
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = rustix::fs::unlinkat(
+                self.dir.as_fd(),
+                self.name.as_str(),
+                rustix::fs::AtFlags::empty(),
+            );
+        }
+    }
 }
 
 /// A writer that streams the payload of one regular file into a transaction.
@@ -886,14 +939,27 @@ pub(crate) fn archive_level(zlib_level: i64) -> u8 {
     zlib_level.clamp(1, 9) as u8
 }
 
-/// Opens a temp file in the directory `dir_fd`.
+#[cfg(test)]
+thread_local! {
+    /// If set, [`open_temp`] on this thread opens a named temp file and does
+    /// not try `O_TMPFILE`.
+    pub(crate) static FORCE_NAMED_TEMP: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Opens a temp file in the directory `dir`.
 ///
 /// The function uses `O_TMPFILE` if the file system supports it, and a named
-/// temp file otherwise. The checkout copy path uses this function to open its
+/// temp file otherwise. A [`NamedTemp`] guards the name of a named temp file
+/// from its creation. The checkout copy path uses this function to open its
 /// temp files in the destination directory.
-pub(crate) fn open_temp(dir_fd: BorrowedFd<'_>) -> Result<(OwnedFd, TempKind)> {
+pub(crate) fn open_temp(dir: &Arc<OwnedFd>) -> Result<(OwnedFd, TempKind)> {
+    #[cfg(test)]
+    if FORCE_NAMED_TEMP.get() {
+        return open_named_temp(dir);
+    }
     match rustix::fs::openat(
-        dir_fd,
+        dir.as_fd(),
         ".",
         OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
         Mode::from_raw_mode(FIXED_MODE),
@@ -901,17 +967,30 @@ pub(crate) fn open_temp(dir_fd: BorrowedFd<'_>) -> Result<(OwnedFd, TempKind)> {
         Ok(fd) => Ok((fd, TempKind::Anonymous)),
         // Each failure of the O_TMPFILE attempt falls back to a named temp. A
         // real error, for example ENOSPC, comes back from that open.
-        Err(_) => {
-            let name = temp_name();
-            let fd = rustix::fs::openat(
-                dir_fd,
-                name.as_str(),
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::from_raw_mode(FIXED_MODE),
-            )?;
-            Ok((fd, TempKind::Named(name)))
-        }
+        Err(_) => open_named_temp(dir),
     }
+}
+
+/// Opens a named temp file in the directory `dir`, with an armed guard on its
+/// name.
+///
+/// The guard shares the descriptor `dir` with the caller.
+fn open_named_temp(dir: &Arc<OwnedFd>) -> Result<(OwnedFd, TempKind)> {
+    let name = temp_name();
+    let fd = rustix::fs::openat(
+        dir.as_fd(),
+        name.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(FIXED_MODE),
+    )?;
+    Ok((
+        fd,
+        TempKind::Named(NamedTemp {
+            dir: Arc::clone(dir),
+            name,
+            armed: true,
+        }),
+    ))
 }
 
 /// Returns the uid and gid that a newly staged object in `staging` gets.
@@ -2110,5 +2189,70 @@ mod verity_tests {
             }
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod temp_tests {
+    use super::{TempKind, open_named_temp};
+    use std::os::fd::OwnedFd;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    /// Creates an empty scratch directory for one test.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-{tag}-{}-{}",
+            std::process::id(),
+            super::unique()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Opens `dir` as a shared directory descriptor.
+    fn open_dir(dir: &std::path::Path) -> Arc<OwnedFd> {
+        Arc::new(std::fs::File::open(dir).unwrap().into())
+    }
+
+    /// A drop of a named temp file removes its name from the directory.
+    #[test]
+    fn named_temp_removed_on_drop() {
+        let dir = scratch("named-temp-drop");
+        let (fd, kind) = open_named_temp(&open_dir(&dir)).unwrap();
+        let TempKind::Named(temp) = &kind else {
+            panic!("the helper gives a named temp, got {kind:?}");
+        };
+        let path = dir.join(temp.name());
+        assert!(path.exists(), "the named temp file exists");
+        drop((fd, kind));
+        let gone = !path.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(gone, "the drop removes the named temp file");
+    }
+
+    /// A drop of a disarmed guard unlinks nothing. After the rename, the test
+    /// puts a foreign file at the temp name, and the drop keeps it.
+    #[test]
+    fn named_temp_kept_after_rename_and_disarm() {
+        let dir = scratch("named-temp-keep");
+        let (fd, kind) = open_named_temp(&open_dir(&dir)).unwrap();
+        let TempKind::Named(mut temp) = kind else {
+            panic!("the helper gives a named temp, got {kind:?}");
+        };
+        let foreign = dir.join(temp.name());
+        std::fs::rename(&foreign, dir.join("target")).unwrap();
+        temp.disarm();
+        std::fs::write(&foreign, b"foreign").unwrap();
+        drop((fd, temp));
+        let target_kept = dir.join("target").exists();
+        let foreign_kept = foreign.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(target_kept, "the drop keeps the target");
+        assert!(
+            foreign_kept,
+            "the drop keeps the foreign file at the temp name"
+        );
     }
 }

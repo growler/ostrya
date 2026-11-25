@@ -81,9 +81,10 @@ impl Transaction {
     ///
     /// A [`CommitModifier`] applies to each recorded entry the steps that
     /// [`write_dfd_to_mtree`](Transaction::write_dfd_to_mtree) lists under
-    /// its `Modifier` heading. The root of the upper directory goes through
-    /// each step except the filter. The merge does not use a
-    /// [`DevInoCache`](crate::DevInoCache) or
+    /// its `Modifier` heading. The merge reads the xattrs of an entry before
+    /// the filter, so the filter gets the xattrs that steps 1 to 3 leave. The
+    /// root of the upper directory goes through each step except the filter.
+    /// The merge does not use a [`DevInoCache`](crate::DevInoCache) or
     /// [`CONSUME`](CommitModifierFlags::CONSUME).
     ///
     /// Whiteouts and opaque markers are merge mechanics, and the modifier

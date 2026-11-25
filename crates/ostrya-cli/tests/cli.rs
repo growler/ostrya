@@ -23922,6 +23922,111 @@ fn commit_skip_list_matches_the_tool() {
     }
 }
 
+/// Sets the mode of each listed path again on drop.
+///
+/// Declare it after the `TmpDir` of the test. It then drops first, and the
+/// `TmpDir` can remove an entry that the test made unreadable.
+struct RestoreModes(Vec<(PathBuf, u32)>);
+
+impl Drop for RestoreModes {
+    fn drop(&mut self) {
+        for (path, mode) in &self.0 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode));
+        }
+    }
+}
+
+/// `commit --skip-list` that names an entry that does not open commits the
+/// tree without the entry at exit 0 in ostrya and in the `ostree` command, with
+/// the same commit checksum. Both open an entry only after the skip list keeps
+/// it. Without the skip list, both refuse the entry at exit 1, with different
+/// wording. A directory at mode 0644 opens, and its first entry fails
+/// `fstatat`.
+#[test]
+fn commit_skip_list_of_an_entry_that_does_not_open_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("commit-skip-unopened");
+    let base = tmp.path();
+    let entries = [
+        ("file0000", 0o000),
+        ("file0200", 0o200),
+        ("empty0000", 0o000),
+        ("dir0000", 0o000),
+        ("dir0311", 0o311),
+        ("dir0644", 0o644),
+    ];
+    let mut restore = RestoreModes(Vec::new());
+    for (name, mode) in entries {
+        let src = base.join(format!("src-{name}"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("kept.txt"), "kept\n").unwrap();
+        chmod_to(&src.join("kept.txt"), 0o644);
+        chmod_to(&src, 0o755);
+        let entry = src.join(name);
+        if name.starts_with("dir") {
+            std::fs::create_dir(&entry).unwrap();
+            std::fs::write(entry.join("inner"), "inner\n").unwrap();
+        } else if name.starts_with("empty") {
+            std::fs::write(&entry, "").unwrap();
+        } else {
+            std::fs::write(&entry, "secret\n").unwrap();
+        }
+        restore.0.push((entry.clone(), 0o755));
+        chmod_to(&entry, mode);
+        std::fs::write(base.join(format!("skip-{name}")), format!("/{name}\n")).unwrap();
+    }
+
+    for (tag, mode) in [
+        ("archive", RepoMode::Archive),
+        ("bare-user", RepoMode::BareUser),
+        ("bare-user-only", RepoMode::BareUserOnly),
+    ] {
+        let (port_repo, tool_repo) = create_repo_pair(&base.join(tag), mode);
+        for (name, _) in entries {
+            let src = base.join(format!("src-{name}"));
+            let src = src.to_str().unwrap();
+            let skip = format!(
+                "--skip-list={}",
+                base.join(format!("skip-{name}")).display()
+            );
+            for xattrs in [None, Some("--no-xattrs")] {
+                let branch = format!("{name}-{}", xattrs.is_some());
+                let mut args = vec!["commit", "-b", &branch, FIXED_TIMESTAMP];
+                args.extend(xattrs);
+                let refused = [args.as_slice(), &[src]].concat();
+                let skipped = [args.as_slice(), &[&skip, src]].concat();
+
+                let label = skipped.join(" ");
+                let (port, tool) = run_both(&port_repo, &tool_repo, &skipped);
+                assert_runs_agree(&port, &tool, &format!("{tag}: {label}"));
+                assert_eq!(
+                    port.status.code(),
+                    Some(0),
+                    "{tag}: `{label}` failed:\n{}",
+                    String::from_utf8_lossy(&port.stderr),
+                );
+
+                let label = refused.join(" ");
+                let (port, tool) = run_both(&port_repo, &tool_repo, &refused);
+                if port.status.success() && tool.status.success() && is_root() {
+                    eprintln!("skipping the refusal of {name}: root opens each mode");
+                    continue;
+                }
+                for (who, run) in [("port", &port), ("tool", &tool)] {
+                    assert_eq!(
+                        run.status.code(),
+                        Some(1),
+                        "{tag}: the {who} gave another result for `{label}`:\n{}",
+                        String::from_utf8_lossy(&run.stderr),
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// `commit --mode-ro-executables` clears the write bits of each regular file
 /// with an execute bit, and runs before `--statoverride`.
 #[test]
@@ -28158,9 +28263,9 @@ fn commit_consume_matches_the_tool() {
     }
     assert!(archive.exists(), "the `tar=` source was consumed");
 
-    // A walk filter does not keep a path from the removal. The source is gone
-    // for all paths that the filter kept out of the commit, and the commit is
-    // written.
+    // A path that the skip list names parts the two. The tool removes it with
+    // the rest, and the port keeps it and the source directory that holds it.
+    // Both write the same commit.
     let skip_list = base.join("skip-list");
     std::fs::write(&skip_list, "/skipme\n").unwrap();
     let (port_filtered, tool_filtered) = build("filtered");
@@ -28190,12 +28295,17 @@ fn commit_consume_matches_the_tool() {
         });
     }
     assert_runs_agree(&runs[0], &runs[1], "consume with a skip-list");
-    assert_eq!(state(&port_filtered), state(&tool_filtered));
+    assert_eq!(
+        state(&tool_filtered),
+        "gone",
+        "the tool left the source behind"
+    );
     assert_eq!(
         state(&port_filtered),
-        "gone",
-        "a filtered path left the source behind"
+        "kept with 1 entries",
+        "the port removed the skipped path"
     );
+    assert_eq!(state(&port_filtered.join("skipme")), "kept with 1 entries");
 
     // Both sources are consumed.
     let (port_first, tool_first) = build("first");
@@ -28252,14 +28362,14 @@ fn commit_consume_matches_the_tool() {
     assert_eq!(state(&port_src), "kept with 0 entries");
 }
 
-/// `commit --consume` removes a source subtree that the filter kept out of the
-/// commit, at any depth. The removal uses a bounded number of descriptors. A
-/// chain deeper than the descriptor limit of the run is removed completely,
-/// and the commit is written. The run sets its own limit, because the
-/// inherited limit is far more than any depth that a test can build in
+/// `commit --consume` keeps a source subtree that the skip list names, at any
+/// depth, and removes the other entries. The removal does not enter the
+/// subtree, so a chain deeper than the descriptor limit of the run stays
+/// complete, and the commit is written. The run sets its own limit, because
+/// the inherited limit is far more than any depth that a test can build in
 /// reasonable time.
 #[test]
-fn commit_consume_removes_a_deep_filtered_tree() {
+fn commit_consume_keeps_a_deep_skipped_tree() {
     // The depth of the chain that the skip list prunes, and the descriptor
     // limit of the run, which is much less than the depth.
     const DEPTH: usize = 512;
@@ -28277,8 +28387,8 @@ fn commit_consume_removes_a_deep_filtered_tree() {
     std::fs::create_dir_all(&chain).unwrap();
     std::fs::write(src.join("keep.txt"), "keep\n").unwrap();
 
-    // The skip list prunes the chain at its root, so the walk never goes into
-    // it. Only the consuming removal empties it.
+    // The skip list prunes the chain at its root, so neither the walk nor the
+    // consuming removal goes into it.
     let skip_list = base.join("skip-list");
     std::fs::write(&skip_list, "/deep\n").unwrap();
 
@@ -28304,10 +28414,17 @@ fn commit_consume_removes_a_deep_filtered_tree() {
 
     assert!(
         out.status.success(),
-        "a {DEPTH}-level chain was not consumed under {NOFILE} descriptors:\n{}",
+        "a {DEPTH}-level skipped chain failed the run under {NOFILE} descriptors:\n{}",
         String::from_utf8_lossy(&out.stderr),
     );
-    assert!(!src.exists(), "the consuming commit left the source behind");
+    assert!(
+        chain.is_dir(),
+        "the consuming commit removed the skipped chain"
+    );
+    assert!(
+        !src.join("keep.txt").exists(),
+        "the consuming commit left the file behind"
+    );
 }
 
 /// Builds a small source tree for a `commit --consume` test: one file at the
@@ -28680,9 +28797,9 @@ fn commit_consume_removes_the_source_from_an_unreadable_working_directory() {
 }
 
 /// A skip list that names the walk root prunes the whole walk. With `--base`
-/// the commit holds the base tree, and `--consume` removes the whole source.
+/// the commit holds the base tree, and `--consume` keeps the whole source.
 #[test]
-fn commit_consume_removes_the_source_under_a_pruned_walk_root_with_base() {
+fn commit_consume_keeps_the_source_under_a_pruned_walk_root_with_base() {
     let tmp = TmpDir::new("commit-consume-pruned");
     let base = tmp.path();
     let repo = create_repo(base, RepoMode::Archive);
@@ -28741,7 +28858,76 @@ fn commit_consume_removes_the_source_under_a_pruned_walk_root_with_base() {
         listing("seed"),
         "the commit is not the base"
     );
-    assert!(!src.exists(), "the pruned run left the source behind");
+    assert!(
+        src.join("x").exists() && src.join("sub/y").exists(),
+        "the pruned run removed a part of the source"
+    );
+}
+
+/// `commit --consume` does not open or remove an entry that `--skip-list`
+/// names. The entry stays, and each directory that holds it stays, the source
+/// directory included. The command removes each other entry and exits 0, also
+/// where the skipped entry does not open.
+#[test]
+fn commit_consume_keeps_the_entries_that_the_skip_list_names() {
+    let tmp = TmpDir::new("commit-consume-skip");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let src = base.join("src");
+    for dir in ["sub/locked", "other", "gone"] {
+        std::fs::create_dir_all(src.join(dir)).unwrap();
+    }
+    for file in [
+        "x",
+        "sub/y",
+        "sub/locked/inner",
+        "other/skip.txt",
+        "other/b",
+        "gone/w",
+    ] {
+        std::fs::write(src.join(file), file).unwrap();
+    }
+    let locked = src.join("sub/locked");
+    let _restore = RestoreModes(vec![(locked.clone(), 0o755)]);
+    chmod_to(&locked, 0o000);
+    let skip_list = base.join("skip-list");
+    std::fs::write(&skip_list, "/sub/locked\n/other/skip.txt\n").unwrap();
+    let skip_arg = format!("--skip-list={}", skip_list.display());
+    let src_arg = format!("--tree=dir={}", src.display());
+    let run = ostrya(
+        &[
+            &repo_arg,
+            "commit",
+            "-b",
+            "skipped",
+            FIXED_TIMESTAMP,
+            "--consume",
+            &skip_arg,
+            &src_arg,
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "the run did not exit 0:\n{}",
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let names = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names(&src), ["other", "sub"]);
+    assert_eq!(names(&src.join("sub")), ["locked"]);
+    assert_eq!(names(&src.join("other")), ["skip.txt"]);
+    chmod_to(&locked, 0o755);
+    assert_eq!(names(&locked), ["inner"]);
 }
 
 /// A second ed25519 sign fixture, so that a run with two keys shows an order.

@@ -1358,13 +1358,21 @@ the path text is exactly `.` (`commit_consume_matches_the_tool` in
 - A run under `--skip-if-unchanged` that writes no commit. The port removes no
   source (`commit_consume_with_skip_if_unchanged_keeps_the_source`). Not
   observed: the tool in this case.
+- A path that `--skip-list` names. The tool removes it with the rest of the
+  source. The port does not open or remove it, and it keeps each directory
+  that holds it, the source directory included. Both write the same commit
+  (`commit_consume_matches_the_tool`,
+  `commit_consume_keeps_the_entries_that_the_skip_list_names`, and
+  `commit_consume_keeps_a_deep_skipped_tree`). A skip list that holds `/`
+  keeps the whole source in the port
+  (`commit_consume_keeps_the_source_under_a_pruned_walk_root_with_base`).
 
 The walk of a filesystem source carries divergences apart from the seven
-above: the wording of each refusal of an entry, and two outcomes. The walk
+above: the wording of each refusal of an entry, and one outcome. The walk
 reads each entry with `fstatat` and checks its type ahead of `--skip-list` in
-both implementations, and it opens an entry after that check
-(`cli-behavior.md`, "CLI output formats", `commit`, "The walk of a filesystem
-source"). Both refuse a fifo and a unix socket at
+both implementations, and it opens an entry and reads its xattrs only after
+the skip list keeps it (`cli-behavior.md`, "CLI output formats", `commit`,
+"The walk of a filesystem source"). Both refuse a fifo and a unix socket at
 exit 1, with no object and no ref, and a skip list that names the entry does
 not prevent the refusal. Both refuse a regular file or a directory that does
 not open, and an entry of a directory at mode 0644, whose `fstatat` fails. The
@@ -1375,7 +1383,14 @@ reports `i/o error: Permission denied (os error 13)` and `unsupported:
 unsupported file type for entry "<name>"`. The walk root that does not open
 reads `opendir(<path>): Permission denied` in both. Observed with `ostree`
 2026.1 as uid 1000 in `archive`, `bare`, `bare-user`, and `bare-user-only`.
-Two outcomes part:
+A skip list that names a regular file or a directory that does not open gives
+a commit at exit 0 in both, with the same commit checksum, with and without
+`--no-xattrs`. The checked entries are a file at mode 0000, an empty file at
+mode 0000, a file at mode 0200, a directory at mode 0000, a directory at mode
+0311, and a directory at mode 0644, in `archive`, `bare-user`, and
+`bare-user-only`
+(`commit_skip_list_of_an_entry_that_does_not_open_matches_the_tool`). One
+outcome parts:
 
 - a symlink whose target is not valid UTF-8. The tool commits it at exit 0,
   writes GLib criticals to standard error, two in `archive` and one in `bare`,
@@ -1387,22 +1402,17 @@ Two outcomes part:
   UTF-8` at exit 1 and writes no object and no ref. This is the rule "refuse
   rather than reinterpret": the file header stores the target as a GVariant
   string, and the port does not store a value of its own in place of the
-  target. No matrix cell states the case;
-- a skip list that names a regular file or a directory that does not open. The
-  tool does not open the entry and commits the tree without it. Without
-  `--no-xattrs` the port reads the xattrs of each entry when it lists the
-  directory, ahead of the skip list. That read opens the entry, so it fails, and
-  the port refuses at exit 1 with no object and no ref. With `--no-xattrs` the
-  port commits, and the commit checksum equals the tool's. This is a defect of
-  the port, and no matrix cell states it yet.
+  target. No matrix cell states the case.
 
-The port lists a whole directory before it enters a subdirectory. The walk of
-the tool enters a subdirectory when it reaches it (`cli-behavior.md`, "CLI
-output formats", `commit`, "The walk of a filesystem source"). So over a tree
-with more than one failing entry, the two can report different entries.
-The port reports an entry that does not open with `error: i/o error: <reason>
-(os error <n>)`, which names no path. A directory at mode 0644 opens, so a skip
-list that names one gives a commit in both.
+The port reads the `fstatat` and checks the type of each entry of a directory
+before it opens the first entry or enters a subdirectory. The walk of the tool
+does all steps for one entry, and enters a subdirectory when it reaches it
+(`cli-behavior.md`, "CLI output formats", `commit`, "The walk of a filesystem
+source"). The port opens the entries in the order of the walk of the tool. So
+over a tree with more than one failing entry, the two can report different
+entries only where an `fstatat` failure or a type refusal is one of them. The
+port reports an entry that does not open with `error: i/o error: <reason> (os
+error <n>)`, which names no path.
 
 The one divergence the four Phase 17c options carry sits at the values
 `--timestamp` takes. The tool reads a date with a full natural-language reader:
@@ -1710,8 +1720,9 @@ not. Nine divergences stand:
     directory holding one regular file the removal fails and the tool reports
     `error: unlinkat(<path>): Directory not empty`, where the port reports the
     empty tree; both leave the tree and its content in place. Under `--base` the
-    port writes the commit the base states and then removes the whole source
-    (`commit_consume_removes_the_source_under_a_pruned_walk_root_with_base`),
+    port writes the commit the base states and keeps the whole source, because
+    its removal keeps each path the skip list names
+    (`commit_consume_keeps_the_source_under_a_pruned_walk_root_with_base`),
     where the tool attempts the removal of the source directory alone.
   - Over `--tree=tar=<path>` the tool reads the stream, the archive format being
     detected only by the read the pruned walk skips. A file that is not an

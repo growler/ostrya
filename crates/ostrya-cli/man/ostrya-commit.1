@@ -202,7 +202,7 @@ No modifiers apply to the base. The base is the bottom layer at any position on 
 \fB\-\-consume\fR
 Remove each directory source after the commit.
 .IP
-The command first writes the commit and the refs, and prints its output. Then it removes each \fB\%dir=\fR source and PATH, with all files in it. This includes the entries that \%\-\-skip\-list prunes. If the last component of the path is \fB\%\&.\fR, for example \fB\%\&.\fR, \fB\%\&./\fR, or \fB\%a/.\fR, the command removes the contents and keeps the directory. A \fB\%tar\fR or \fB\%ref\fR source ignores this switch. If the command writes no commit, it removes no source. If a removal fails, the command prints the path and the error, removes the other sources, and exits \%1. The commit and the refs stay.
+The command first writes the commit and the refs, and prints its output. Then it removes each \fB\%dir=\fR source and PATH, with all files in it. The command does not open or remove an entry that \%\-\-skip\-list names, and it keeps each directory that holds such an entry. A line \fB\%/\fR keeps the whole source. If the last component of the path is \fB\%\&.\fR, for example \fB\%\&.\fR, \fB\%\&./\fR, or \fB\%a/.\fR, the command removes the contents and keeps the directory. A \fB\%tar\fR or \fB\%ref\fR source ignores this switch. If the command writes no commit, it removes no source. If a removal fails, the command prints the path and the error, removes the other sources, and exits \%1. The commit and the refs stay.
 .TP
 \fB\-\-tar\-autocreate\-parents\fR
 Create the missing parent directories of the members of a tar archive.

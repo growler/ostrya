@@ -1337,13 +1337,14 @@ struct CommitArgs {
     ///
     /// The command first writes the commit and the refs, and prints its
     /// output. Then it removes each `dir=` source and PATH, with all files in
-    /// it. This includes the entries that --skip-list prunes. If the last
-    /// component of the path is `.`, for example `.`, `./`, or `a/.`, the
-    /// command removes the contents and keeps the directory. A `tar` or `ref`
-    /// source ignores this switch. If the command writes no commit, it removes
-    /// no source. If a removal fails, the command prints the path and the
-    /// error, removes the other sources, and exits 1. The commit and the refs
-    /// stay.
+    /// it. The command does not open or remove an entry that --skip-list
+    /// names, and it keeps each directory that holds such an entry. A line `/`
+    /// keeps the whole source. If the last component of the path is `.`, for
+    /// example `.`, `./`, or `a/.`, the command removes the contents and keeps
+    /// the directory. A `tar` or `ref` source ignores this switch. If the
+    /// command writes no commit, it removes no source. If a removal fails, the
+    /// command prints the path and the error, removes the other sources, and
+    /// exits 1. The commit and the refs stay.
     #[arg(long)]
     consume: bool,
     /// Create the missing parent directories of the members of a tar archive.
@@ -6996,7 +6997,7 @@ async fn push_tree(
     print_server_commit(verbose, outcome)?;
     // The output comes first, and then the removal. A failed removal exits 1,
     // and the commit and the refs stay.
-    if args.consume && !remove_consumed_sources(&[dir]).await {
+    if args.consume && !remove_consumed_sources(&[dir], Arc::default()).await {
         exit_process(1);
     }
     Ok(())
@@ -9804,8 +9805,9 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     let mut consumed: Vec<PathBuf> = Vec::new();
     for spec in specs {
         let source = refuse!(open_tree_source(&repo, spec).await?);
-        // The path is kept before the test for a pruned walk root. A commit
-        // over `--base` then still removes the whole source.
+        // The path is kept before the test for a pruned walk root. The
+        // removal keeps each entry that the skip list names, so a pruned walk
+        // root keeps the whole source.
         if args.consume
             && let OpenSource::Dir(_, path) = &source
         {
@@ -10016,7 +10018,8 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // failed removal or a failed summary exits 1, and the commit and the refs
     // stay. A tag is a local ref or a collection ref, and a summary lists
     // both. A remote branch alone changes no ref that a summary lists.
-    let removed = remove_consumed_sources(&consumed).await;
+    let keep = Arc::new(walk.skip_list.iter().cloned().collect());
+    let removed = remove_consumed_sources(&consumed, keep).await;
     let listed = !args.tags.is_empty()
         || args
             .branch
@@ -11263,17 +11266,20 @@ async fn overlay_source(
 /// Removes each source of `commit --consume`, in order, after the commit, or
 /// DIR of `push-tree --consume` after the push.
 ///
-/// A path is read against the working directory. If a removal fails, the
-/// function prints the path and the error, and goes on with the next path.
-/// It returns `false` if a removal failed.
-async fn remove_consumed_sources<P: AsRef<Path>>(paths: &[P]) -> bool {
+/// A path is read against the working directory. The removal of each path
+/// keeps the entries whose in-tree paths `keep` names, and the directories
+/// that hold them. If a removal fails, the function prints the path and the
+/// error, and goes on with the next path. It returns `false` if a removal
+/// failed.
+async fn remove_consumed_sources<P: AsRef<Path>>(paths: &[P], keep: Arc<HashSet<String>>) -> bool {
     if paths.is_empty() {
         return true;
     }
     let mut removed = true;
     for path in paths {
         let path = path.as_ref();
-        if let Err(err) = ostrya::remove_source_tree(rustix::fs::CWD, path).await {
+        if let Err(err) = ostrya::remove_source_tree(rustix::fs::CWD, path, Arc::clone(&keep)).await
+        {
             eprintln!("error: {}: {}", path.display(), error_line(&err));
             removed = false;
         }

@@ -5,12 +5,14 @@
 //! `Transaction::overlay_tree_to_mtree` hold the behavior that a caller sees.
 //! The object writers are in `write.rs`.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::future::Future;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 
 use ostrya_core::{DirMeta, RepoMode, Xattrs};
 use ostrya_rt::FileReader;
@@ -59,24 +61,35 @@ impl Transaction {
     ///
     /// 1. The [`CANONICAL_PERMISSIONS`](CommitModifierFlags::CANONICAL_PERMISSIONS)
     ///    reduction: owner 0:0, no xattrs, and `perm & 0o755` on a regular
-    ///    file or a directory. A symlink keeps its mode.
+    ///    file or a directory. A symlink keeps its mode. The walk reads no
+    ///    xattrs from the disk.
     /// 2. [`SKIP_XATTRS`](CommitModifierFlags::SKIP_XATTRS): the walk reads no
     ///    xattrs from the disk, and the entry has no xattrs.
     /// 3. The declared ownership (`owner_uid` and `owner_gid`).
-    /// 4. The filter. It gets the metadata of steps 1 to 3. If it returns
-    ///    [`FilterResult::Skip`] for a directory, the walk skips the whole
-    ///    subtree.
-    /// 5. The mode callback.
-    /// 6. The `CANONICAL_PERMISSIONS` reduction again, on the mode that the
+    /// 4. The filter. It gets the metadata of steps 1 to 3 with no xattrs,
+    ///    because the walk reads the xattrs after the filter. If it returns
+    ///    [`FilterResult::Skip`], the walk does not open the entry. For a
+    ///    directory, the walk skips the whole subtree.
+    /// 5. If the filter keeps a regular file or a directory, the walk opens
+    ///    it. Unless step 1 or 2 applies, the walk reads the xattrs of the
+    ///    entry. For a symlink, it reads them from the link. The walk does
+    ///    not open an entry that the devino cache finds, and it does not read
+    ///    the xattrs of that entry from the disk.
+    /// 6. The mode callback.
+    /// 7. The `CANONICAL_PERMISSIONS` reduction again, on the mode that the
     ///    callback returns. The file type stays the type that the walk found.
     ///    A symlink keeps its mode.
-    /// 7. The xattr callback.
-    /// 8. The SELinux label callback. The walk drops the `security.selinux`
+    /// 8. The xattr callback.
+    /// 9. The SELinux label callback. The walk drops the `security.selinux`
     ///    xattr of the entry, then adds the label that the callback returns.
     ///    If the callback returns no label, the entry has no label.
     ///
-    /// Steps 5 to 8 run only for an entry that the filter keeps. The walk root
-    /// goes through each step except the filter.
+    /// Steps 5 to 9 run only for an entry that the filter keeps. The walk root
+    /// goes through each step except the filter. The `statat`, the type
+    /// check, and the read of a symlink target come before the filter, so a
+    /// skipped FIFO or socket still causes an error, and so does a skipped
+    /// entry whose `statat` fails. A skipped entry that the walk cannot open
+    /// or whose xattrs it cannot read does not cause an error.
     ///
     /// If the modifier holds a [`DevInoCache`](crate::DevInoCache), the walk
     /// looks up each regular file and symlink in it, and never a directory.
@@ -89,9 +102,10 @@ impl Transaction {
     /// # Consume
     ///
     /// Under [`CONSUME`](CommitModifierFlags::CONSUME), the walk removes each
-    /// source entry after it records the entry. It also removes each entry
-    /// that the filter skips, with its whole subtree. Then the call removes the
-    /// walk root.
+    /// source entry after it records the entry, and each directory after it
+    /// records the directory. Then the call removes the walk root. The walk
+    /// does not open or remove an entry that the filter skips. That entry
+    /// stays, and each directory that holds it stays, the walk root included.
     ///
     /// The test for the walk root is on the bytes of `path`. If `path` is
     /// exactly `.`, the call keeps the root. For each other spelling, `./`
@@ -100,11 +114,14 @@ impl Transaction {
     /// # File system access
     ///
     /// The walk reads each directory in one pass on the blocking pool. The pass
-    /// reads the entry list, the `statat` of each entry, the xattrs, and the
-    /// symlink targets. The walk reads the xattrs of a symlink from the link itself. The
-    /// calls that open and remove entries run on the calling task.
-    /// The walk holds at most two directory descriptors at a time, at any
-    /// depth of the source.
+    /// reads the entry list, the `statat` of each entry, the symlink targets,
+    /// and the xattrs of the directory itself. The pass opens no entry. The
+    /// walk opens an entry only after the filter keeps it, and the calls that
+    /// open and remove entries run on the calling task. The walk reads the
+    /// xattrs of a regular file from the descriptor that it opens for the
+    /// content, and the xattrs of a symlink from the link itself. A
+    /// subdirectory gives its xattrs in its own pass. The walk holds at most
+    /// two directory descriptors at a time, at any depth of the source.
     ///
     /// # Errors
     ///
@@ -163,9 +180,9 @@ impl Transaction {
         // The walk root asks for no parent descriptor. The directory above it
         // can be unreadable or outside the tree that the caller names. A
         // failure to open it then fails a commit that works otherwise.
-        walk_dir(self, root_fd, mtree, modifier, "/".to_owned(), None, false).await?;
+        let walked = walk_dir(self, root_fd, mtree, modifier, "/".to_owned(), false).await?;
 
-        if flags.contains(CommitModifierFlags::CONSUME) {
+        if flags.contains(CommitModifierFlags::CONSUME) && !walked.skipped {
             remove_walk_root(dfd, path);
         }
         Ok(())
@@ -190,11 +207,13 @@ impl Transaction {
     ///
     /// If `modifier` is set, the merge reads each entry and applies the steps
     /// of the modifier to its metadata, in the order that
-    /// [`write_dfd_to_mtree`](Transaction::write_dfd_to_mtree) states. If the
-    /// result differs from the stored metadata, the merge writes a new object
-    /// from the stored payload. Otherwise it records the stored checksum. The
-    /// merge does not use `CONSUME`, `GENERATE_SIZES`, `DEVINO_CANONICAL`, or
-    /// the devino cache.
+    /// [`write_dfd_to_mtree`](Transaction::write_dfd_to_mtree) states. The
+    /// xattrs come from the stored object before the filter, so the filter
+    /// gets the xattrs that steps 1 to 3 leave. If the result differs from
+    /// the stored metadata, the merge writes a new object from the stored
+    /// payload. Otherwise it records the stored checksum. The merge does not
+    /// use `CONSUME`, `GENERATE_SIZES`, `DEVINO_CANONICAL`, or the devino
+    /// cache.
     ///
     /// The transaction can write `ostree.sizes` in an `archive` repository
     /// after a call to [`begin_tree_source`](Transaction::begin_tree_source).
@@ -422,7 +441,6 @@ struct EntryInfo {
     /// The `st_size` that the walk read. It limits the read-ahead of a regular
     /// file.
     size: u64,
-    xattrs: Xattrs,
 }
 
 /// The kind of object that an entry becomes.
@@ -433,6 +451,9 @@ enum EntryKind {
 }
 
 /// The metadata of a directory and its entries, read in one blocking pass.
+///
+/// The xattrs are the xattrs of the directory itself. The pass reads no xattrs
+/// of an entry.
 struct DirSnapshot {
     uid: u32,
     gid: u32,
@@ -446,19 +467,30 @@ struct DirSnapshot {
 /// Async recursion needs indirection, so each level returns a boxed future.
 type WalkFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
+/// The result of one level of the file system walk.
+struct WalkedDir {
+    /// The descriptor of the parent directory, if the caller asks for it.
+    parent: Option<OwnedFd>,
+    /// `true` if the filter skipped an entry in the directory or below it.
+    /// A consuming walk then keeps the directory.
+    skipped: bool,
+}
+
 /// The boxed future of one level of the file system walk.
-///
-/// If the caller asks for the descriptor of the parent directory, the result
-/// holds it. Otherwise the result is `None`.
-type WalkDirFuture<'a> = Pin<Box<dyn Future<Output = Result<Option<OwnedFd>>> + Send + 'a>>;
+type WalkDirFuture<'a> = Pin<Box<dyn Future<Output = Result<WalkedDir>> + Send + 'a>>;
 
 /// Ingests one directory: writes its dirmeta onto `node`, then ingests each
 /// entry.
 ///
-/// `dir_meta` holds the fully adjusted metadata of this directory. The parent
-/// computes it once, so the user callbacks run once for each directory. It is
-/// `None` only for the walk root, which has no parent. The function adjusts
-/// the metadata of the walk root itself.
+/// The function reads the metadata and the xattrs of the directory from
+/// `dir_fd`, and runs the user callbacks for the directory before it ingests
+/// the entries. Thus the callbacks run once for each directory, and before the
+/// callbacks of its entries. The parent gives the filter the metadata of the
+/// directory, with no xattrs, before it opens the directory.
+///
+/// For each entry, the function applies the filter before it opens the entry
+/// or reads its xattrs. It never opens or removes an entry that the filter
+/// skips.
 ///
 /// If `needs_parent` is set, the function closes `dir_fd` and returns the
 /// descriptor of the directory above, opened through `..`. This keeps the walk
@@ -469,7 +501,6 @@ fn walk_dir<'a>(
     node: &'a mut MutableTree,
     mut modifier: Option<&'a mut CommitModifier>,
     path: String,
-    dir_meta: Option<FileMeta>,
     needs_parent: bool,
 ) -> WalkDirFuture<'a> {
     Box::pin(async move {
@@ -478,35 +509,32 @@ fn walk_dir<'a>(
             .as_deref()
             .map_or(CommitModifierFlags::empty(), |m| m.flags);
         let owner = Owner::of(modifier.as_deref());
-        let skip_xattrs = flags.contains(CommitModifierFlags::SKIP_XATTRS);
+        // Each of the two flags empties the xattr set in `adjust_meta`, so the
+        // walk reads no xattrs under either.
+        let read_xattrs = !flags.contains(CommitModifierFlags::SKIP_XATTRS)
+            && !flags.contains(CommitModifierFlags::CANONICAL_PERMISSIONS);
 
         // The large work of each directory runs on the blocking pool in one
         // pass.
         let snap = {
             let dir = dir_fd.as_fd().try_clone_to_owned()?;
-            ostrya_rt::unblock(move || snapshot_dir(dir.as_fd(), skip_xattrs)).await?
+            ostrya_rt::unblock(move || snapshot_dir(dir.as_fd(), read_xattrs)).await?
         };
 
-        // The metadata of this directory becomes the dirmeta of `node`. The
-        // walk root is adjusted here. A nested directory uses the metadata
-        // that its parent computed.
-        let dir_meta = match dir_meta {
-            Some(m) => m,
-            None => {
-                let base = FileMeta {
-                    uid: snap.uid,
-                    gid: snap.gid,
-                    mode: snap.mode,
-                    xattrs: snap.xattrs,
-                };
-                let adjusted = adjust_meta(flags, owner, base, false);
-                finalize_meta(modifier.as_deref_mut(), Path::new(&path), adjusted)?
-            }
+        // The metadata of this directory becomes the dirmeta of `node`.
+        let base = FileMeta {
+            uid: snap.uid,
+            gid: snap.gid,
+            mode: snap.mode,
+            xattrs: snap.xattrs,
         };
+        let adjusted = adjust_meta(flags, owner, base, false);
+        let dir_meta = finalize_meta(modifier.as_deref_mut(), Path::new(&path), adjusted)?;
         let dirmeta = txn.write_dirmeta(&to_dirmeta(&dir_meta)).await?;
         node.set_metadata_checksum(dirmeta);
 
         let consume = flags.contains(CommitModifierFlags::CONSUME);
+        let mut skipped = false;
 
         for entry in snap.entries {
             let cb_path = join_path(&path, &entry.name);
@@ -529,13 +557,14 @@ fn walk_dir<'a>(
             }
 
             // The canonical permissions cost little and are deterministic, and
-            // the filter gets them. The user callbacks run only for the entries
-            // that the filter keeps.
+            // the filter gets them. The walk has not opened the entry yet, so
+            // the filter gets no xattrs from the disk. The user callbacks run
+            // only for the entries that the filter keeps.
             let base = FileMeta {
                 uid: entry.uid,
                 gid: entry.gid,
                 mode: entry.mode,
-                xattrs: entry.xattrs,
+                xattrs: Xattrs::empty(),
             };
             let filter_meta = adjust_meta(flags, owner, base, is_symlink);
 
@@ -544,21 +573,10 @@ fn walk_dir<'a>(
                 && filter(Path::new(&cb_path), &filter_meta) == FilterResult::Skip
             {
                 txn.note_filtered();
-                // A consuming walk empties the source, also the entries that
-                // the filter keeps out of the commit. If a skipped entry
-                // stays, the source stays half removed, and the removal of its
-                // directory fails.
-                if consume {
-                    if matches!(entry.kind, EntryKind::Dir) {
-                        // A subtree can be large, so its removal runs on the
-                        // blocking pool with a copy of the descriptor.
-                        let level = dir_fd.try_clone()?;
-                        let name = entry.name;
-                        ostrya_rt::unblock(move || remove_tree(level.as_fd(), &name)).await?;
-                    } else {
-                        unlink(dir_fd.as_fd(), &entry.name, false)?;
-                    }
-                }
+                // The walk does not open or remove a skipped entry, also under
+                // CONSUME. A consuming walk then keeps each directory that
+                // holds the entry.
+                skipped = true;
                 continue;
             }
 
@@ -587,14 +605,17 @@ fn walk_dir<'a>(
 
             match entry.kind {
                 EntryKind::Regular => {
-                    let meta =
-                        finalize_meta(modifier.as_deref_mut(), Path::new(&cb_path), filter_meta)?;
                     let fd = rustix::fs::openat(
                         dir_fd.as_fd(),
                         entry.name.as_str(),
                         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                         Mode::empty(),
                     )?;
+                    let mut meta = filter_meta;
+                    if read_xattrs {
+                        meta.xattrs = read_all_xattrs(fd.as_fd())?;
+                    }
+                    let meta = finalize_meta(modifier.as_deref_mut(), Path::new(&cb_path), meta)?;
                     let reader = FileReader::with_len_hint(fd.into(), entry.size);
                     let checksum = txn.write_content(None, &meta, reader).await?;
                     node.replace_file(&entry.name, checksum)?;
@@ -603,8 +624,14 @@ fn walk_dir<'a>(
                     }
                 }
                 EntryKind::Symlink(target) => {
-                    let meta =
-                        finalize_meta(modifier.as_deref_mut(), Path::new(&cb_path), filter_meta)?;
+                    let mut meta = filter_meta;
+                    if read_xattrs {
+                        // A symlink gives no descriptor, so the walk reads the
+                        // xattrs of the link itself by its name.
+                        let name = Path::new(&entry.name);
+                        meta.xattrs = utf8_names(link_xattrs_at(dir_fd.as_fd(), name)?)?;
+                    }
+                    let meta = finalize_meta(modifier.as_deref_mut(), Path::new(&cb_path), meta)?;
                     let checksum = txn.write_symlink(&target, &meta, None).await?;
                     node.replace_file(&entry.name, checksum)?;
                     if consume {
@@ -612,8 +639,6 @@ fn walk_dir<'a>(
                     }
                 }
                 EntryKind::Dir => {
-                    let meta =
-                        finalize_meta(modifier.as_deref_mut(), Path::new(&cb_path), filter_meta)?;
                     let child_fd = rustix::fs::openat(
                         dir_fd.as_fd(),
                         entry.name.as_str(),
@@ -626,18 +651,15 @@ fn walk_dir<'a>(
                     // The walk holds at most two directory descriptors at a
                     // time, at any depth below it.
                     drop(dir_fd);
-                    let parent = walk_dir(
-                        txn,
-                        child_fd,
-                        child,
-                        modifier.as_deref_mut(),
-                        cb_path,
-                        Some(meta),
-                        true,
-                    )
-                    .await?;
-                    dir_fd = parent.expect("the descent was asked for the parent descriptor");
-                    if consume {
+                    let walked =
+                        walk_dir(txn, child_fd, child, modifier.as_deref_mut(), cb_path, true)
+                            .await?;
+                    dir_fd = walked
+                        .parent
+                        .expect("the descent was asked for the parent descriptor");
+                    if walked.skipped {
+                        skipped = true;
+                    } else if consume {
                         unlink(dir_fd.as_fd(), &entry.name, true)?;
                     }
                 }
@@ -645,11 +667,17 @@ fn walk_dir<'a>(
         }
 
         if !needs_parent {
-            return Ok(None);
+            return Ok(WalkedDir {
+                parent: None,
+                skipped,
+            });
         }
         let parent = open_dir(dir_fd.as_fd(), "..")?;
         drop(dir_fd);
-        Ok(Some(parent))
+        Ok(WalkedDir {
+            parent: Some(parent),
+            skipped,
+        })
     })
 }
 
@@ -872,14 +900,15 @@ pub(crate) fn to_dirmeta(meta: &FileMeta) -> DirMeta {
 /// Reads the metadata of a directory and all of its entries in one blocking
 /// pass.
 ///
-/// If `skip_xattrs` is not set, the function reads the xattrs of each entry.
-/// It reads the xattrs of a symlink with no-follow, from the link itself.
-fn snapshot_dir(dir: BorrowedFd<'_>, skip_xattrs: bool) -> Result<DirSnapshot> {
+/// If `read_xattrs` is set, the function reads the xattrs of the directory
+/// from `dir`. It reads no xattrs of an entry, and it opens no entry. For each
+/// entry, it reads the `statat` and the target of a symlink.
+fn snapshot_dir(dir: BorrowedFd<'_>, read_xattrs: bool) -> Result<DirSnapshot> {
     let stat = rustix::fs::fstat(dir)?;
-    let dir_xattrs = if skip_xattrs {
-        Xattrs::empty()
-    } else {
+    let dir_xattrs = if read_xattrs {
         read_all_xattrs(dir)?
+    } else {
+        Xattrs::empty()
     };
 
     let mut entries = Vec::new();
@@ -913,12 +942,6 @@ fn snapshot_dir(dir: BorrowedFd<'_>, skip_xattrs: bool) -> Result<DirSnapshot> {
             }
         };
 
-        let xattrs = if skip_xattrs {
-            Xattrs::empty()
-        } else {
-            read_entry_xattrs(dir, name.as_str(), &kind)?
-        };
-
         entries.push(EntryInfo {
             name,
             kind,
@@ -928,7 +951,6 @@ fn snapshot_dir(dir: BorrowedFd<'_>, skip_xattrs: bool) -> Result<DirSnapshot> {
             gid: stat.st_gid,
             mode: stat.st_mode,
             size: stat.st_size as u64,
-            xattrs,
         });
     }
 
@@ -939,21 +961,6 @@ fn snapshot_dir(dir: BorrowedFd<'_>, skip_xattrs: bool) -> Result<DirSnapshot> {
         xattrs: dir_xattrs,
         entries,
     })
-}
-
-/// Reads the xattrs of an entry, no-follow.
-///
-/// The function opens a regular file or a directory and reads from its fd. A
-/// symlink cannot give an fd, so the function reads its xattrs with the
-/// path-based no-follow reader.
-fn read_entry_xattrs(dir: BorrowedFd<'_>, name: &str, kind: &EntryKind) -> Result<Xattrs> {
-    let oflags = match kind {
-        EntryKind::Regular => OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        EntryKind::Dir => OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        EntryKind::Symlink(_) => return utf8_names(link_xattrs_at(dir, Path::new(name))?),
-    };
-    let fd = rustix::fs::openat(dir, name, oflags, Mode::empty())?;
-    read_all_xattrs(fd.as_fd())
 }
 
 /// Opens the walk root relative to `dfd`.
@@ -980,6 +987,9 @@ fn open_walk_root(dfd: BorrowedFd<'_>, path: &Path) -> Result<OwnedFd> {
 /// function keeps the root. It removes the root for each other spelling, `./`
 /// included. This is the rule of `ostree commit --consume`.
 ///
+/// The walk does not call the function if the filter skipped an entry. The
+/// walk root then holds that entry, or a directory that holds it, and stays.
+///
 /// The CLI does not set `CONSUME`. It removes each source after the commit
 /// with [`remove_source_tree`], so this function runs only for a caller of the
 /// library API. The function ignores a failed removal for these reasons:
@@ -994,7 +1004,8 @@ fn remove_walk_root(dfd: BorrowedFd<'_>, path: &Path) {
     let _ = rustix::fs::unlinkat(dfd, path, AtFlags::REMOVEDIR);
 }
 
-/// Removes the source tree at `path` under `dfd`, with all entries in it.
+/// Removes the source tree at `path` under `dfd`, with all entries in it,
+/// except the entries that `keep` names.
 ///
 /// A caller calls this function after the commit of a directory source, so
 /// that the source stays in place if the commit fails. The commit does not
@@ -1014,6 +1025,19 @@ fn remove_walk_root(dfd: BorrowedFd<'_>, path: &Path) {
 /// at `path` gives an error, and the function removes nothing. The function
 /// removes a symlink in the tree and does not follow it. If nothing is at
 /// `path`, the function returns `Ok(())`, because nothing is left to remove.
+///
+/// # Kept entries
+///
+/// Each item of `keep` is an in-tree path, as the filter of
+/// [`Transaction::write_dfd_to_mtree`](crate::Transaction::write_dfd_to_mtree)
+/// gets it: `/` for the directory at `path`, and `/a/b` for the entry `b` in
+/// its subdirectory `a`. The test is on the exact bytes. The function does not
+/// open, read, or remove an entry that `keep` names, and it keeps each
+/// directory that holds such an entry, the directory at `path` included. A
+/// directory that `keep` names stays with its whole subtree. If `keep` holds
+/// `/`, the function changes nothing and returns `Ok(())`. An item that names
+/// no entry has no effect. The set is shared, so a caller can build it once
+/// and give a clone of the [`Arc`] to each call.
 ///
 /// # File system access
 ///
@@ -1047,13 +1071,24 @@ fn remove_walk_root(dfd: BorrowedFd<'_>, path: &Path) {
 ///
 /// ```no_run
 /// # async fn run() -> ostrya::Result<()> {
+/// use std::collections::HashSet;
 /// use std::os::fd::AsFd;
+/// use std::sync::Arc;
 ///
 /// let cwd = std::fs::File::open(".")?;
-/// ostrya::remove_source_tree(cwd.as_fd(), "src".as_ref()).await?;
+/// // Remove `src` and keep `src/cache` with its subtree.
+/// let keep = Arc::new(HashSet::from(["/cache".to_owned()]));
+/// ostrya::remove_source_tree(cwd.as_fd(), "src".as_ref(), keep).await?;
 /// # Ok(()) }
 /// ```
-pub async fn remove_source_tree(dfd: BorrowedFd<'_>, path: &Path) -> Result<()> {
+pub async fn remove_source_tree(
+    dfd: BorrowedFd<'_>,
+    path: &Path,
+    keep: Arc<HashSet<String>>,
+) -> Result<()> {
+    if keep.contains("/") {
+        return Ok(());
+    }
     // `AT_FDCWD` is not a descriptor, so it has no copy. It is valid on each
     // thread, so the closure uses it as it is.
     let copy = if dfd.as_raw_fd() == rustix::fs::CWD.as_raw_fd() {
@@ -1082,7 +1117,7 @@ pub async fn remove_source_tree(dfd: BorrowedFd<'_>, path: &Path) -> Result<()> 
             Err(Errno::NOENT) => return Ok(()),
             Err(err) => return Err(unlink_error(root, err)),
         };
-        remove_opened_tree(dir, level, root, keep_root)
+        remove_opened_tree(dir, level, root, keep_root, &keep)
     })
     .await
 }
@@ -1101,18 +1136,12 @@ fn unlink(dir: BorrowedFd<'_>, name: &(impl AsRef<Path> + ?Sized), is_dir: bool)
     rustix::fs::unlinkat(dir, name.as_ref(), flags).map_err(|err| unlink_error(name, err))
 }
 
-/// Removes the directory `name` under `dir` and all entries below it.
-///
-/// A consuming walk uses it for a directory that the filter keeps out of the
-/// commit. The walk does not visit the children of such an entry, so it does
-/// not remove them one by one.
-fn remove_tree(dir: BorrowedFd<'_>, name: &str) -> Result<()> {
-    let level = open_dir(dir, name).map_err(|err| unlink_error(name, err))?;
-    remove_opened_tree(dir, level, Path::new(name), false)
-}
-
 /// Removes all entries below `name` under `dir`, and then `name` itself
 /// unless `keep_root` is set. `level` is the open descriptor of `name`.
+///
+/// The function does not touch an entry whose in-tree path is in `keep`, and
+/// it keeps each directory that holds such an entry, `name` included. The
+/// in-tree path of `name` is `/`.
 ///
 /// The removal is a loop over an explicit stack of levels. The descriptor of
 /// the current level is open, and at most one more for a short time. A
@@ -1131,28 +1160,37 @@ fn remove_opened_tree(
     level: OwnedFd,
     name: &Path,
     keep_root: bool,
+    keep: &HashSet<String>,
 ) -> Result<()> {
     let mut level = Dir::new(level).map_err(|err| unlink_error(name, err))?;
+    // The in-tree path of the current level: empty for `name`, then `/a`,
+    // `/a/b`, and so on.
+    let mut tree_path = String::new();
     // One entry for each level from `name` to the current level: the name of
-    // the level, and the names of the subdirectories left to remove in it.
-    let mut levels = vec![(name.to_owned(), clear_level(&mut level, name)?)];
+    // the level, the names of the subdirectories left to remove in it, and
+    // `true` if the level holds a kept entry.
+    let (subdirs, kept) = clear_level(&mut level, name, keep, &mut tree_path)?;
+    let mut levels = vec![(name.to_owned(), subdirs, kept)];
 
-    while let Some((_, subdirs)) = levels.last_mut() {
+    while let Some((_, subdirs, _)) = levels.last_mut() {
         let level_fd = level.fd().map_err(|err| unlink_error(name, err))?;
         match subdirs.pop() {
             Some(child) => {
                 let mut child_dir = open_dir(level_fd, &child)
                     .and_then(Dir::new)
                     .map_err(|err| unlink_error(&child, err))?;
-                let child_subdirs = clear_level(&mut child_dir, Path::new(&child))?;
+                tree_path.push('/');
+                tree_path.push_str(&child);
+                let (child_subdirs, child_kept) =
+                    clear_level(&mut child_dir, Path::new(&child), keep, &mut tree_path)?;
                 level = child_dir;
-                levels.push((PathBuf::from(child), child_subdirs));
+                levels.push((PathBuf::from(child), child_subdirs, child_kept));
             }
             None => {
-                let (cleared, _) = levels.pop().expect("a level is in hand within the loop");
+                let (cleared, _, kept) = levels.pop().expect("a level is in hand within the loop");
                 if levels.is_empty() {
                     drop(level);
-                    if keep_root {
+                    if keep_root || kept {
                         return Ok(());
                     }
                     return unlink(dir, &cleared, true);
@@ -1160,8 +1198,16 @@ fn remove_opened_tree(
                 level = open_dir(level_fd, "..")
                     .and_then(Dir::new)
                     .map_err(|err| unlink_error(&cleared, err))?;
-                let parent_fd = level.fd().map_err(|err| unlink_error(&cleared, err))?;
-                unlink(parent_fd, &cleared, true)?;
+                let cut = tree_path
+                    .rfind('/')
+                    .expect("a level below `name` has a path");
+                tree_path.truncate(cut);
+                if kept {
+                    levels.last_mut().expect("the parent level is in hand").2 = true;
+                } else {
+                    let parent_fd = level.fd().map_err(|err| unlink_error(&cleared, err))?;
+                    unlink(parent_fd, &cleared, true)?;
+                }
             }
         }
     }
@@ -1184,12 +1230,24 @@ fn open_dir(
 /// Reads one directory level, unlinks each entry that is not a directory when
 /// the read returns it, and returns the names of the subdirectories.
 ///
-/// `name` is the name of the level. The error of a failed read names it. The
-/// type comes from the directory entry. Only an entry of unknown type costs a
-/// `stat`. A name that is not valid UTF-8 stops the read with an error that
-/// names the entry, and the entry stays.
-fn clear_level(level: &mut Dir, name: &Path) -> Result<Vec<String>> {
+/// `name` is the name of the level, and `tree_path` is its in-tree path, empty
+/// for the root of the removal. The function uses `tree_path` as a buffer for
+/// the in-tree path of each entry, and gives it back with the value that it
+/// had. The error of a failed read names the level.
+/// The type comes from the directory entry. Only an entry of unknown type
+/// costs a `stat`. A name that is not valid UTF-8 stops the read with an error
+/// that names the entry, and the entry stays.
+///
+/// The function does not touch an entry whose in-tree path is in `keep`. The
+/// flag in the result is `true` if the level holds such an entry.
+fn clear_level(
+    level: &mut Dir,
+    name: &Path,
+    keep: &HashSet<String>,
+    tree_path: &mut String,
+) -> Result<(Vec<String>, bool)> {
     let mut subdirs = Vec::new();
+    let mut kept = false;
     while let Some(entry) = level.read() {
         let entry = entry.map_err(|err| unlink_error(name, err))?;
         let child_name = entry.file_name();
@@ -1202,6 +1260,17 @@ fn clear_level(level: &mut Dir, name: &Path) -> Result<Vec<String>> {
                 reason: "Name is not valid UTF-8".to_owned(),
             });
         };
+        if !keep.is_empty() {
+            let len = tree_path.len();
+            tree_path.push('/');
+            tree_path.push_str(child_str);
+            let named = keep.contains(tree_path.as_str());
+            tree_path.truncate(len);
+            if named {
+                kept = true;
+                continue;
+            }
+        }
         let level_fd = level.fd().map_err(|err| unlink_error(name, err))?;
         let child_is_dir = match entry.file_type() {
             FileType::Unknown => {
@@ -1218,7 +1287,7 @@ fn clear_level(level: &mut Dir, name: &Path) -> Result<Vec<String>> {
                 .map_err(|err| unlink_error(child_str, err))?;
         }
     }
-    Ok(subdirs)
+    Ok((subdirs, kept))
 }
 
 /// Returns the error of a failed removal: the name of the entry and the

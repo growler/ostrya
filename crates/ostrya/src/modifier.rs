@@ -54,8 +54,9 @@ impl CommitModifierFlags {
     ///
     /// Each entry gets owner 0:0 and no extended attributes. A regular file or
     /// a directory gets `perm & 0o755`, and a symlink keeps its mode. The walk
-    /// empties the xattr set before the callbacks run, so a callback can add to
-    /// it, as under [`SKIP_XATTRS`](CommitModifierFlags::SKIP_XATTRS).
+    /// reads no extended attributes from the disk. It empties the xattr set
+    /// before the callbacks run, so a callback can add to it, as under
+    /// [`SKIP_XATTRS`](CommitModifierFlags::SKIP_XATTRS).
     pub const CANONICAL_PERMISSIONS: CommitModifierFlags = CommitModifierFlags(1 << 2);
     /// The flag that makes a path with no label an error.
     ///
@@ -68,6 +69,10 @@ impl CommitModifierFlags {
     /// removes each directory that becomes empty, the walk root included.
     /// [`Transaction::write_dfd_to_mtree`](crate::Transaction::write_dfd_to_mtree)
     /// gives the rules for the walk root.
+    ///
+    /// The walk does not open or remove an entry that the filter skips. That
+    /// entry stays, and each directory that holds it stays, the walk root
+    /// included.
     ///
     /// To remove the source only after the commit, do not set this flag.
     /// Call [`remove_source_tree`](crate::remove_source_tree) after the
@@ -265,6 +270,9 @@ fn devino_cache_blocking(objects: &RepoDir) -> Result<DevInoCache> {
 }
 
 /// A synchronous filter over the ingested paths.
+///
+/// In a walk of a file system source, the metadata holds no xattrs.
+/// [`CommitModifier::filter`] gives the rules.
 pub type FilterFn = Box<dyn FnMut(&Path, &FileMeta) -> FilterResult + Send>;
 /// A synchronous callback that replaces the recorded `st_mode` of an entry.
 ///
@@ -308,6 +316,10 @@ pub struct CommitModifier {
     pub owner_gid: Option<u32>,
     /// A filter that the walk calls for each path to include or skip the
     /// entry.
+    ///
+    /// The walk of a file system source calls the filter before it opens the
+    /// entry. So the metadata that the filter gets holds no xattrs from the
+    /// disk, and the walk never opens an entry that the filter skips.
     pub filter: Option<FilterFn>,
     /// A callback whose return value replaces the recorded `st_mode` of an
     /// entry.

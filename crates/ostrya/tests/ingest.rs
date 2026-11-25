@@ -14,8 +14,10 @@
 
 mod common;
 
+use std::collections::HashSet;
 use std::os::fd::AsFd;
 use std::path::Path;
+use std::sync::Arc;
 
 use common::{ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, fixture_repo, ostree_available};
 use futures_lite::AsyncReadExt;
@@ -412,6 +414,284 @@ fn filter_prunes_a_subtree() {
         assert!(tree.dirs.is_empty(), "the skipped subdir is absent");
         let names: Vec<&str> = tree.files.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["empty.txt", "hello.txt", "link"]);
+    });
+}
+
+/// Sets the mode of each listed path again on drop.
+///
+/// Declare it after the `TmpDir` of the test. It then drops first, and the
+/// `TmpDir` can remove an entry that the test made unreadable.
+struct RestoreModes(Vec<(std::path::PathBuf, u32)>);
+
+impl Drop for RestoreModes {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        for (path, mode) in &self.0 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode));
+        }
+    }
+}
+
+/// Returns the sorted names of the entries of a directory.
+fn entry_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn filter_skips_an_entry_that_does_not_open() {
+    // The walk opens an entry only after the filter keeps it. An entry that
+    // does not open and that the filter skips thus does not stop the walk,
+    // and the tree is the tree without the entry. Without the filter, the
+    // open fails. The `ostree` command gives the same results for an entry
+    // that `--skip-list` names. A directory at mode 0644 opens, so it has no
+    // control.
+    for (name, mode) in [
+        ("file0000", 0o000),
+        ("file0200", 0o200),
+        ("empty0000", 0o000),
+        ("dir0000", 0o000),
+        ("dir0311", 0o311),
+        ("dir0644", 0o644),
+    ] {
+        let tmp = TmpDir::new("ingest-filter-unopened");
+        let base = tmp.path();
+        for tree in ["src", "want"] {
+            let dir = base.join(tree);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("kept.txt"), b"kept\n").unwrap();
+            set_mode(&dir.join("kept.txt"), 0o644);
+            set_mode(&dir, 0o755);
+        }
+        let entry = base.join("src").join(name);
+        if name.starts_with("dir") {
+            std::fs::create_dir(&entry).unwrap();
+            std::fs::write(entry.join("inner"), b"inner\n").unwrap();
+        } else if name.starts_with("empty") {
+            std::fs::write(&entry, b"").unwrap();
+        } else {
+            std::fs::write(&entry, b"secret\n").unwrap();
+        }
+        let _restore = RestoreModes(vec![(entry.clone(), 0o755)]);
+        set_mode(&entry, mode);
+
+        block_on(async {
+            let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::BareUser))
+                .await
+                .unwrap();
+            let dfd = std::fs::File::open(base).unwrap();
+
+            let want = {
+                let txn = repo.transaction().await.unwrap();
+                let mut mtree = MutableTree::new();
+                txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("want"), &mut mtree, None)
+                    .await
+                    .unwrap();
+                let rt = txn.write_mtree(&mut mtree).await.unwrap();
+                let want = (*rt.dirtree_checksum(), *rt.dirmeta_checksum());
+                txn.abort().await.unwrap();
+                want
+            };
+
+            if name != "dir0644" {
+                let txn = repo.transaction().await.unwrap();
+                let mut mtree = MutableTree::new();
+                let result = txn
+                    .write_dfd_to_mtree(dfd.as_fd(), Path::new("src"), &mut mtree, None)
+                    .await;
+                txn.abort().await.unwrap();
+                match result {
+                    Err(ostrya::Error::Io(err)) => assert_eq!(
+                        err.kind(),
+                        std::io::ErrorKind::PermissionDenied,
+                        "{name}: {err}"
+                    ),
+                    Err(err) => panic!("{name}: the walk without a filter gives {err}"),
+                    Ok(()) => {
+                        if !rustix::process::geteuid().is_root() {
+                            panic!("{name}: the walk without a filter reads the entry");
+                        }
+                        eprintln!("skipping the control of {name}: root opens each mode");
+                    }
+                }
+            }
+
+            let txn = repo.transaction().await.unwrap();
+            let listed = format!("/{name}");
+            let mut modifier = CommitModifier::new(CommitModifierFlags::empty());
+            modifier.filter = Some(Box::new(move |path, _meta| {
+                if path == Path::new(&listed) {
+                    FilterResult::Skip
+                } else {
+                    FilterResult::Allow
+                }
+            }));
+            let mut mtree = MutableTree::new();
+            if let Err(err) = txn
+                .write_dfd_to_mtree(
+                    dfd.as_fd(),
+                    Path::new("src"),
+                    &mut mtree,
+                    Some(&mut modifier),
+                )
+                .await
+            {
+                panic!("{name}: the walk that skips the entry gives {err}");
+            }
+            let rt = txn.write_mtree(&mut mtree).await.unwrap();
+            let got = (*rt.dirtree_checksum(), *rt.dirmeta_checksum());
+            let stats = txn.commit().await.unwrap();
+            assert_eq!(stats.filtered, 1, "{name}: one entry skipped");
+            assert_eq!(got, want, "{name}: the tree without the entry");
+        });
+    }
+}
+
+#[test]
+fn filter_gets_no_xattrs_from_disk() {
+    // The filter runs before the walk opens an entry, so the metadata that it
+    // gets holds no xattrs from the disk. The committed entry holds them.
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    let tmp = TmpDir::new("ingest-filter-xattrs");
+    let base = tmp.path();
+    let src = base.join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("hello.txt"), b"labeled\n").unwrap();
+    set_mode(&src.join("hello.txt"), 0o644);
+    for path in [src.join("hello.txt"), src.join("sub")] {
+        rustix::fs::setxattr(
+            &path,
+            "user.demo",
+            b"value",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+    }
+    let seen: Arc<Mutex<HashMap<String, Xattrs>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    block_on(async {
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let dfd = std::fs::File::open(base).unwrap();
+        let record = Arc::clone(&seen);
+        let mut modifier = CommitModifier::new(CommitModifierFlags::empty());
+        modifier.filter = Some(Box::new(move |path, meta| {
+            record
+                .lock()
+                .unwrap()
+                .insert(path.to_str().unwrap().to_owned(), meta.xattrs.clone());
+            FilterResult::Allow
+        }));
+        let mut mtree = MutableTree::new();
+        txn.write_dfd_to_mtree(
+            dfd.as_fd(),
+            Path::new("src"),
+            &mut mtree,
+            Some(&mut modifier),
+        )
+        .await
+        .unwrap();
+        let rt = txn.write_mtree(&mut mtree).await.unwrap();
+        let root_dirtree = *rt.dirtree_checksum();
+        txn.commit().await.unwrap();
+
+        for path in ["/hello.txt", "/sub"] {
+            let xattrs = seen.lock().unwrap().get(path).cloned();
+            let xattrs = xattrs.unwrap_or_else(|| panic!("{path} filtered"));
+            assert!(xattrs.is_empty(), "{path}: the filter gets {xattrs:?}");
+        }
+
+        let has_demo = |xattrs: &Xattrs| {
+            xattrs
+                .iter()
+                .any(|(name, value)| name == b"user.demo\0" && value == b"value")
+        };
+        let tree = repo.load_dirtree(&root_dirtree).await.unwrap();
+        let hello = tree.files.iter().find(|(n, _)| n == "hello.txt").unwrap().1;
+        let file = repo.load_file(&hello).await.unwrap();
+        assert!(has_demo(&file.xattrs), "file xattrs: {:?}", file.xattrs);
+        let sub = tree.dirs.iter().find(|(n, _, _)| n == "sub").unwrap();
+        let dirmeta = repo.load_dirmeta(&sub.2).await.unwrap();
+        assert!(has_demo(&dirmeta.xattrs), "dirmeta xattrs: {:?}", dirmeta);
+    });
+}
+
+#[test]
+fn nested_directory_xattrs_reach_the_dirmeta() {
+    // The walk reads the xattrs of a nested directory. They enter its dirmeta,
+    // with no modifier and under a modifier, and the xattr callback gets them.
+    use std::sync::{Arc, Mutex};
+
+    let tmp = TmpDir::new("ingest-dir-xattrs");
+    let base = tmp.path();
+    let src = base.join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("sub/nested.txt"), b"nested\n").unwrap();
+    set_mode(&src.join("sub/nested.txt"), 0o644);
+    rustix::fs::setxattr(
+        src.join("sub"),
+        "user.demo",
+        b"value",
+        rustix::fs::XattrFlags::empty(),
+    )
+    .unwrap();
+    let has_demo = |xattrs: &Xattrs| {
+        xattrs
+            .iter()
+            .any(|(name, value)| name == b"user.demo\0" && value == b"value")
+    };
+
+    block_on(async {
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        for with_callback in [false, true] {
+            let seen: Arc<Mutex<Option<Xattrs>>> = Arc::new(Mutex::new(None));
+            let mut modifier = with_callback.then(|| {
+                let record = Arc::clone(&seen);
+                let mut modifier = CommitModifier::new(CommitModifierFlags::empty());
+                modifier.xattr_callback = Some(Box::new(move |path, meta| {
+                    if path == Path::new("/sub") {
+                        *record.lock().unwrap() = Some(meta.xattrs.clone());
+                    }
+                    meta.xattrs.clone()
+                }));
+                modifier
+            });
+            let txn = repo.transaction().await.unwrap();
+            let dfd = std::fs::File::open(base).unwrap();
+            let mut mtree = MutableTree::new();
+            txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("src"), &mut mtree, modifier.as_mut())
+                .await
+                .unwrap();
+            let rt = txn.write_mtree(&mut mtree).await.unwrap();
+            let root_dirtree = *rt.dirtree_checksum();
+            txn.commit().await.unwrap();
+
+            let tree = repo.load_dirtree(&root_dirtree).await.unwrap();
+            let sub = tree.dirs.iter().find(|(n, _, _)| n == "sub").unwrap();
+            let dirmeta = repo.load_dirmeta(&sub.2).await.unwrap();
+            assert!(
+                has_demo(&dirmeta.xattrs),
+                "callback {with_callback}: dirmeta xattrs: {dirmeta:?}"
+            );
+            if with_callback {
+                let got = seen
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("the callback gets /sub");
+                assert!(has_demo(&got), "the callback gets {got:?}");
+            }
+        }
     });
 }
 
@@ -1128,12 +1408,10 @@ fn error_on_unlabeled_fails_when_the_hook_returns_no_label() {
 }
 
 #[test]
-fn consume_with_a_pruning_filter_still_empties_the_source() {
-    // CONSUME empties each ingested source, also the parts that the filter
-    // keeps out of the commit. The walk removes a pruned file and its parent
-    // with the rest, and the committed tree does not hold the pruned file. If
-    // the walk leaves them, the source stays half deleted, and the removal of
-    // the directory that holds them fails.
+fn consume_keeps_a_file_that_the_filter_skips() {
+    // A consuming walk does not remove a file that the filter skips. The file
+    // and the directories that hold it stay, and the committed tree does not
+    // hold the file.
     let tmp = TmpDir::new("ingest-consume-prune");
     let base = tmp.path();
     let src = base.join("src");
@@ -1174,9 +1452,11 @@ fn consume_with_a_pruning_filter_still_empties_the_source() {
         let root_dirtree = *rt.dirtree_checksum();
         txn.commit().await.unwrap();
 
-        assert!(
-            !src.join("subdir").exists(),
-            "the pruned file and its parent are consumed with the rest"
+        assert_eq!(entry_names(&src), vec!["subdir"], "the walk root stays");
+        assert_eq!(
+            entry_names(&src.join("subdir")),
+            vec!["skip.txt"],
+            "the skipped file and its parent stay"
         );
 
         let repo = Repo::open(&root).await.unwrap();
@@ -1189,9 +1469,10 @@ fn consume_with_a_pruning_filter_still_empties_the_source() {
 }
 
 #[test]
-fn consume_with_a_filter_that_prunes_a_directory_empties_the_source() {
-    // The walk removes a pruned directory with its subtree on the blocking
-    // pool, and then goes on with the other entries.
+fn consume_keeps_a_directory_that_the_filter_skips() {
+    // A consuming walk does not enter or remove a directory that the filter
+    // skips. The directory keeps its subtree, the walk root stays, and the
+    // walk removes the other entries.
     let tmp = TmpDir::new("ingest-consume-prune-dir");
     let base = tmp.path();
     let src = base.join("src");
@@ -1233,10 +1514,71 @@ fn consume_with_a_filter_that_prunes_a_directory_empties_the_source() {
         txn.abort().await.unwrap();
     });
 
-    assert!(
-        !src.exists(),
-        "the pruned directory is consumed with the rest"
-    );
+    assert_eq!(entry_names(&src), vec!["pruned"], "the walk root stays");
+    assert_eq!(entry_names(&src.join("pruned")), vec!["a.txt", "deeper"]);
+    assert_eq!(entry_names(&src.join("pruned/deeper")), vec!["b.txt"]);
+}
+
+#[test]
+fn consume_keeps_an_entry_that_the_filter_skips_and_that_does_not_open() {
+    // A consuming walk never opens an entry that the filter skips. A skipped
+    // directory that does not open and a skipped file stay, with each
+    // directory that holds them, the walk root included. The walk removes
+    // each other entry and succeeds.
+    let tmp = TmpDir::new("ingest-consume-unopened");
+    let base = tmp.path();
+    let src = base.join("src");
+    for dir in ["sub/locked", "other", "gone"] {
+        std::fs::create_dir_all(src.join(dir)).unwrap();
+    }
+    for path in [
+        "top.txt",
+        "sub/a.txt",
+        "sub/locked/inner",
+        "other/skip.txt",
+        "other/b.txt",
+        "gone/c.txt",
+    ] {
+        std::fs::write(src.join(path), path.as_bytes()).unwrap();
+        set_mode(&src.join(path), 0o644);
+    }
+    let locked = src.join("sub/locked");
+    let _restore = RestoreModes(vec![(locked.clone(), 0o755)]);
+    set_mode(&locked, 0o000);
+
+    block_on(async {
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let dfd = std::fs::File::open(base).unwrap();
+        let mut modifier = CommitModifier::new(CommitModifierFlags::CONSUME);
+        modifier.filter = Some(Box::new(|path, _meta| {
+            if path == Path::new("/sub/locked") || path == Path::new("/other/skip.txt") {
+                FilterResult::Skip
+            } else {
+                FilterResult::Allow
+            }
+        }));
+        let mut mtree = MutableTree::new();
+        txn.write_dfd_to_mtree(
+            dfd.as_fd(),
+            Path::new("src"),
+            &mut mtree,
+            Some(&mut modifier),
+        )
+        .await
+        .unwrap();
+        txn.write_mtree(&mut mtree).await.unwrap();
+        let stats = txn.commit().await.unwrap();
+        assert_eq!(stats.filtered, 2, "two entries skipped");
+    });
+
+    assert_eq!(entry_names(&src), vec!["other", "sub"]);
+    assert_eq!(entry_names(&src.join("sub")), vec!["locked"]);
+    assert_eq!(entry_names(&src.join("other")), vec!["skip.txt"]);
+    set_mode(&locked, 0o755);
+    assert_eq!(entry_names(&locked), vec!["inner"]);
 }
 
 #[test]
@@ -1628,7 +1970,12 @@ fn remove_a_deep_tree() {
     drop(dir);
 
     let dfd = std::fs::File::open(base).unwrap();
-    block_on(ostrya::remove_source_tree(dfd.as_fd(), Path::new("src"))).unwrap();
+    block_on(ostrya::remove_source_tree(
+        dfd.as_fd(),
+        Path::new("src"),
+        Arc::default(),
+    ))
+    .unwrap();
     assert!(!src.exists(), "the removal left the deep tree behind");
     assert!(base.exists(), "the removal went past the tree");
 }
@@ -1663,8 +2010,12 @@ fn remove_source_tree_keeps_a_directory_spelled_dot() {
     ] {
         removal_source(&src, &outside);
         let dfd = std::fs::File::open(if from_src { &src } else { base }).unwrap();
-        block_on(ostrya::remove_source_tree(dfd.as_fd(), Path::new(spelling)))
-            .unwrap_or_else(|err| panic!("`{spelling}` failed: {err}"));
+        block_on(ostrya::remove_source_tree(
+            dfd.as_fd(),
+            Path::new(spelling),
+            Arc::default(),
+        ))
+        .unwrap_or_else(|err| panic!("`{spelling}` failed: {err}"));
         assert_eq!(
             std::fs::read_dir(&src).map(Iterator::count).ok(),
             Some(0),
@@ -1693,19 +2044,83 @@ fn remove_source_tree_removes_the_directory() {
     block_on(ostrya::remove_source_tree(
         dfd.as_fd(),
         Path::new("relative"),
+        Arc::default(),
     ))
     .unwrap();
     assert!(!relative.exists(), "the relative path stayed");
 
     let absolute = base.join("absolute");
     removal_source(&absolute, &outside);
-    block_on(ostrya::remove_source_tree(unrelated.as_fd(), &absolute)).unwrap();
+    block_on(ostrya::remove_source_tree(
+        unrelated.as_fd(),
+        &absolute,
+        Arc::default(),
+    ))
+    .unwrap();
     assert!(!absolute.exists(), "the absolute path stayed");
 
     assert!(
         base.exists() && outside.exists(),
         "the removal went too far"
     );
+}
+
+/// An entry that `keep` names stays and is never opened. Each directory that
+/// holds it stays, the source root included. A kept directory keeps its
+/// subtree, and `/` keeps the whole source.
+#[test]
+fn remove_source_tree_keeps_the_entries_that_keep_names() {
+    let tmp = TmpDir::new("remove-keep");
+    let base = tmp.path();
+    let src = base.join("src");
+    for dir in ["sub/locked", "sub/deep", "gone", "kept"] {
+        std::fs::create_dir_all(src.join(dir)).unwrap();
+    }
+    for file in [
+        "x",
+        "sub/y",
+        "sub/locked/inner",
+        "sub/deep/z",
+        "gone/w",
+        "kept/q",
+    ] {
+        std::fs::write(src.join(file), file).unwrap();
+    }
+    let locked = src.join("sub/locked");
+    let _restore = RestoreModes(vec![(locked.clone(), 0o755)]);
+    set_mode(&locked, 0o000);
+    let dfd = std::fs::File::open(base).unwrap();
+
+    let all = Arc::new(HashSet::from(["/".to_owned()]));
+    block_on(ostrya::remove_source_tree(
+        dfd.as_fd(),
+        Path::new("src"),
+        all,
+    ))
+    .unwrap();
+    assert_eq!(entry_names(&src), vec!["gone", "kept", "sub", "x"]);
+    assert_eq!(entry_names(&src.join("sub")), vec!["deep", "locked", "y"]);
+
+    let keep = [
+        "/sub/locked",
+        "/kept",
+        "/x",
+        "/absent",
+        "sub/y",
+        "/sub/deep/",
+    ]
+    .map(String::from);
+    block_on(ostrya::remove_source_tree(
+        dfd.as_fd(),
+        Path::new("src"),
+        Arc::new(HashSet::from(keep)),
+    ))
+    .unwrap();
+    assert_eq!(entry_names(&src), vec!["kept", "sub", "x"]);
+    assert_eq!(entry_names(&src.join("sub")), vec!["locked"]);
+    assert_eq!(entry_names(&src.join("kept")), vec!["q"]);
+    set_mode(&locked, 0o755);
+    assert_eq!(entry_names(&locked), vec!["inner"]);
 }
 
 /// A symlink or a file at the path is refused, and nothing is removed. A
@@ -1722,8 +2137,12 @@ fn remove_source_tree_refuses_a_symlink_or_a_file_at_the_path() {
     let dfd = std::fs::File::open(base).unwrap();
 
     for spelling in ["link", "link/", "file", "file/"] {
-        let err = block_on(ostrya::remove_source_tree(dfd.as_fd(), Path::new(spelling)))
-            .expect_err(spelling);
+        let err = block_on(ostrya::remove_source_tree(
+            dfd.as_fd(),
+            Path::new(spelling),
+            Arc::default(),
+        ))
+        .expect_err(spelling);
         assert!(
             matches!(err, ostrya::Error::ConsumeUnlink { .. }),
             "`{spelling}` gave another error: {err:?}"
@@ -1745,10 +2164,16 @@ fn remove_source_tree_refuses_a_symlink_or_a_file_at_the_path() {
 fn remove_source_tree_of_a_missing_path_is_ok() {
     let tmp = TmpDir::new("remove-missing");
     let dfd = std::fs::File::open(tmp.path()).unwrap();
-    block_on(ostrya::remove_source_tree(dfd.as_fd(), Path::new("absent"))).unwrap();
+    block_on(ostrya::remove_source_tree(
+        dfd.as_fd(),
+        Path::new("absent"),
+        Arc::default(),
+    ))
+    .unwrap();
     block_on(ostrya::remove_source_tree(
         dfd.as_fd(),
         Path::new("absent/"),
+        Arc::default(),
     ))
     .unwrap();
 }
@@ -1783,11 +2208,21 @@ fn remove_source_tree_removes_a_wide_tree() {
     let dfd = std::fs::File::open(base).unwrap();
 
     wide_removal_source(&src);
-    block_on(ostrya::remove_source_tree(dfd.as_fd(), Path::new("src"))).unwrap();
+    block_on(ostrya::remove_source_tree(
+        dfd.as_fd(),
+        Path::new("src"),
+        Arc::default(),
+    ))
+    .unwrap();
     assert!(!src.exists(), "the removal left the wide tree behind");
 
     wide_removal_source(&src);
-    block_on(ostrya::remove_source_tree(dfd.as_fd(), Path::new("src/."))).unwrap();
+    block_on(ostrya::remove_source_tree(
+        dfd.as_fd(),
+        Path::new("src/."),
+        Arc::default(),
+    ))
+    .unwrap();
     assert_eq!(
         std::fs::read_dir(&src).map(Iterator::count).ok(),
         Some(0),
@@ -1809,8 +2244,12 @@ fn remove_source_tree_refuses_a_name_that_is_not_utf8() {
     std::fs::write(&bad, "").unwrap();
     let dfd = std::fs::File::open(base).unwrap();
 
-    let err = block_on(ostrya::remove_source_tree(dfd.as_fd(), Path::new("src")))
-        .expect_err("a name that is not valid UTF-8 is refused");
+    let err = block_on(ostrya::remove_source_tree(
+        dfd.as_fd(),
+        Path::new("src"),
+        Arc::default(),
+    ))
+    .expect_err("a name that is not valid UTF-8 is refused");
     match &err {
         ostrya::Error::ConsumeUnlink { name, .. } => assert_eq!(name, "bad\u{FFFD}"),
         other => panic!("another error: {other:?}"),
@@ -1876,6 +2315,7 @@ fn remove_from_the_working_directory() {
     let result = block_on(ostrya::remove_source_tree(
         rustix::fs::CWD,
         Path::new("src"),
+        Arc::default(),
     ));
     std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o755)).unwrap();
     result.unwrap();

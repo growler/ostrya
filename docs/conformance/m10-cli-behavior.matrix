@@ -8203,9 +8203,9 @@ note: what `--consume` leaves on disk, which no oracle reads, each case held at
  `--tree=dir=` value, a positional path, and a trailing-slash spelling, and
  stays, emptied, where the path is spelled `.`. A `ref=` source that resolves
  and a `tar=` archive file both survive beside a consumed `dir=` source, and the
- commit is written. A walk filter spares nothing: a path `--skip-list` names is
- removed with the rest and the source directory goes. Two sources are both
- consumed. A run that fails, a removal that fails, a `./` spelling, and a
+ commit is written. A path that `--skip-list` names parts the two: the tool
+ removes it with the rest, and the port keeps it and the source directory that
+ holds it. Two sources are both consumed. A run that fails, a removal that fails, a `./` spelling, and a
  pruned walk root part from the tool, because the port removes the sources
  after the commit (`cli-surface.md`, `commit`, the `--consume` paragraph).
 

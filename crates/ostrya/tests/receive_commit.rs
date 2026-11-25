@@ -1952,6 +1952,161 @@ fn an_unsigned_commit_is_signature_required() {
     ));
 }
 
+/// A commit with more than 64 signature blobs under the key of one engine is
+/// `signature-required`, also with a signature of the trusted key in the
+/// last place. A commit with 64 blobs passes. The receive merge keeps one
+/// copy of equal blobs, so the junk blobs differ.
+#[test]
+fn more_than_64_signatures_of_one_engine_are_signature_required() {
+    let policy = ReceivePolicy {
+        verify: ReceiveVerify::Keys(trust(SECRET_B64)),
+        ..policy()
+    };
+    let objects = fixture_objects(Encoding::Raw);
+    let payload = &objects
+        .iter()
+        .find(|o| o.ty == ObjectType::Commit)
+        .unwrap()
+        .bytes;
+    let updates = || {
+        vec![update(
+            "test/main",
+            Expected::Absent,
+            Some(fixture_commit()),
+        )]
+    };
+    // `junk` blobs that are no signature, then a valid signature.
+    let dict = |junk: u8| {
+        let mut dict = Value::Array(Vec::new());
+        for i in 0..junk {
+            append_signature(&mut dict, ED25519_KEY, vec![i; 64]).unwrap();
+        }
+        append_signature(
+            &mut dict,
+            ED25519_KEY,
+            ed25519_signature(SECRET_B64, payload),
+        )
+        .unwrap();
+        dict_bytes(&dict)
+    };
+
+    let tmp = TmpDir::new("recv-signature-limit");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy,
+            &objects,
+            &[(fixture_commit(), dict(64))],
+            updates(),
+            false,
+        ),
+        ErrorCode::SignatureRequired,
+    );
+    assert!(
+        error.message.contains(
+            "the signature dict holds more than 64 signatures under 'ostree.sign.ed25519'"
+        ),
+        "{error:?}"
+    );
+    assert_unchanged(&repo, &before);
+    committed(push(
+        &repo,
+        &policy,
+        &objects,
+        &[(fixture_commit(), dict(63))],
+        updates(),
+        false,
+    ));
+}
+
+/// The server signs a commit only if its key has not signed it. The search
+/// for the signature of the server key refuses more than 64 blobs under the
+/// key of its engine, and the push is then `signature-required`, with no
+/// verification in the policy.
+#[test]
+fn the_signing_search_refuses_more_than_64_signatures_of_one_engine() {
+    let policy = ReceivePolicy {
+        signers: vec![server_signer(SERVER_SECRET_B64)],
+        ..policy()
+    };
+    let objects = fixture_objects(Encoding::Raw);
+    let mut dict = Value::Array(Vec::new());
+    for i in 0..65u8 {
+        append_signature(&mut dict, ED25519_KEY, vec![i; 64]).unwrap();
+    }
+    let tmp = TmpDir::new("recv-signing-search-limit");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy,
+            &objects,
+            &[(fixture_commit(), dict_bytes(&dict))],
+            vec![update(
+                "test/main",
+                Expected::Absent,
+                Some(fixture_commit()),
+            )],
+            false,
+        ),
+        ErrorCode::SignatureRequired,
+    );
+    assert!(
+        error.message.contains(
+            "the signature dict holds more than 64 signatures under 'ostree.sign.ed25519'"
+        ),
+        "{error:?}"
+    );
+    assert_unchanged(&repo, &before);
+}
+
+/// Each server key searches the dict of the client, which holds 64 blobs, and
+/// not the signatures of the server keys before it. Two keys with different
+/// secrets sign once each, and a third key with the secret of the second key
+/// finds the signature of the second key and makes none.
+#[test]
+fn the_server_keys_sign_a_commit_with_64_signatures_of_the_client() {
+    let commit = build_commit(None, "unbound", no_metadata(), &[]);
+    let mut objects = tree_objects();
+    objects.push(commit.clone());
+    let policy = ReceivePolicy {
+        verify: ReceiveVerify::Keys(trust(SECRET_B64)),
+        signers: vec![
+            server_signer(SERVER_SECRET_B64),
+            server_signer(SECOND_SERVER_SECRET_B64),
+            server_signer(SECOND_SERVER_SECRET_B64),
+        ],
+        ..policy()
+    };
+    let mut dict = Value::Array(Vec::new());
+    for i in 0..63u8 {
+        append_signature(&mut dict, ED25519_KEY, vec![i; 64]).unwrap();
+    }
+    let client = ed25519_signature(SECRET_B64, &commit.bytes);
+    append_signature(&mut dict, ED25519_KEY, client.clone()).unwrap();
+    let tmp = TmpDir::new("recv-server-keys-at-limit");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    committed(push(
+        &repo,
+        &policy,
+        &objects,
+        &[(commit.checksum, dict_bytes(&dict))],
+        vec![update("a", Expected::Absent, Some(commit.checksum))],
+        false,
+    ));
+    let stored = block_on(repo.read_commit_detached_metadata(&commit.checksum))
+        .unwrap()
+        .unwrap();
+    let mut expected: Vec<Vec<u8>> = (0..63u8).map(|i| vec![i; 64]).collect();
+    expected.push(client);
+    expected.push(ed25519_signature(SERVER_SECRET_B64, &commit.bytes));
+    expected.push(ed25519_signature(SECOND_SERVER_SECRET_B64, &commit.bytes));
+    assert_eq!(signatures(&stored, ED25519_KEY), expected);
+}
+
 /// With `allow_unsigned`, a commit with no signature blob passes. A signature
 /// blob under any signature key must pass the verification: a key that the
 /// trust does not hold fails, and so does a blob of an engine that the trust

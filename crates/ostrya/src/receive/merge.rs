@@ -428,7 +428,7 @@ mod tests {
 
     /// The blobs under `key`.
     fn blobs(dict: &Value, key: &str) -> Vec<Vec<u8>> {
-        crate::sign::signatures_for(dict, key)
+        crate::sign::signatures_for(dict, key).unwrap()
     }
 
     const ED: &str = "ostree.sign.ed25519";

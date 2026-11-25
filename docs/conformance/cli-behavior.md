@@ -1846,6 +1846,10 @@ directory").
   follows included. On a repeat pull, the tool checks again a commit that the
   destination already holds. That check names the commit and gives the texts
   of a `file://` pull, also over HTTP.
+- The tool reads each signature blob under the key of an engine. A commit with
+  65 ed25519 blobs and the trusted signature last passes a `file://` pull
+  (`sign`, "The verify report"). The port refuses more than 64 blobs
+  (`cli-surface.md`, "The signature limit of one engine").
 
 A pull from a `file://` URL gives other texts, and each text names the commit.
 A repeat pull over HTTP gives the ed25519 texts of this list:
@@ -6198,6 +6202,28 @@ Under the gpg engine, the port writes the report that `cli-surface.md`, "P2",
 <fingerprint>` where the signature names its key. It has ` (<name> <email>)`
 where the key has a user id. A user id with no address gives ` (<name>)`. A
 user id with an address alone gives ` (<<email>>)`.
+
+The tool reads each signature blob under the key of the engine. On
+2026-11-25, `ostree` 2026.1 on the NixOS development host was given a commit
+with 65 ed25519 blobs. `ostree sign` with 65 different secret keys wrote
+them, one signature for each run. The run with the trusted key was last:
+
+- `ostree sign --verify --sign-type=ed25519 COMMIT KEY`, with the key of the
+  last signature, wrote `ed25519: Signature verified successfully with key
+  '<hex>'` at exit 0. The key of the first signature gave the same line with
+  its own key.
+- A `pull` from a `file://` remote with `sign-verify=true` and
+  `verification-ed25519-key` set to the key of the last signature imported
+  the commit at exit 0. With a key that made no signature, the pull wrote
+  `error: Can't verify commit <checksum>: ed25519: Signature couldn't be
+  verified; tried 65 keys` at exit 1.
+- `pull-local --remote=<remote>` with the same remote config imported the
+  commit at exit 0, also with a key that made no signature, because
+  `pull-local` of the tool makes no sign-api check ("Rules common to the
+  verification axes").
+
+The port refuses more than 64 blobs under the key of one engine
+(`cli-surface.md`, "The signature limit of one engine").
 
 #### Delete mode
 

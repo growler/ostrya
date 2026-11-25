@@ -966,6 +966,35 @@ fn a_summary_that_does_not_parse_is_an_error() {
     });
 }
 
+/// A summary.sig with more than 64 signatures of one engine gives the
+/// refusal of the limit as the finding, with no hint about the summary
+/// signers.
+#[test]
+fn a_summary_sig_over_the_signature_limit_gives_no_signer_hint() {
+    block_on(async {
+        let f = Fixture::new(None).await;
+        let signer = signer();
+        f.local
+            .regenerate_summaries(&SummaryOptions::default(), &[&signer as &dyn Signer])
+            .await
+            .unwrap();
+        f.local
+            .sign_summary_all(&[&signer as &dyn Signer; 64])
+            .await
+            .unwrap();
+        f.copy_file("summary");
+        f.copy_file("summary.sig");
+        let mut opts = BucketFsckOptions::default();
+        opts.summary_keys = Some(keys(false));
+        let report = f.bucket.fsck(&opts).await.unwrap();
+        assert_eq!(kinds(&report), [(Summary, "summary.sig".to_owned(), true)]);
+        assert_eq!(
+            report.findings[0].detail,
+            "the signature dict holds more than 64 signatures under 'ostree.sign.ed25519'"
+        );
+    });
+}
+
 #[test]
 fn the_signature_of_the_summary_verifies_with_the_keys_of_the_run() {
     block_on(async {

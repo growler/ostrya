@@ -202,6 +202,51 @@ fn sign_and_verify_round_trip() {
     });
 }
 
+/// The verification of the summary reads at most 64 signatures under the key
+/// of one engine. A summary with 64 signatures of the trusted key verifies. A
+/// 65th signature fails the verification.
+#[test]
+fn a_summary_with_more_than_64_signatures_of_one_engine_is_refused() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "summary-sign-limit");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        repo.regenerate_summary(&SummaryOptions {
+            last_modified: Some(FIXED_EPOCH),
+            metadata_commit_timestamp: None,
+            additional_metadata: Vec::new(),
+            auth_items_only: false,
+            root_summary_only: false,
+        })
+        .await
+        .unwrap();
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        let public = base64::decode(PUBLIC_B64).unwrap();
+        let trusted: Arc<dyn ostrya::Verifier> =
+            Arc::new(Ed25519Verifier::new([public], Vec::<Vec<u8>>::new()).unwrap());
+        repo.sign_summary_all(&[&signer as &dyn ostrya::Signer; 64])
+            .await
+            .unwrap();
+        let outcome = repo
+            .verify_summary(std::slice::from_ref(&trusted))
+            .await
+            .unwrap();
+        assert!(outcome.valid);
+        assert_eq!(outcome.signatures.len(), 64);
+
+        repo.sign_summary(&signer).await.unwrap();
+        let err = repo
+            .verify_summary(std::slice::from_ref(&trusted))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ostrya::Error::Signature(m)
+                if m == "the signature dict holds more than 64 signatures under \
+                         'ostree.sign.ed25519'"),
+            "{err}"
+        );
+    });
+}
+
 /// `Repo::verify_summary` runs the verifiers on the blocking pool, so a
 /// verifier that works in the call does not hold the async executor.
 #[test]

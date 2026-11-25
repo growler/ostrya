@@ -153,6 +153,16 @@ for it.
   - A second entry of one id in `ostree.summary.collection-map`. The import
     reads the first entry of the id.
   - A ref name that fails the ref-name rule. The import leaves out the name.
+- A limit on the write paths of signatures. Each verification refuses more
+  than 64 blobs under the key of one engine
+  (`conformance/cli-surface.md`, "The signature limit of one engine"). The
+  write paths still append a 65th blob of one engine: `Repo::sign_commit`,
+  `Transaction::sign_commit`, `Repo::sign_summary`,
+  `Repo::sign_summary_all`, `Repo::sign_static_delta`,
+  `DeltaOptions::signers`, and the signatures of the server keys of the
+  receive endpoint. Each verification of the dict then refuses it.
+  `Repo::delete_signatures` removes signatures. `ostrya sign` has no option
+  that removes a signature, and it refuses `--delete`.
 
 ## Gaps of bucket repositories
 

@@ -10,7 +10,8 @@
 //! - the signatures of a commit: [`Repo::sign_commit`],
 //!   [`Repo::verify_commit`], and [`Repo::delete_signatures`]
 //! - the signature blobs of a signature dict and their verification:
-//!   [`signatures_for`] and [`verify_all`]
+//!   [`signatures_for`] and [`verify_all`], which read at most
+//!   [`MAX_SIGNATURES_PER_ENGINE`] blobs under the key of one engine
 //! - the key store of the ed25519 and spki engines: [`load_sign_keys`] and
 //!   [`load_sign_keys_from`]
 //! - a verifier that trusts the system key store: [`FromSystemKeys`]
@@ -157,6 +158,11 @@ impl Repo {
     /// verifier does not get an element of the array that is not a byte
     /// string.
     ///
+    /// The call reads the blobs of all verifiers before the first verifier
+    /// runs. If the detached metadata holds more than
+    /// [`MAX_SIGNATURES_PER_ENGINE`] blobs under the key of a verifier, the
+    /// call fails and no verifier runs.
+    ///
     /// If at least one verifier reports a valid signature, the outcome is
     /// valid. The outcome holds the [`SignatureInfo`] records of all
     /// verifiers, in the order of `verifiers`.
@@ -173,6 +179,9 @@ impl Repo {
     ///   store.
     /// - [`Error::Core`] if the `.commitmeta` file does not parse as an
     ///   `a{sv}` dict.
+    /// - [`Error::Signature`] with the message of [`signatures_for`] if the
+    ///   detached metadata holds more than [`MAX_SIGNATURES_PER_ENGINE`]
+    ///   blobs under the key of a verifier.
     /// - [`Error::Signature`] if a verifier fails with the `Signature` variant
     ///   of [`ostrya_sign::Error`], or with a variant that the conversion to
     ///   [`Error`](crate::Error) does not name. Of the verifiers that this
@@ -244,8 +253,15 @@ impl Repo {
     ///   if `objects/<xx>` of the commit object is not a directory.
     /// - [`Error::Io`] if a file system operation fails.
     ///
+    /// The error of the search:
+    ///
+    /// - [`Error::Signature`] with the message of [`signatures_for`] if the
+    ///   detached metadata holds more than [`MAX_SIGNATURES_PER_ENGINE`]
+    ///   blobs under the metadata key of the engine of `key`.
+    ///
     /// [`Error::ObjectNotFound`]: crate::Error::ObjectNotFound
     /// [`Error::Core`]: crate::Error::Core
+    /// [`Error::Signature`]: crate::Error::Signature
     /// [`Error::InvalidFormat`]: crate::Error::InvalidFormat
     /// [`Error::Io`]: crate::Error::Io
     pub async fn has_signed_commit(
@@ -254,7 +270,7 @@ impl Repo {
         key: &SigningKey,
     ) -> crate::Result<bool> {
         let (data, dict) = self.load_commit_and_detached(checksum).await?;
-        Ok(key.has_signed_payload(&Arc::new(data), dict.as_ref()).await)
+        key.has_signed_payload(&Arc::new(data), dict.as_ref()).await
     }
 
     /// Removes the signatures of a commit that `remove` selects.
@@ -348,6 +364,22 @@ impl Repo {
     }
 }
 
+/// The number of signature blobs that a verification reads under the
+/// metadata key of one engine in one signature dict.
+///
+/// [`signatures_for`] refuses a dict with more blobs under the key. The
+/// limit applies to each verification of this crate: a commit, the summary,
+/// a static delta, a pull, and the receive endpoint. It also applies to the
+/// search of [`SigningKey::has_signed`]. The time of a verification grows
+/// with the number of blobs, the number of trusted keys, and the size of the
+/// payload, and the party that writes the dict sets the number of blobs.
+///
+/// A GPG blob counts as one blob, also when it holds more than one signature
+/// packet. The GPG verifier of `ostrya-sign` also reads at most 64 signature
+/// packets in all blobs of one verification together, and it refuses more
+/// before it verifies a signature.
+pub const MAX_SIGNATURES_PER_ENGINE: usize = 64;
+
 /// Returns the signature blobs under `metadata_key` in the `a{sv}` dict `dict`.
 ///
 /// `dict` is a signature dict: the detached metadata of a commit, the
@@ -362,6 +394,19 @@ impl Repo {
 /// element that is not a byte string. A malformed entry of another writer does
 /// not cause an error, so it cannot fail a verification.
 ///
+/// The call reads at most [`MAX_SIGNATURES_PER_ENGINE`] blobs. Only the byte
+/// strings count. The call stops the scan at the first byte string over the
+/// limit, and it then copies no blob.
+///
+/// # Errors
+///
+/// - [`Error::Signature`] with the message
+///   `the signature dict holds more than 64 signatures under '<metadata_key>'`
+///   if the value of the key holds more than [`MAX_SIGNATURES_PER_ENGINE`]
+///   byte strings.
+///
+/// [`Error::Signature`]: crate::Error::Signature
+///
 /// # Examples
 ///
 /// ```
@@ -372,26 +417,47 @@ impl Repo {
 /// append_signature(&mut dict, "ostree.sign.dummy", b"one".to_vec())?;
 /// append_signature(&mut dict, "ostree.sign.dummy", b"two".to_vec())?;
 ///
-/// let blobs = signatures_for(&dict, "ostree.sign.dummy");
+/// let blobs = signatures_for(&dict, "ostree.sign.dummy")?;
 /// assert_eq!(blobs, [b"one".to_vec(), b"two".to_vec()]);
-/// assert!(signatures_for(&dict, "ostree.sign.ed25519").is_empty());
+/// assert!(signatures_for(&dict, "ostree.sign.ed25519")?.is_empty());
 /// # Ok::<(), ostrya::Error>(())
 /// ```
-pub fn signatures_for(dict: &Value, metadata_key: &str) -> Vec<Vec<u8>> {
+pub fn signatures_for(dict: &Value, metadata_key: &str) -> crate::Result<Vec<Vec<u8>>> {
+    Ok(capped_signatures(dict, metadata_key)?
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+/// Returns the signature blobs under `metadata_key` in `dict` as slices of
+/// `dict`, with the rules and the error of [`signatures_for`]. The call copies
+/// no blob.
+pub(crate) fn capped_signatures<'a>(
+    dict: &'a Value,
+    metadata_key: &str,
+) -> crate::Result<Vec<&'a [u8]>> {
     let Some(value) = dict.dict_get(metadata_key) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let array = match value.as_variant() {
         Some((_, inner)) => inner,
         None => value,
     };
-    match array.as_array() {
-        Some(blobs) => blobs
-            .iter()
-            .filter_map(|blob| blob.as_bytes().map(<[u8]>::to_vec))
-            .collect(),
-        None => Vec::new(),
+    let Some(elements) = array.as_array() else {
+        return Ok(Vec::new());
+    };
+    let blobs: Vec<&[u8]> = elements
+        .iter()
+        .filter_map(Value::as_bytes)
+        .take(MAX_SIGNATURES_PER_ENGINE + 1)
+        .collect();
+    if blobs.len() > MAX_SIGNATURES_PER_ENGINE {
+        return Err(crate::Error::Signature(format!(
+            "the signature dict holds more than {MAX_SIGNATURES_PER_ENGINE} signatures under \
+             '{metadata_key}'"
+        )));
     }
+    Ok(blobs)
 }
 
 /// Verifies `data` with each verifier of `verifiers` against the signature
@@ -401,6 +467,11 @@ pub fn signatures_for(dict: &Value, metadata_key: &str) -> Vec<Vec<u8>> {
 /// [`metadata_key`](Verifier::metadata_key) in `dict`, as [`signatures_for`]
 /// reads them. If `dict` is `None`, each verifier gets no blob. The call also
 /// calls a verifier that gets no blob.
+///
+/// The call reads the blobs of all verifiers before the first verifier runs.
+/// If the dict holds more than [`MAX_SIGNATURES_PER_ENGINE`] blobs under the
+/// key of a verifier, the call fails and no verifier runs. The call copies the
+/// blobs of a verifier just before that verifier runs.
 ///
 /// If at least one verifier reports a valid signature, the outcome is valid.
 /// The outcome holds the [`SignatureInfo`] records of all verifiers, in the
@@ -412,6 +483,10 @@ pub fn signatures_for(dict: &Value, metadata_key: &str) -> Vec<Vec<u8>> {
 /// untrusted input runs the call on the blocking pool.
 ///
 /// # Errors
+///
+/// - [`Error::Signature`] with the message of [`signatures_for`] if `dict`
+///   holds more than [`MAX_SIGNATURES_PER_ENGINE`] blobs under the key of a
+///   verifier. No verifier runs.
 ///
 /// The first verifier that fails stops the call. The verifiers after it do not
 /// run. The call returns the error of that verifier, converted to
@@ -454,12 +529,16 @@ pub fn verify_all(
     data: &[u8],
     dict: Option<&Value>,
 ) -> crate::Result<VerifyOutcome> {
+    let blobs = verifiers
+        .iter()
+        .map(|verifier| match dict {
+            Some(dict) => capped_signatures(dict, verifier.metadata_key()),
+            None => Ok(Vec::new()),
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
     let mut outcome = VerifyOutcome::default();
-    for verifier in verifiers {
-        let signatures = match dict {
-            Some(dict) => signatures_for(dict, verifier.metadata_key()),
-            None => Vec::new(),
-        };
+    for (verifier, blobs) in verifiers.iter().zip(blobs) {
+        let signatures: Vec<Vec<u8>> = blobs.into_iter().map(<[u8]>::to_vec).collect();
         let result = verifier.verify(data, &signatures)?;
         outcome.valid |= result.valid;
         if outcome.signatures.is_empty() {
@@ -908,6 +987,84 @@ mod tests {
             "{err}"
         );
         assert_eq!(failing.calls(), [1]);
+        assert!(second.calls().is_empty());
+    }
+
+    /// Returns a dict that holds `count` different blobs under `key`.
+    fn dict_of(key: &str, count: usize) -> Value {
+        let mut dict = Value::Array(Vec::new());
+        for i in 0..count {
+            append_signature(&mut dict, key, i.to_be_bytes().to_vec()).unwrap();
+        }
+        dict
+    }
+
+    /// The refusal of a dict with more than 64 blobs under `key`.
+    fn limit_error(key: &str) -> String {
+        format!("the signature dict holds more than 64 signatures under '{key}'")
+    }
+
+    /// `signatures_for` reads 64 blobs under one key, in stored order, and
+    /// refuses 65.
+    #[test]
+    fn signatures_for_reads_at_most_64_blobs() {
+        assert_eq!(MAX_SIGNATURES_PER_ENGINE, 64);
+        let blobs = signatures_for(&dict_of("test.a", 64), "test.a").unwrap();
+        assert_eq!(blobs.len(), 64);
+        assert_eq!(blobs[0], 0usize.to_be_bytes());
+        assert_eq!(blobs[63], 63usize.to_be_bytes());
+
+        let err = signatures_for(&dict_of("test.a", 65), "test.a").unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Signature(m) if *m == limit_error("test.a")),
+            "{err}"
+        );
+    }
+
+    /// The blobs under the key of another engine do not count.
+    #[test]
+    fn the_blobs_of_another_key_do_not_count() {
+        let mut dict = dict_of("test.b", 65);
+        append_signature(&mut dict, "test.a", b"a1".to_vec()).unwrap();
+        assert_eq!(signatures_for(&dict, "test.a").unwrap(), [b"a1".to_vec()]);
+        let verifier = Recorder::new("test.a", true);
+        let outcome = verify_all(&[&verifier], b"data", Some(&dict)).unwrap();
+        assert!(outcome.valid);
+        assert_eq!(verifier.calls(), [1]);
+    }
+
+    /// An element that is not a byte string does not count to the limit.
+    #[test]
+    fn an_element_that_is_not_a_byte_string_does_not_count() {
+        let mut elements: Vec<Value> = (0..64u8).map(|i| Value::Bytes(vec![i])).collect();
+        elements.extend((0..10).map(|i| Value::Str(format!("not a blob {i}"))));
+        let dict = Value::Array(vec![Value::Tuple(vec![
+            Value::Str("test.a".into()),
+            Value::variant(
+                ostrya_core::Type::parse("av").unwrap(),
+                Value::Array(elements),
+            ),
+        ])]);
+        assert_eq!(signatures_for(&dict, "test.a").unwrap().len(), 64);
+    }
+
+    /// `verify_all` reads the blobs of each verifier first. A key over the
+    /// limit refuses the call before any verifier runs, also a verifier that
+    /// comes before that key and holds a valid blob.
+    #[test]
+    fn verify_all_refuses_before_a_verifier_runs() {
+        let mut dict = dict_of("test.b", 65);
+        append_signature(&mut dict, "test.a", b"a1".to_vec()).unwrap();
+        let first = Recorder::new("test.a", true);
+        let second = Recorder::new("test.b", true);
+
+        let err = verify_all(&[&first, &second], b"data", Some(&dict)).unwrap_err();
+
+        assert!(
+            matches!(&err, crate::Error::Signature(m) if *m == limit_error("test.b")),
+            "{err}"
+        );
+        assert!(first.calls().is_empty());
         assert!(second.calls().is_empty());
     }
 }

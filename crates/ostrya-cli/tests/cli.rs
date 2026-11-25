@@ -3984,6 +3984,180 @@ fn sign_verify_ed25519() {
     }
 }
 
+/// The refusal of a dict with more than 64 signatures under the ed25519 key.
+const ED25519_LIMIT_ERROR: &str = "error: signature: the signature dict holds more than 64 \
+                                   signatures under 'ostree.sign.ed25519'\n";
+
+/// Writes the detached metadata of the fixture commit in `repo`: `junk`
+/// different 64-byte blobs that are no signature under `key`, then, if
+/// `valid` is `true`, the ed25519 signature of [`ED25519_SECRET_B64`].
+fn write_signature_blobs(repo: &Path, key: &str, junk: u8, valid: bool) {
+    block_on(async {
+        let repo = Repo::open(repo).await.unwrap();
+        let checksum = Checksum::from_hex(COMMIT).unwrap();
+        let mut dict = Value::Array(Vec::new());
+        for i in 0..junk {
+            ostrya::sign::append_signature(&mut dict, key, vec![i; 64]).unwrap();
+        }
+        if valid {
+            let payload = repo
+                .load_object_bytes(ObjectType::Commit, &checksum)
+                .await
+                .unwrap();
+            let signer = ostrya::Ed25519Signer::from_base64(ED25519_SECRET_B64).unwrap();
+            let blob = ostrya::Signer::sign(&signer, &payload).await.unwrap();
+            ostrya::sign::append_signature(&mut dict, "ostree.sign.ed25519", blob).unwrap();
+        }
+        repo.write_commit_detached_metadata(&checksum, Some(&dict))
+            .await
+            .unwrap();
+    });
+}
+
+/// `sign --verify` and `pull-local --sign-verify` refuse a commit with more
+/// than 64 signatures under the key of one engine at exit 1, also with a
+/// valid signature in the last place. A commit with 64 signatures verifies.
+#[test]
+fn sign_verify_refuses_more_than_64_signatures_of_one_engine() {
+    let tmp = TmpDir::new("sign-verify-limit");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_arg = format!("--repo={}", repo.display());
+    let verify = || {
+        ostrya(
+            &["sign", "--verify", &repo_arg, COMMIT, ED25519_PUBLIC_B64],
+            None,
+            &[],
+        )
+    };
+
+    write_signature_blobs(&repo, "ostree.sign.ed25519", 63, true);
+    let run = verify();
+    run.ok();
+    assert!(
+        run.stdout_trimmed()
+            .ends_with("signature 64: good\nverification OK"),
+        "{}",
+        run.stdout_trimmed()
+    );
+
+    write_signature_blobs(&repo, "ostree.sign.ed25519", 64, true);
+    let run = verify();
+    assert_eq!(run.status.code(), Some(1));
+    assert!(run.stdout.is_empty(), "{}", run.stdout_trimmed());
+    assert_eq!(String::from_utf8_lossy(&run.stderr), ED25519_LIMIT_ERROR);
+
+    let (run, dest) = pull_local_into_origin(
+        base,
+        "pull",
+        &repo,
+        Some(&format!("verification-ed25519-key={ED25519_PUBLIC_B64}\n")),
+        &["--sign-verify"],
+    );
+    assert_eq!(run.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&run.stderr), ED25519_LIMIT_ERROR);
+    assert_nothing_pulled(&dest, "pull-local");
+}
+
+/// `summary --verify` refuses a summary with more than 64 signatures under
+/// the key of one engine at exit 1.
+#[test]
+fn summary_verify_refuses_more_than_64_signatures_of_one_engine() {
+    let tmp = TmpDir::new("summary-verify-limit");
+    let base = tmp.path();
+    let repo = build_remote(base, "remote");
+    block_on(async {
+        let repo = Repo::open(&repo).await.unwrap();
+        let signer = ostrya::Ed25519Signer::from_base64(ED25519_SECRET_B64).unwrap();
+        repo.sign_summary_all(&[&signer as &dyn ostrya::Signer; 64])
+            .await
+            .unwrap();
+        repo.sign_summary(&signer).await.unwrap();
+    });
+    let repo_arg = format!("--repo={}", repo.display());
+    let run = ostrya(
+        &["summary", &repo_arg, "--verify", ED25519_PUBLIC_B64],
+        None,
+        &[],
+    );
+    assert_eq!(run.status.code(), Some(1));
+    assert!(run.stdout.is_empty(), "{}", run.stdout_trimmed());
+    assert_eq!(String::from_utf8_lossy(&run.stderr), ED25519_LIMIT_ERROR);
+}
+
+/// `static-delta verify` and `static-delta apply-offline` with a key exit 1
+/// over a delta with more than 64 signatures under the key of one engine.
+/// The verify prints `Verification fails` first, as for each other refusal.
+/// The apply writes no object.
+#[test]
+fn static_delta_verify_refuses_more_than_64_signatures_of_one_engine() {
+    let tmp = TmpDir::new("delta-verify-limit");
+    let base = tmp.path();
+    let repo = verify_fixture(base);
+    let delta = repo.join(ostrya::static_delta_relative_dir(
+        None,
+        &Checksum::from_hex(COMMIT).unwrap(),
+    ));
+    block_on(async {
+        let repo = Repo::open(&repo).await.unwrap();
+        let signer = ostrya::Ed25519Signer::from_base64(ED25519_SECRET_B64).unwrap();
+        for _ in 0..64 {
+            repo.sign_static_delta(&delta, &signer).await.unwrap();
+        }
+    });
+
+    assert_verify_run(
+        &run_delta_verify(base, &repo, &[COMMIT, ED25519_PUBLIC_B64]),
+        1,
+        "Verification fails\n",
+        ED25519_LIMIT_ERROR,
+        "verify",
+    );
+
+    let dest = build_dest(base, "dest");
+    let run = ostrya(
+        &[
+            "static-delta",
+            "--repo",
+            dest.to_str().unwrap(),
+            "apply-offline",
+            delta.to_str().unwrap(),
+            ED25519_PUBLIC_B64,
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(run.status.code(), Some(1));
+    assert!(run.stdout.is_empty(), "{}", run.stdout_trimmed());
+    assert_eq!(String::from_utf8_lossy(&run.stderr), ED25519_LIMIT_ERROR);
+    assert!(
+        loose_objects(&dest).is_empty(),
+        "apply-offline wrote objects"
+    );
+}
+
+/// `show` and `log` refuse a commit with more than 64 blobs under
+/// `ostree.gpgsigs` at exit 1.
+#[cfg(feature = "gpg")]
+#[test]
+fn show_refuses_more_than_64_gpg_signature_blobs() {
+    let tmp = TmpDir::new("show-gpg-limit");
+    let repo = commit_fixture(tmp.path());
+    let repo_arg = format!("--repo={}", repo.display());
+    write_signature_blobs(&repo, "ostree.gpgsigs", 65, false);
+    for args in [["show", &repo_arg, COMMIT], ["log", &repo_arg, BRANCH]] {
+        let run = ostrya(&args, None, &[]);
+        assert_eq!(run.status.code(), Some(1), "{}", args[0]);
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            "error: signature: the signature dict holds more than 64 signatures under \
+             'ostree.gpgsigs'\n",
+            "{}",
+            args[0]
+        );
+    }
+}
+
 /// `sign` writes the `.commitmeta` file through a named temp file in `tmp/`.
 /// With fsync on, it syncs the temp file with `fsync`, and then the fan-out
 /// directory that holds the `.commitmeta` file. It makes no `fdatasync` call.

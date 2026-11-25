@@ -4785,6 +4785,58 @@ fn a_delta_is_held_to_the_pulls_signature_policy() {
     });
 }
 
+/// A pull refuses a static delta with more than 64 signatures under the key
+/// of one engine, also when the trusted key made each of them. The pull fails
+/// before it fetches a part and publishes nothing.
+#[test]
+fn a_delta_with_more_than_64_signatures_of_one_engine_is_refused() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-delta-verify-limit");
+        let src = dir.path().join("src");
+        build_tree(&src, b"hello\n");
+        let remote_path = dir.path().join("remote");
+        let remote = Repo::create(&remote_path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let tip = commit_tree(&remote, dir.path(), "src", "test/main", None, FIXED_TS).await;
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        remote.sign_commit(&tip, &signer).await.unwrap();
+        let delta = remote_path.join(
+            remote
+                .generate_static_delta(
+                    None,
+                    &tip,
+                    &DeltaOptions {
+                        timestamp: Some(FIXED_TS),
+                        ..DeltaOptions::default()
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+        for _ in 0..65 {
+            remote.sign_static_delta(&delta, &signer).await.unwrap();
+        }
+
+        let server = RepoServer::start(&remote_path, false).await;
+        let extra = format!("sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n");
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), &extra).await;
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m)
+                if m == "the signature dict holds more than 64 signatures under \
+                         'ostree.sign.ed25519'"),
+            "{err}"
+        );
+        assert_nothing_published(&dest).await;
+        assert!(
+            !server.seen().iter().any(|path| path.ends_with("/0")),
+            "no part was fetched: {:?}",
+            server.seen()
+        );
+    });
+}
+
 /// Interop: a pull by ostrya verifies the signatures that the `ostree` command
 /// writes. The command builds the remote and signs its commit and its summary
 /// with ed25519. ostrya pulls the remote under a policy that names that key. It

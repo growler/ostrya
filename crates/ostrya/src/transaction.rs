@@ -2074,7 +2074,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(
-                crate::sign::signatures_for(&dict, KEY),
+                crate::sign::signatures_for(&dict, KEY).unwrap(),
                 vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()]
             );
             let text = |key: &str| {
@@ -2238,7 +2238,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(stored.dict_get("a").is_some(), "the staged key stays");
-            assert_eq!(crate::sign::signatures_for(&stored, KEY), vec![vec![9; 64]]);
+            assert_eq!(
+                crate::sign::signatures_for(&stored, KEY).unwrap(),
+                vec![vec![9; 64]]
+            );
         });
     }
 

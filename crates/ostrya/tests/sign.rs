@@ -718,3 +718,66 @@ fn signing_items_resolve_at_their_public_paths() {
         assert_eq!(signer.homedir(), Some(Path::new("/nonexistent")));
     }
 }
+
+/// The base64 of a 64-byte ed25519 secret key (seed, then public key).
+const ED25519_SECRET_B64: &str =
+    "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
+
+/// The refusal of a dict with more than 64 signatures under the ed25519 key.
+const ED25519_LIMIT_ERROR: &str =
+    "the signature dict holds more than 64 signatures under 'ostree.sign.ed25519'";
+
+/// The verification of a commit reads at most 64 signatures under the key of
+/// one engine. A commit with 64 signatures of the trusted key verifies. A
+/// 65th signature fails the verification and the signing search, also with
+/// valid signatures in the dict.
+#[test]
+fn a_commit_with_more_than_64_signatures_of_one_engine_is_refused() {
+    use ostrya::sign::append_signature;
+    use ostrya::{Ed25519Verifier, Error, ObjectType, SigningKey, Verifier, base64};
+
+    let tmp = TmpDir::new("sign-limit");
+    let base = tmp.path();
+    let secret = base64::decode(ED25519_SECRET_B64).unwrap();
+    let key = SigningKey::ed25519(&secret).unwrap();
+    let verifier: Arc<dyn Verifier> =
+        Arc::new(Ed25519Verifier::new([&secret[32..]], Vec::<Vec<u8>>::new()).unwrap());
+    block_on(async {
+        let (repo, commit) = build_committed_repo(base).await;
+        // An ed25519 signature is deterministic, so the 64 blobs are equal.
+        let payload = repo
+            .load_object_bytes(ObjectType::Commit, &commit)
+            .await
+            .unwrap();
+        let blob = key.signer().sign(&payload).await.unwrap();
+        let mut dict = Value::Array(Vec::new());
+        for _ in 0..64 {
+            append_signature(&mut dict, "ostree.sign.ed25519", blob.clone()).unwrap();
+        }
+        repo.write_commit_detached_metadata(&commit, Some(&dict))
+            .await
+            .unwrap();
+        let outcome = repo
+            .verify_commit(&commit, std::slice::from_ref(&verifier))
+            .await
+            .unwrap();
+        assert!(outcome.valid);
+        assert_eq!(outcome.signatures.len(), 64);
+        assert!(repo.has_signed_commit(&commit, &key).await.unwrap());
+
+        repo.sign_commit(&commit, key.signer()).await.unwrap();
+        let err = repo
+            .verify_commit(&commit, std::slice::from_ref(&verifier))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m == ED25519_LIMIT_ERROR),
+            "{err}"
+        );
+        let err = repo.has_signed_commit(&commit, &key).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m == ED25519_LIMIT_ERROR),
+            "{err}"
+        );
+    });
+}

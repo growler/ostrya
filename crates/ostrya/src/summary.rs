@@ -1954,6 +1954,11 @@ impl Repo {
     ///
     /// - [`Error::InvalidFormat`] if the repository has no `summary`.
     /// - [`Error::Core`] if `summary.sig` is not an `a{sv}` dict.
+    /// - [`Error::Signature`] with the message of
+    ///   [`signatures_for`](crate::sign::signatures_for) if `summary.sig`
+    ///   holds more than
+    ///   [`MAX_SIGNATURES_PER_ENGINE`](crate::sign::MAX_SIGNATURES_PER_ENGINE)
+    ///   blobs under the key of a verifier. No verifier runs.
     /// - [`Error::Signature`], or the variant that the engine error converts
     ///   to, if a verifier fails.
     /// - [`Error::Io`] if a read fails.

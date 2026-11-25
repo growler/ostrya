@@ -257,7 +257,9 @@ struct Edit<'a> {
 ///   [`check_bindings`] states.
 /// - Each new commit passes the signature verification of each of its rules
 ///   (`signature-required`). The verification reads the union of the stored
-///   and the incoming detached metadata. A rule that accepts a commit with no
+///   and the incoming detached metadata. A union with more than
+///   [`MAX_SIGNATURES_PER_ENGINE`](crate::sign::MAX_SIGNATURES_PER_ENGINE)
+///   blobs under the key of one engine fails it. A rule that accepts a commit with no
 ///   signature skips a commit whose union holds no signature blob. A commit
 ///   that no update names gets no verification, a staged parent and an
 ///   attachment included. The checksum of an attachment is in field 2 of a
@@ -279,6 +281,13 @@ struct Edit<'a> {
 ///
 /// - The merge of the filtered incoming dict into the stored dict.
 /// - A signature that a key before it made.
+///
+/// The search of the merge fails with `signature-required` if the merge holds
+/// more than
+/// [`MAX_SIGNATURES_PER_ENGINE`](crate::sign::MAX_SIGNATURES_PER_ENGINE) blobs
+/// under the metadata key of the engine of the server key. The merge holds no
+/// signature of a server key of the session, so these signatures do not count
+/// to the limit. The search checks them on their own.
 ///
 /// If no `hooks` are given, this step also finds the size of each dict that
 /// the commit writes. Then the fast-forward walk of each update reads the
@@ -1978,7 +1987,8 @@ fn oversize_failure(commit: &Checksum, size: u64) -> Failure {
 /// A key makes no signature if it already signed the commit. The signature
 /// can be in the merge of the filtered incoming dict into the stored dict.
 /// It can also be a signature that a key before it made. As a result, two
-/// keys that hold one secret sign once.
+/// keys that hold one secret sign once. [`signed_before`] states the search,
+/// and the limit that applies to the merge alone.
 ///
 /// If `size` is `true`, this function then finds the size of the dict that
 /// each edit writes. A session with hooks finds the size after the merge of
@@ -1997,28 +2007,84 @@ async fn prepare_signatures(mut edits: Vec<Edit<'_>>, size: bool) -> Checked<Vec
         .await?;
         if let Some(dict) = written.as_mut() {
             for signer in signers {
-                if signer.has_signed_payload(edit.payload, Some(dict)).await {
+                if signed_before(signer, edit.payload, dict, &edit.signatures).await? {
                     continue;
                 }
-                let key = signer.signer().metadata_key();
                 let signature = signer
                     .signer()
                     .sign(edit.payload.bytes())
                     .await
-                    .map_err(|e| Failure::Internal(e.into()))?;
-                append_signature(dict, key, signature.clone())
                     .map_err(|e| Failure::Internal(e.into()))?;
                 edit.signatures.push(Prepared {
                     signer: signer.as_ref(),
                     signature,
                 });
             }
+            append_prepared(dict, &edit.signatures)?;
         }
         if size {
             edit.oversize = oversize(edit, written).await?;
         }
     }
     Ok(edits)
+}
+
+/// Returns `true` if `signer` signed `payload` in `dict` or in `kept`.
+///
+/// `dict` is the merge of the filtered incoming dict into the stored dict,
+/// with no signature of this session. The search of `dict` applies the limit
+/// of [`signatures_for`](crate::sign::signatures_for), and an error of it is
+/// the failure of [`search_failure`]. `kept` holds the signatures of the keys
+/// before `signer` in this session. The call checks the signatures of `kept`
+/// under the key of the engine of `signer` directly, with no limit, so the
+/// signatures of this session do not count to the limit.
+async fn signed_before(
+    signer: &SigningKey,
+    payload: Payload<'_>,
+    dict: &Value,
+    kept: &[Prepared<'_>],
+) -> Checked<bool> {
+    if signer
+        .has_signed_payload(payload, Some(dict))
+        .await
+        .map_err(search_failure)?
+    {
+        return Ok(true);
+    }
+    let key = signer.signer().metadata_key();
+    let own: Vec<Vec<u8>> = kept
+        .iter()
+        .filter(|p| p.signer.signer().metadata_key() == key)
+        .map(|p| p.signature.clone())
+        .collect();
+    Ok(signer.signed_one_of(payload, own).await)
+}
+
+/// Appends each signature of `prepared` to `dict`, in order, under the key of
+/// the engine of its signer.
+fn append_prepared(dict: &mut Value, prepared: &[Prepared<'_>]) -> Checked<()> {
+    for p in prepared {
+        append_signature(dict, p.signer.signer().metadata_key(), p.signature.clone())
+            .map_err(|e| Failure::Internal(e.into()))?;
+    }
+    Ok(())
+}
+
+/// Returns the failure for an error of the search for the signature of a
+/// server key.
+///
+/// The search refuses a dict with more than
+/// [`MAX_SIGNATURES_PER_ENGINE`](crate::sign::MAX_SIGNATURES_PER_ENGINE) blobs
+/// under the key of the engine with [`Error::Signature`]. The blobs come from
+/// the client or from the stored dict. The stored dict of a server commit that
+/// the host makes is one example, in [`sign_server_commit`]. That error is
+/// `signature-required` in each case, as in the verification of a rule. Each
+/// other error is a failure on the server side.
+fn search_failure(error: Error) -> Failure {
+    match error {
+        Error::Signature(message) => Failure::Wire(remote::Error::SignatureRequired(message)),
+        other => Failure::Internal(other),
+    }
 }
 
 /// Returns the failure for a refusal of the plan of the host, a failure on
@@ -2312,7 +2378,8 @@ async fn add_host_entries<'a>(
 ///
 /// If the dict changed, this function drops some prepared signatures. It
 /// drops each one whose key signed the commit in the new merge, or in a
-/// signature kept before it. It then finds the size again.
+/// signature kept before it, as [`signed_before`] states. It then finds the
+/// size again.
 ///
 /// Last, [`queue_edit`] queues each edit.
 async fn queue_detached(repo: &Repo, txn: &Transaction, edits: Vec<Edit<'_>>) -> Checked<()> {
@@ -2332,18 +2399,12 @@ async fn queue_detached(repo: &Repo, txn: &Transaction, edits: Vec<Edit<'_>>) ->
             .await?;
             if let Some(dict) = written.as_mut() {
                 for prepared in prepared {
-                    if prepared
-                        .signer
-                        .has_signed_payload(edit.payload, Some(dict))
-                        .await
-                    {
+                    if signed_before(prepared.signer, edit.payload, dict, &edit.signatures).await? {
                         continue;
                     }
-                    let key = prepared.signer.signer().metadata_key();
-                    append_signature(dict, key, prepared.signature.clone())
-                        .map_err(|e| Failure::Internal(e.into()))?;
                     edit.signatures.push(prepared);
                 }
+                append_prepared(dict, &edit.signatures)?;
             }
             edit.oversize = oversize(&edit, written).await?;
         }

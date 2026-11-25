@@ -1145,6 +1145,16 @@ impl BucketRepo {
                 return Ok(());
             }
         };
+        // A dict over the limit of one engine gets the refusal of the limit
+        // alone. The hint about the summary signers does not apply to it.
+        match keys.policy().check_signature_count(dict.as_ref()) {
+            Ok(()) => {}
+            Err(Error::Signature(message)) => {
+                run.add(BucketFindingKind::Summary, true, "summary.sig", message);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
         match keys
             .policy()
             .check("the summary", summary, dict.as_ref())

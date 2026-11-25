@@ -402,9 +402,9 @@ fn has_signed_commit_sees_the_signature_of_the_key() {
     // agrees.
     let data = block_on(repo.load_object_bytes(ostrya::ObjectType::Commit, &commit)).unwrap();
     let dict = block_on(repo.read_commit_detached_metadata(&commit)).unwrap();
-    assert!(block_on(key.has_signed(&data, dict.as_ref())));
-    assert!(!block_on(key.has_signed(b"other bytes", dict.as_ref())));
-    assert!(!block_on(key.has_signed(&data, None)));
+    assert!(block_on(key.has_signed(&data, dict.as_ref())).unwrap());
+    assert!(!block_on(key.has_signed(b"other bytes", dict.as_ref())).unwrap());
+    assert!(!block_on(key.has_signed(&data, None)).unwrap());
 
     // A commit that the repository does not hold.
     let absent = Checksum::from_hex(&"ab".repeat(32)).unwrap();

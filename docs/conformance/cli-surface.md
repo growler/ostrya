@@ -5779,6 +5779,68 @@ has an HTTP or an ssh address. So no option of `pull` sets it for an HTTP
 remote.
 Cookie-jar support needs its own design pass against that refusal.
 
+## The signature limit of one engine
+
+The port reads at most 64 signature blobs under the metadata key of one engine
+in one signature dict. The dict is the detached metadata of a commit,
+`summary.sig`, or the signatures of a signed static delta. Only the byte
+strings under the key count. A GPG blob counts as one blob, also when it holds
+more than one signature packet. The GPG engine also reads at most 64
+signature packets in all blobs of one verification together ("GPG
+verification differences", item 5). A command that verifies a dict with more
+blobs under the key of one of its engines refuses it before any verifier of
+that engine runs, also when the dict holds a valid signature. A verifier of
+another engine can run first. `sign --verify`, `summary --verify`,
+`static-delta verify`, and `static-delta apply-offline` with several engines
+verify one engine before they read the blobs of the next engine. A pull with
+GPG and sign-api verification verifies the GPG signatures before it reads
+the sign-api blobs. The command writes this line and exits 1:
+
+```text
+error: signature: the signature dict holds more than 64 signatures under '<key>'
+```
+
+`<key>` is the metadata key of the engine, for example `ostree.sign.ed25519`
+or `ostree.gpgsigs`. These commands refuse:
+
+- `sign --verify`. It writes nothing to standard output.
+- `summary --verify`. It writes nothing to standard output.
+- `static-delta verify`. It writes `Verification fails` to standard output
+  first, as for each other refusal.
+- `static-delta apply-offline` with a key source. It writes no object.
+- `show` and `log`, over the `ostree.gpgsigs` blobs of a commit.
+- `pull` and `pull-local`, when they verify a commit, a summary, or a static
+  delta. A pull writes no object and no ref.
+
+`remote fsck` with a remote name gives the refusal as a finding of the
+`summary.sig` of the bucket. The detail of the finding is the refusal alone.
+The command writes this line to standard error:
+
+```text
+summary summary.sig: the signature dict holds more than 64 signatures under '<key>'
+```
+
+It then writes `error: Bucket repository corruption encountered` and exits 1.
+
+The receive endpoint of `receive` and `serve` gives `signature-required` for
+the trust check of a rule and for the search for the signature of a server
+key. The session writes no object and no ref. The search for the signature
+of a server key reads the dict of the commit with no server signature of the
+session. So a client dict of 64 blobs under the key of an engine gets the
+signature of each server key of that engine.
+
+The commands that sign do not apply the limit. `sign` appends a 65th
+signature, and each verification of the commit then refuses it.
+
+`ostree` 2026.1 reads each blob. On 2026-11-25, a commit held 65 ed25519
+blobs: 64 signatures of keys that the run does not trust, and the signature
+of the trusted key last. `ostree sign --verify --sign-type=ed25519 COMMIT KEY`
+reported `ed25519: Signature verified successfully with key '<hex>'` at exit
+0. A `pull` of the tool from a `file://` remote with `sign-verify=true`
+imported the commit at exit 0. `cli-behavior.md`, `sign`, "The verify
+report", records the probe. `docs/decisions.md`, "The signature limit of one
+engine", states the reason for the limit.
+
 ## GPG verification differences
 
 The port verifies a GPG signature in the process, under its own trust and
@@ -5870,10 +5932,15 @@ the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
    such a signature, and `gpgv --keyring <ring> <sig> <data>` reports
    `GOODSIG` over it.
 5. The input limits. The port refuses, by name, a stored signature blob over
-   1 MiB or with more than 64 signature packets, and a keyring over 4 MiB or
-   with more than 256 certificates. `gpgv` reads an input of each of these
-   four shapes and reports on it. The port also refuses a file of a
-   `gpgkeypath` entry over these two keyring limits. In a `gpgkeypath`
+   1 MiB, the stored blobs of one verification with more than 64 signature
+   packets together, and a keyring over 4 MiB or with more than 256
+   certificates. `gpgv` reads an input of each of these four shapes and
+   reports on it. The port counts the signature packets of all blobs before
+   it verifies a signature, and it refuses more with
+   `the signature blobs hold more than 64 signature packets`. The port also
+   refuses more than 64 blobs under `ostree.gpgsigs` ("The signature limit
+   of one engine"). The port also refuses a file of a `gpgkeypath` entry over
+   these two keyring limits. In a `gpgkeypath`
    directory, `ostree` 2026.1 reads a file of 5 MiB that holds blank lines
    and then the armored keyring, and trusts the key. The port reads at most
    4 MiB of key input from the `-k` files of `remote gpg-import` together,
@@ -6087,7 +6154,9 @@ ostrya receive [--repo=PATH] --one-way [--allow-remote=REMOTE]...
   `TrustedKeys::from_trust_group`, on the default rule and on each rule of
   `--allow-remote` and of `--allow-collection`. Each commit that is the new
   value of a ref must pass the keys, and a commit with no signature gets
-  `signature-required`. An
+  `signature-required`. A commit with more than 64 blobs under the key of
+  an engine of the keys also gets `signature-required` ("The signature
+  limit of one engine"). An
   attachment that field 2 of the commit names gets no verification of its
   own, because the signature of the commit covers field 2. A name with no
   group gets `error: invalid input: the config has no [ex-ostrya trust

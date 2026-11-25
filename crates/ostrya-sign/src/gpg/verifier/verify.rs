@@ -35,9 +35,10 @@ use crate::{Error, Result, SignatureInfo, VerifyOutcome};
 /// blob in memory. One detached signature is a few hundred bytes, so one
 /// mebibyte holds thousands of them.
 const MAX_SIGNATURE_BLOB: usize = 1024 * 1024;
-/// The maximum number of signature packets in one blob. A commit carries a few
-/// signatures. The limit bounds the parser work and the public-key operations
-/// that a blob from the detached metadata of a pulled commit can cause.
+/// The maximum number of signature packets in all blobs of one verification.
+/// A commit carries a few signatures. The limit bounds the parser work and the
+/// public-key operations that the blobs from the detached metadata of a pulled
+/// commit can cause.
 const MAX_SIGNATURE_PACKETS: usize = 64;
 
 /// Reports on each signature in `blobs`, over `payload`, against the
@@ -45,6 +46,10 @@ const MAX_SIGNATURE_PACKETS: usize = 64;
 ///
 /// [`VerifyOutcome::valid`] is the OR of the flags of all signatures. One valid
 /// signature among several makes the outcome valid.
+///
+/// The function parses all blobs before it verifies a signature. If the blobs
+/// hold more than [`MAX_SIGNATURE_PACKETS`] signature packets together, the
+/// function fails with [`Error::Signature`], and no signature is verified.
 ///
 /// The work is public-key cryptography over untrusted input.
 /// [`Verifier::verify`](crate::Verifier::verify) for
@@ -58,82 +63,86 @@ pub(super) fn verify_signatures(
     blobs: &[Vec<u8>],
     rule: TimeRule,
 ) -> Result<VerifyOutcome> {
-    let mut outcome = VerifyOutcome::default();
+    let mut parsed: Vec<Vec<DetachedSignature>> = Vec::with_capacity(blobs.len());
+    let mut total = 0;
     for (index, blob) in blobs.iter().enumerate() {
-        let infos = verify_blob(
-            certs,
-            payload,
-            blob,
-            &format!("the signature blob {index}"),
-            rule,
-        )?;
-        if infos.is_empty() {
+        let signatures = parse_blob(blob, &blob_subject(index), MAX_SIGNATURE_PACKETS - total)?;
+        total += signatures.len();
+        parsed.push(signatures);
+    }
+    let mut outcome = VerifyOutcome::default();
+    for (index, signatures) in parsed.iter().enumerate() {
+        if signatures.is_empty() {
             outcome.signatures.push(SignatureInfo::default());
-        } else {
-            for info in infos {
-                outcome.valid |= info.valid;
-                outcome.signatures.push(info);
-            }
+            continue;
+        }
+        let infos = super::contained(&panicked(&blob_subject(index)), || {
+            Ok(signatures
+                .iter()
+                .map(|signature| describe(certs, payload, signature, rule))
+                .collect::<Vec<_>>())
+        })?;
+        for info in infos {
+            outcome.valid |= info.valid;
+            outcome.signatures.push(info);
         }
     }
     Ok(outcome)
 }
 
-/// Reports on each signature in one blob. `subject` names the blob, so a
-/// refusal states which blob reached which limit.
+/// Returns the name of the blob at `index` for a refusal.
+fn blob_subject(index: usize) -> String {
+    format!("the signature blob {index}")
+}
+
+/// Returns the signature packets of one blob. `subject` names the blob, so a
+/// refusal states which blob reached the size limit. `room` is the number of
+/// packets that the blobs before it leave of [`MAX_SIGNATURE_PACKETS`].
 ///
-/// A blob is untrusted input. The parse and the public-key operations run
-/// inside [`std::panic::catch_unwind`]. A caught panic reads as a blob that the
-/// parser rejects. This containment has two limits:
+/// If the parser reads no whole signature packet from a blob, the result is
+/// empty. This is true if the packet stream does not open, and also if the
+/// first packet is incomplete. [`verify_signatures`] gives such a blob one
+/// record, so the record count follows the blob count.
 ///
-/// - If the final binary is built with `panic = "abort"`, `catch_unwind`
-///   catches nothing.
-/// - `catch_unwind` does not find a parser that returns a wrong answer with no
-///   panic.
-fn verify_blob(
-    certs: &[SignedPublicKey],
-    payload: &[u8],
-    blob: &[u8],
-    subject: &str,
-    rule: TimeRule,
-) -> Result<Vec<SignatureInfo>> {
+/// The parse runs inside [`std::panic::catch_unwind`], and so does the report
+/// on the packets of the blob, with the limits that
+/// [`contained`](super::contained) states.
+fn parse_blob(blob: &[u8], subject: &str, room: usize) -> Result<Vec<DetachedSignature>> {
     if blob.len() > MAX_SIGNATURE_BLOB {
         return Err(Error::Signature(format!(
             "{subject} is over the {MAX_SIGNATURE_BLOB}-byte ceiling"
         )));
     }
-    let work = || -> Result<Vec<SignatureInfo>> {
-        let mut infos: Vec<SignatureInfo> = Vec::new();
-        // If the parser reads no whole signature packet from a blob, this
-        // function reports no record for it. This is true if the packet stream
-        // does not open, and also if the first packet is incomplete. The caller
-        // gives such a blob one record, so the record count follows the blob
-        // count.
+    super::contained(&panicked(subject), || {
+        let mut packets = Vec::new();
         let Ok(signatures) = DetachedSignature::from_bytes_many(Cursor::new(blob)) else {
-            return Ok(infos);
+            return Ok(packets);
         };
         for signature in signatures {
-            // Each packet that the parser read whole keeps its record. The
-            // stream stops at the first packet that is not whole. The parser
-            // reads each packet before the limit test, so the limit refuses a
-            // blob only on a whole packet. If a blob holds the limit and ends
-            // in a partial packet, it reports the whole packets and stops.
+            // Each packet that the parser read whole counts. The stream stops
+            // at the first packet that is not whole. The parser reads each
+            // packet before the limit test, so the limit refuses the blobs
+            // only on a whole packet. If the blobs hold the limit and the last
+            // one ends in a partial packet, the whole packets stay and the
+            // stream stops.
             let Ok(signature) = signature else { break };
-            if infos.len() == MAX_SIGNATURE_PACKETS {
+            if packets.len() == room {
                 return Err(Error::Signature(format!(
-                    "{subject} holds more than {MAX_SIGNATURE_PACKETS} signature packets"
+                    "the signature blobs hold more than {MAX_SIGNATURE_PACKETS} signature \
+                     packets"
                 )));
             }
-            infos.push(describe(certs, payload, &signature, rule));
+            packets.push(signature);
         }
-        Ok(infos)
-    };
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
-        Ok(result) => result,
-        Err(_) => Err(Error::Signature(format!(
-            "{subject} is not readable as an OpenPGP signature: the parser panicked"
-        ))),
-    }
+        Ok(packets)
+    })
+}
+
+/// Returns the refusal of the blob that `subject` names, for a panic in the
+/// parser or in the policy. A caught panic reads as a blob that the parser
+/// rejects.
+fn panicked(subject: &str) -> String {
+    format!("{subject} is not readable as an OpenPGP signature: the parser panicked")
 }
 
 /// Reports on one signature packet.
@@ -2137,7 +2146,7 @@ mod tests {
 
     /// A blob with more than 64 signature packets is refused.
     ///
-    /// The error names the blob and states the limit. `gpgv` reads each packet
+    /// The error states the limit. `gpgv` reads each packet
     /// and reports one record for each, so the limit belongs to ostrya.
     #[test]
     fn too_many_signature_packets_is_refused() {
@@ -2152,8 +2161,8 @@ mod tests {
         assert!(many.len() <= MAX_SIGNATURE_BLOB);
         let err = verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&many)).unwrap_err();
         assert!(
-            matches!(&err, Error::Signature(m) if m.contains("signature blob 0")
-                && m.contains("64 signature packets")),
+            matches!(&err, Error::Signature(m)
+                if m == "the signature blobs hold more than 64 signature packets"),
             "{err}"
         );
         assert_eq!(
@@ -2165,6 +2174,30 @@ mod tests {
         let allowed = one.repeat(MAX_SIGNATURE_PACKETS);
         let outcome = verify_signatures(&certs, PAYLOAD, &[allowed]).unwrap();
         assert_eq!(outcome.signatures.len(), MAX_SIGNATURE_PACKETS);
+    }
+
+    /// The limit of 64 signature packets applies to all blobs of one call
+    /// together. Two blobs of 33 packets each are refused, and two blobs of
+    /// 32 packets each give one record for each packet.
+    #[test]
+    fn the_packet_limit_counts_the_packets_of_all_blobs() {
+        if !tools_available() {
+            return;
+        }
+        let home = Fixture::new("Sum <sum@ostrya.example>");
+        let certs = home.certs();
+        let one = home.sign(&home.primary, PAYLOAD);
+        let over = one.repeat(MAX_SIGNATURE_PACKETS / 2 + 1);
+        let err = verify_signatures(&certs, PAYLOAD, &[over.clone(), over]).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m)
+                if m == "the signature blobs hold more than 64 signature packets"),
+            "{err}"
+        );
+        let half = one.repeat(MAX_SIGNATURE_PACKETS / 2);
+        let outcome = verify_signatures(&certs, PAYLOAD, &[half.clone(), half]).unwrap();
+        assert_eq!(outcome.signatures.len(), MAX_SIGNATURE_PACKETS);
+        assert!(outcome.valid);
     }
 
     /// A blob with the maximum number of whole packets and a partial packet at

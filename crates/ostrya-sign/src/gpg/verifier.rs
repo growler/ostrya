@@ -199,11 +199,14 @@ const KEYBOX_MAGIC_OFFSET: usize = 8;
 /// # Limits of a stored blob
 ///
 /// A stored blob is untrusted input. One blob has a limit of 1 MiB, which the
-/// verifier checks before the parser reads the bytes. One blob also has a limit
-/// of 64 signature packets, which the verifier checks as it reads the packets.
-/// Each refusal names the limit that it reached. The policy runs in the same
-/// containment. So if a crafted certificate causes a panic in a public-key
-/// operation, the result is the same as for a blob that the parser refuses.
+/// verifier checks before the parser reads the bytes. All blobs of one call of
+/// [`verify`](crate::Verifier::verify) together have a limit of 64 signature
+/// packets. The verifier counts the packets as it parses the blobs, and it
+/// parses all blobs before it verifies a signature. So a refusal comes before
+/// any public-key operation. Each refusal names the limit that it reached.
+/// The policy runs in the same containment. So if a crafted certificate causes
+/// a panic in a public-key operation, the result is the same as for a blob
+/// that the parser refuses.
 #[derive(Debug, Clone, Default)]
 pub struct GpgVerifier {
     /// The certificates of the loaded keyrings, in load order.
@@ -851,9 +854,10 @@ fn parse_keyring(
 /// Runs `work`, which reads OpenPGP packets, and changes a panic in it to the
 /// error that `refusal` states.
 ///
-/// A keyring is untrusted input, so each read of a keyring runs here. A caught
-/// panic gives the same result as input that the parser refuses. Two limits
-/// apply:
+/// A keyring and a stored signature blob are untrusted input, so each read of
+/// a keyring, and the parse of a blob and the report on its packets, run here.
+/// A caught panic gives the same result as input that the parser refuses. Two
+/// limits apply:
 ///
 /// - If the final binary is built with `panic = "abort"`, `catch_unwind`
 ///   catches nothing.

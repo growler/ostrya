@@ -2427,6 +2427,10 @@ signature blobs:
   OpenSSL.
 - `ostree.sign.dummy` -- the test engine.
 
+The port verifies at most 64 blobs under the key of one engine in one dict,
+and refuses a dict with more. `cli-surface.md`, "The signature limit of one
+engine", states the rule.
+
 ### Signing sequence
 
 A signature that a commit write produces stands before the ref that names the
@@ -2713,10 +2717,13 @@ RFC 8410.
 The signature key is `ostree.gpgsigs`. Each `ay` element is one detached
 OpenPGP signature: the binary signature packet stream, with no armor. A blob
 can hold more than one signature packet, and each packet is verified
-independently. The port signs through the system GnuPG installation
-(`gpg --detach-sign`, driven over the machine-readable `--status-fd`
-interface). It verifies in the process with the `pgp` crate (rPGP). The stored
-blobs are thus the OpenPGP interchange form that GnuPG produces and reads.
+independently. The port verifies at most 64 signature packets in all blobs of
+one verification together. It counts the packets before it verifies a
+signature, and it refuses more. The port signs through the system GnuPG
+installation (`gpg --detach-sign`, driven over the machine-readable
+`--status-fd` interface). It verifies in the process with the `pgp` crate
+(rPGP). The stored blobs are thus the OpenPGP interchange form that GnuPG
+produces and reads.
 
 A signature is valid only where it verifies against a trusted key whose
 bindings hold. A signature by an expired, revoked, or unknown key is invalid.
@@ -4532,7 +4539,8 @@ give the condition of each refusal.
   `t` or `w` on a tag. A hook of a host application can also refuse a commit
   with ref updates or a server commit with this code.
 - `signature-required` -- a commit has a signature that does not verify, or
-  has no signature and the client group requires one.
+  has no signature and the client group requires one, or holds more than 64
+  blobs under the key of an engine that the check reads.
 - `binding-mismatch` -- the ref binding of a commit does not name its target
   ref, or its collection binding does not name the collection of the
   namespace of the ref. A commit with no collection binding on a ref of a
@@ -4893,7 +4901,9 @@ Each failed check ends the session, and the session writes nothing:
 8. A new commit that the client built must pass the signature verification
    of the client group, else `signature-required`. The verification reads the stored detached
    metadata of the commit and the incoming dict together, before the switch
-   of step 9. A group with no `verify`
+   of step 9. In a group with `verify`, a dict that holds more than 64
+   blobs under the key of an engine that the trust group reads is also
+   `signature-required`. A group with no `verify`
    checks no signature. A group with `verify=trust:NAME` checks each axis of
    the trust group. With `allow-unsigned=true`, a commit whose dict holds no
    blob under `ostree.gpgsigs`, `ostree.sign.ed25519`, `ostree.sign.spki`, and
@@ -4914,7 +4924,12 @@ Each failed check ends the session, and the session writes nothing:
 9. If `[ex-ostrya] keep-detached-related` is `false`, the server drops
    `ostrya.related` from each incoming dict ("The switch of the
    destination"). The server then makes the staged objects durable, and signs each new commit one time with each key
-   of the key `sign` of the client group. The server signs no other commit,
+   of the key `sign` of the client group. The search for the signature of a
+   key reads the merged dict with no server signature of the session, at
+   most 64 blobs under the key of its engine, and a merged dict with more is
+   `signature-required`. The search checks the signatures of the keys before
+   it in the session on their own, and these do not count to the limit. The
+   server signs no other commit,
    a staged parent and an attachment included. The incoming dict of each
    other commit of the session, a staged attachment included, merges into
    its stored dict with no signature. The server then walks the history of each update
@@ -8796,9 +8811,11 @@ Each finding has one kind, and is an error or a note:
   summary keys, an absent `summary` or `summary.sig` is an error too. A
   `summary` or a `summary.sig` larger than 64 MiB is one error. The detail
   of a `summary.sig` that the summary keys do not verify states that a
-  summary update with the summary signers writes a matching pair. The
-  detail of an absent `summary.sig` states that a summary update with the
-  summary signers writes a `summary.sig`.
+  summary update with the summary signers writes a matching pair. A
+  `summary.sig` with more than 64 blobs under the key of an engine of the
+  summary keys gives the refusal of the limit as the detail, with no other
+  text, before a verifier runs. The detail of an absent `summary.sig` states
+  that a summary update with the summary signers writes a `summary.sig`.
 - `summary`, an error: with a summary in the bucket, a delta map of the
   bucket that the run cannot build. This is a key
   `deltas/<fanout>/<leaf>/superblock` whose directory names do not decode

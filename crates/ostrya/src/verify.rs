@@ -31,8 +31,8 @@ use crate::pull::PullVerify;
 use crate::repo::Repo;
 use crate::repo_fs::{FsError, Named, Reason, open_named};
 use crate::sign::{
-    Ed25519Verifier, MAX_KEY_FILE, SignKeys, Verifier, key_text, load_sign_keys, read_key_source,
-    signatures_for,
+    Ed25519Verifier, MAX_KEY_FILE, SignKeys, Verifier, capped_signatures, key_text, load_sign_keys,
+    read_key_source,
 };
 
 pub(crate) mod trust;
@@ -863,6 +863,22 @@ impl Policy {
         self.gpg.is_some()
     }
 
+    /// Refuses `signatures` if it holds more than
+    /// [`MAX_SIGNATURES_PER_ENGINE`](crate::sign::MAX_SIGNATURES_PER_ENGINE)
+    /// blobs under the key of a verifier of this policy, with the error of
+    /// [`signatures_for`](crate::sign::signatures_for). The call reads the
+    /// verifiers of each axis, and no verifier runs.
+    #[cfg(feature = "s3")]
+    pub(crate) fn check_signature_count(&self, signatures: Option<&Value>) -> Result<()> {
+        let Some(dict) = signatures else {
+            return Ok(());
+        };
+        for verifier in self.gpg.iter().chain(self.sign.iter().flatten()) {
+            capped_signatures(dict, verifier.metadata_key())?;
+        }
+        Ok(())
+    }
+
     /// Verifies the signatures over `payload` on every axis of this policy.
     ///
     /// `signatures` is the detached-metadata dict that holds the signatures. It
@@ -998,6 +1014,15 @@ pub(crate) enum Found {
 /// verifiers that have a blob then run in one call on the blocking pool, in
 /// order, with the payload that they share. The call stops at the first valid
 /// signature. [`Payload`] states when the check copies the payload.
+///
+/// If `signatures` holds more than
+/// [`MAX_SIGNATURES_PER_ENGINE`](crate::sign::MAX_SIGNATURES_PER_ENGINE) blobs
+/// under the key of a verifier, the call fails with [`Error::Signature`], with
+/// the message of [`signatures_for`](crate::sign::signatures_for), before a
+/// verifier of `verifiers` runs. The call reads and counts the blobs of all of
+/// `verifiers` before it copies a blob. A [`Policy::check`] runs one axis
+/// after the other, so the verifiers of an axis can run before the call for
+/// the next axis counts its blobs.
 pub(crate) async fn examine<'p>(
     verifiers: &[Arc<dyn Verifier>],
     payload: impl Into<Payload<'p>>,
@@ -1017,11 +1042,17 @@ async fn examine_pooled(
     let Some(dict) = signatures else {
         return Ok(Found::Nothing);
     };
+    let capped = verifiers
+        .iter()
+        .map(|verifier| capped_signatures(dict, verifier.metadata_key()))
+        .collect::<Result<Vec<_>>>()?;
     let jobs: Vec<Job> = verifiers
         .iter()
-        .filter_map(|verifier| {
-            let blobs = signatures_for(dict, verifier.metadata_key());
-            (!blobs.is_empty()).then(|| (Arc::clone(verifier), blobs))
+        .zip(capped)
+        .filter(|(_, blobs)| !blobs.is_empty())
+        .map(|(verifier, blobs)| {
+            let blobs = blobs.into_iter().map(<[u8]>::to_vec).collect();
+            (Arc::clone(verifier), blobs)
         })
         .collect();
     if jobs.is_empty() {

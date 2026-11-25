@@ -559,6 +559,10 @@ impl Repo {
     /// - [`Error::Core`] or [`Error::InvalidFormat`] if the superblock does not
     ///   parse, as [`DeltaSuperblock::parse`] states.
     /// - [`Error::Signature`] if the delta is not signed.
+    /// - [`Error::Signature`] if the envelope holds more than
+    ///   [`MAX_SIGNATURES_PER_ENGINE`](crate::sign::MAX_SIGNATURES_PER_ENGINE)
+    ///   blobs under the key of a verifier, as [`DeltaSuperblock::verify`]
+    ///   states.
     /// - An error that a verifier returns, as [`Error::Signature`],
     ///   [`Error::InvalidFormat`], or [`Error::Core`].
     pub async fn verify_static_delta(
@@ -1153,6 +1157,11 @@ impl DeltaSuperblock {
     /// # Errors
     ///
     /// - [`Error::Signature`] if the superblock has no signed envelope.
+    /// - [`Error::Signature`] with the message of
+    ///   [`signatures_for`](crate::sign::signatures_for) if the envelope holds
+    ///   more than
+    ///   [`MAX_SIGNATURES_PER_ENGINE`](crate::sign::MAX_SIGNATURES_PER_ENGINE)
+    ///   blobs under the key of a verifier. No verifier runs.
     /// - An error that a verifier returns, as [`Error::Signature`],
     ///   [`Error::InvalidFormat`], or [`Error::Core`].
     pub fn verify(&self, verifiers: &[&dyn Verifier]) -> Result<VerifyOutcome> {

@@ -1546,6 +1546,49 @@ fn verify_static_delta_runs_the_verifiers_on_the_blocking_pool() {
     recorder.assert_one_foreign_call();
 }
 
+/// The verification of a static delta reads at most 64 signatures under the
+/// key of one engine. A delta with 64 signatures of the trusted key verifies
+/// through `Repo::verify_static_delta` and `DeltaSuperblock::verify`. A 65th
+/// signature fails both.
+#[test]
+fn a_delta_with_more_than_64_signatures_of_one_engine_is_refused() {
+    let tmp = TmpDir::new("sb-verify-limit");
+    let delta = verify_fixture_delta(tmp.path(), true);
+    let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+    let trusted: Arc<dyn ostrya::Verifier> = Arc::new(
+        Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new()).unwrap(),
+    );
+    let limit = "the signature dict holds more than 64 signatures under 'ostree.sign.ed25519'";
+    block_on(async {
+        let repo = Repo::open(&tmp.path().join("src")).await.unwrap();
+        for _ in 1..64 {
+            repo.sign_static_delta(&delta, &signer).await.unwrap();
+        }
+        let outcome = repo
+            .verify_static_delta(&delta, std::slice::from_ref(&trusted))
+            .await
+            .unwrap();
+        assert!(outcome.valid);
+        assert_eq!(outcome.signatures.len(), 64);
+        let sb = DeltaSuperblock::read(&delta.join("superblock"))
+            .await
+            .unwrap();
+        assert!(sb.verify(&[trusted.as_ref()]).unwrap().valid);
+
+        repo.sign_static_delta(&delta, &signer).await.unwrap();
+        let err = repo
+            .verify_static_delta(&delta, std::slice::from_ref(&trusted))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::Signature(m) if m == limit), "{err}");
+        let sb = DeltaSuperblock::read(&delta.join("superblock"))
+            .await
+            .unwrap();
+        let err = sb.verify(&[trusted.as_ref()]).unwrap_err();
+        assert!(matches!(&err, Error::Signature(m) if m == limit), "{err}");
+    });
+}
+
 /// `DeltaSuperblock::verify` verifies in the calling thread, and it needs no
 /// async runtime.
 #[test]

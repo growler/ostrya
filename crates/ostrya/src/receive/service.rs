@@ -505,6 +505,12 @@ impl ReceiveService {
     ///   [`allow_unsigned`](super::ReceivePolicy::allow_unsigned), a commit
     ///   with no signature passes, and a commit with a signature that does not
     ///   verify fails.
+    /// - [`remote::Error::SignatureRequired`] if the detached metadata of a
+    ///   new commit holds more than
+    ///   [`MAX_SIGNATURES_PER_ENGINE`](crate::sign::MAX_SIGNATURES_PER_ENGINE)
+    ///   blobs under the key of one engine, and the verification of the
+    ///   policy or the search for the signature of a server key reads that
+    ///   key.
     /// - [`remote::Error::RefMismatch`] if a ref is not in the state that its
     ///   update expects, or if an update writes a commit to a ref that is
     ///   present and the policy gives `t` and no `w` on it. A tag of a server

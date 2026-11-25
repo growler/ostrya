@@ -3256,6 +3256,49 @@ fn sign_verify_of_a_section_checks_the_commits() {
     });
 }
 
+/// A pull refuses a commit with more than 64 signatures under the key of one
+/// engine, also with a signature of the trusted key in the last place. The
+/// pull writes no object and no ref.
+#[test]
+fn sign_verify_refuses_more_than_64_signatures_of_one_engine() {
+    let tmp = TmpDir::new("pull-local-verify-sign-limit");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let payload = src
+            .load_object_bytes(ObjectType::Commit, &c2)
+            .await
+            .unwrap();
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        let mut dict = Value::Array(Vec::new());
+        for i in 0..64u8 {
+            ostrya::sign::append_signature(&mut dict, "ostree.sign.ed25519", vec![i; 64]).unwrap();
+        }
+        let valid = signer.sign(&payload).await.unwrap();
+        ostrya::sign::append_signature(&mut dict, "ostree.sign.ed25519", valid).unwrap();
+        src.write_commit_detached_metadata(&c2, Some(&dict))
+            .await
+            .unwrap();
+        let dst = dest_with_remote(
+            base,
+            &format!(
+                "gpg-verify=false\nsign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"
+            ),
+        )
+        .await;
+        let err = pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m)
+                if m == "the signature dict holds more than 64 signatures under \
+                         'ostree.sign.ed25519'"),
+            "{err}"
+        );
+        assert_nothing_pulled(&dst, &c2).await;
+    });
+}
+
 /// A remote of a `.conf` file of the remotes directory that the key of
 /// `config` names gives its keys to the pull. The pull refuses an unsigned
 /// commit and accepts it after the trusted key signs it.

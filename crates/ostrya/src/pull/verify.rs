@@ -134,7 +134,10 @@ impl Verification {
     ///   delta of an attachment.
     ///
     /// If a delta carries signatures and no signature is from a trusted key,
-    /// this function fails with [`Error::Signature`].
+    /// this function fails with [`Error::Signature`]. It also fails with
+    /// [`Error::Signature`] before a verifier runs if the delta carries more
+    /// than [`MAX_SIGNATURES_PER_ENGINE`](crate::sign::MAX_SIGNATURES_PER_ENGINE)
+    /// signatures under the key of one engine of the axis.
     ///
     /// Each verifier runs on the blocking pool, as [`examine`] states.
     pub(crate) async fn check_delta<'p>(

@@ -51,6 +51,13 @@ const ED25519_SECRET_LEN: usize = 64;
 /// A refused signature does not stop the search, so a signature that another
 /// party adds, for example a client of a server, cannot hide the signature of
 /// this key.
+///
+/// The search reads at most
+/// [`MAX_SIGNATURES_PER_ENGINE`](crate::sign::MAX_SIGNATURES_PER_ENGINE)
+/// signatures under the detached-metadata key of the engine, as
+/// [`signatures_for`](crate::sign::signatures_for) does. If the dict holds
+/// more, the search fails with [`Error::Signature`] before it verifies a
+/// signature.
 pub struct SigningKey {
     /// The key that the caller signs with.
     signer: Box<dyn Signer>,
@@ -222,7 +229,14 @@ impl SigningKey {
     /// The search runs on the blocking pool, because a verifier does its work
     /// in the call. If `dict` holds a signature under the detached-metadata
     /// key of the engine, the pool gets a copy of `payload`.
-    pub async fn has_signed(&self, payload: &[u8], dict: Option<&Value>) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] with the message of
+    ///   [`signatures_for`](crate::sign::signatures_for) if `dict` holds more
+    ///   than [`MAX_SIGNATURES_PER_ENGINE`](crate::sign::MAX_SIGNATURES_PER_ENGINE)
+    ///   blobs under the detached-metadata key of the engine.
+    pub async fn has_signed(&self, payload: &[u8], dict: Option<&Value>) -> Result<bool> {
         self.has_signed_payload(payload, dict).await
     }
 
@@ -230,16 +244,33 @@ impl SigningKey {
     /// made, the search of [`has_signed`](Self::has_signed).
     ///
     /// The pool gets a [`Payload::Shared`] payload with no copy, and a copy of
-    /// a [`Payload::Borrowed`] payload.
+    /// a [`Payload::Borrowed`] payload. The errors are the errors of
+    /// [`has_signed`](Self::has_signed).
     pub(crate) async fn has_signed_payload<'p>(
         &self,
         payload: impl Into<Payload<'p>>,
         dict: Option<&Value>,
-    ) -> bool {
+    ) -> Result<bool> {
         let Some(dict) = dict else {
-            return false;
+            return Ok(false);
         };
-        let blobs = signatures_for(dict, self.verifier.metadata_key());
+        let blobs = signatures_for(dict, self.verifier.metadata_key())?;
+        Ok(self.signed_one_of(payload, blobs).await)
+    }
+
+    /// Returns `true` if one of `blobs` is a signature over `payload` that this
+    /// key made.
+    ///
+    /// The call reads `blobs` as a list of signatures of the engine of this
+    /// key, with no limit on the number. The search runs on the blocking pool,
+    /// and the pool gets the payload as
+    /// [`has_signed_payload`](Self::has_signed_payload) states. An empty list
+    /// gives `false` with no trip to the pool.
+    pub(crate) async fn signed_one_of<'p>(
+        &self,
+        payload: impl Into<Payload<'p>>,
+        blobs: Vec<Vec<u8>>,
+    ) -> bool {
         if blobs.is_empty() {
             return false;
         }
@@ -344,7 +375,7 @@ mod tests {
     }
 
     fn has_signed(signer: &SigningKey, dict: Option<&Value>) -> bool {
-        ostrya_rt::block_on(signer.has_signed(PAYLOAD, dict))
+        ostrya_rt::block_on(signer.has_signed(PAYLOAD, dict)).unwrap()
     }
 
     /// The ed25519 search recognizes the signature of the key and no other
@@ -458,9 +489,7 @@ mod tests {
         .unwrap();
         let payload = Arc::new(PAYLOAD.to_vec());
         let dict = dict_with("ostree.sign.dummy", b"k".to_vec());
-        assert!(ostrya_rt::block_on(
-            server.has_signed_payload(&payload, Some(&dict))
-        ));
+        assert!(ostrya_rt::block_on(server.has_signed_payload(&payload, Some(&dict))).unwrap());
         recorder.assert_one_foreign_call();
         recorder.assert_no_copy_of(&payload);
     }

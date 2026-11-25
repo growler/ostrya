@@ -1386,7 +1386,9 @@ fsck` of a bucket. Each of these paths, other than the search for a
 signature of the own key, runs the verifiers of one axis in one call on the
 blocking pool. The call runs them in order and stops at the first valid
 signature. A client sets the number of signature blobs that the
-receive endpoint verifies, and a summary can be as large as 64 MiB.
+receive endpoint verifies, up to 64 blobs under the key of one engine
+("The signature limit of one engine"), and a summary can be as large as
+64 MiB.
 `Repo::verify_commit`, `Repo::verify_summary`, and
 `Repo::verify_static_delta` take `Arc<dyn Verifier>` and run the verifiers on
 the blocking pool too. `DeltaSuperblock::verify` and `sign::verify_all`
@@ -1528,6 +1530,61 @@ keyring limit plus one byte, through the capped output read of `ostrya-rt`, so
 `gpg` cannot make the process hold a larger output. The method needs the
 feature `gpg` with `gpg-sign`. A `gpg-sign` that turns on `gpg` was rejected,
 so a build with the signer and no OpenPGP parser stays possible.
+
+## The signature limit of one engine
+
+A verification reads at most 64 signature blobs under the metadata key of one
+engine in one signature dict. `sign::signatures_for` reads the blobs, and
+each path that verifies reads them through it: the commit, the summary, the
+static delta, the pull, the receive endpoint, the `ostrya` command, and the
+search for the signature of a signing key (`SigningKey::has_signed`). Only
+the byte strings under the key count. A dict with more blobs under the key is
+refused with `Error::Signature`, and the message is
+`the signature dict holds more than 64 signatures under '<key>'`. The
+constant is `sign::MAX_SIGNATURES_PER_ENGINE`.
+
+The refusal comes before any verifier of that engine runs, also when the dict
+holds a valid blob. `sign::verify_all` reads and counts the blobs of all its
+verifiers first, so no verifier of the call runs. The verification of an axis
+reads and counts the blobs of all verifiers of the axis first. The axes run
+one after the other. So a pull with GPG and sign-api verification verifies
+the GPG signatures before it reads the sign-api blobs. `ostrya sign --verify`
+with several engines verifies one engine before it reads the blobs of the
+next engine.
+
+The receive endpoint gives `signature-required` for the trust check and for
+the search for the signature of a server key. That search reads the dict of
+the commit with no server signature of the session. It checks the signatures
+that the keys before it in the session made on their own, with no limit. So
+the server signatures of the session do not count to the limit, and a client
+dict of 64 blobs under the key of an engine gets the signature of each server
+key of that engine.
+
+The limit is a difference from the `ostree` command, which
+`docs/conformance/cli-surface.md`, "The signature limit of one engine",
+records.
+
+The reason is the CPU time of a verification. It grows with the number of
+blobs, the number of trusted keys, and the size of the payload. The party
+that writes the dict sets the number of blobs: a remote for a pull, and a
+client for the receive endpoint. The 128 MiB cap of a metadata object lets a
+dict hold over a million ed25519 blobs. The GPG verifier reads at most 64
+signature packets in all blobs of one verification together, and it counts
+them before it verifies a signature. So one verification of the GPG engine
+verifies at most 64 packets, and the verification of each other engine
+verifies at most one signature for each blob. The limit gives a bound to the
+number of blobs.
+
+These alternatives were rejected:
+
+- No limit. A remote or a client then sets the CPU time of each
+  verification.
+- A limit inside each verifier of `ostrya-sign`. A verifier of another crate
+  then gets no limit, and the caller copies each blob before the verifier
+  sees the number.
+- A verification of the first 64 blobs alone. A valid blob after position 64
+  then fails with no message, and the verdict depends on the stored order of
+  the blobs.
 
 ## The signature policy of a local pull
 

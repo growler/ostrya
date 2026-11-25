@@ -16,7 +16,13 @@ impl TrustedKeys {
     /// Each verifier of each axis runs on the blocking pool, because a
     /// verifier does its work in the call. A client controls the number of
     /// signature blobs, and an RSA verify with a 16384-bit key takes
-    /// milliseconds of CPU time.
+    /// milliseconds of CPU time. The check reads at most
+    /// [`MAX_SIGNATURES_PER_ENGINE`](crate::sign::MAX_SIGNATURES_PER_ENGINE)
+    /// blobs under the key of one engine. If `detached` holds more under the
+    /// key of a verifier of an axis, the check fails with
+    /// [`Error::Signature`](crate::Error::Signature) before a verifier of that
+    /// axis runs. The axes run in order, so the verifier of the GPG axis can
+    /// run before the check reads the blobs of the sign-api axis.
     pub(crate) async fn check<'p>(
         &self,
         subject: &str,

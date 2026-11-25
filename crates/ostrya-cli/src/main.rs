@@ -16964,7 +16964,7 @@ fn delta_outcomes<'k>(
 #[cfg(feature = "gpg")]
 async fn stored_signatures(repo: &Repo, commit: &Checksum, key: &str) -> Result<Vec<Vec<u8>>> {
     Ok(match repo.read_commit_detached_metadata(commit).await? {
-        Some(dict) => ostrya::sign::signatures_for(&dict, key),
+        Some(dict) => ostrya::sign::signatures_for(&dict, key)?,
         None => Vec::new(),
     })
 }

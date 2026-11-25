@@ -6532,7 +6532,9 @@ is outside its table makes the tool abort on `SIGABRT` after the
 side for these streams.
 
 The tool allocates the xz decoder memory that the xz stream of a part states.
-`cli-surface.md`, "P2", `static-delta`, records the 128 MiB limit of the port.
+This is observed through `show`. `cli-surface.md`, "P2", `static-delta`,
+records the 128 MiB limit of the port, which applies to `show`,
+`apply-offline`, and a pull.
 
 #### `indexes`
 

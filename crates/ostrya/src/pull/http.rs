@@ -575,9 +575,12 @@ impl Repo {
     /// complete, the walk reads what the delta staged and requests nothing.
     ///
     /// Each part in flight costs one xz decoder and two blobs: the verified
-    /// part body and the payload that it decompresses to. Each blob is on the
-    /// heap while it is small. After a blob passes its heap threshold, it is a
-    /// mapped temp file.
+    /// part body and the payload that it decompresses to. The xz decoder has a
+    /// memory limit of 128 MiB, and the pull refuses a part whose xz stream
+    /// states a dictionary that needs more. At most two parts are in flight
+    /// at a time, so the xz decoders of a pull use at most 256 MiB. Each blob
+    /// is on the heap while it is small. After a blob passes its heap
+    /// threshold, it is a mapped temp file.
     ///
     /// [`static_deltas`](PullOptions::static_deltas) replaces this search with
     /// a list. The pull then reads no delta index and no `ostree.static-deltas`
@@ -893,8 +896,9 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if a content object breaks its framing, or
     ///   passes its declared size or its compressed limit.
     /// - [`Error::InvalidFormat`] if a content object inflates to fewer bytes
-    ///   than declared, or has bytes after its end. A malformed static delta
-    ///   has the same error.
+    ///   than declared, or has bytes after its end. A malformed static delta,
+    ///   and a delta part whose xz stream needs more than 128 MiB of decoder
+    ///   memory, have the same error.
     /// - [`Error::InsufficientFreeSpace`] if a stored object needs more space
     ///   than the free-space budget of the transaction holds.
     ///

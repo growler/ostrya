@@ -3379,7 +3379,12 @@ details", "spki"). Fifty-two differences stand on `show`,
   declared for it`. The tool checks neither. Where the tampered part
   still decodes, the tool prints the counts of what it decodes at exit 0. A
   truncated xz part makes the tool fail with `Input buffer too small` at exit 1.
-  Only a write that is neither implementation's reaches this;
+  Where the superblock states the checksum and the size of the truncated part,
+  the port refuses it at exit 1 after the `PartMeta<i>` line with `error: i/o
+  error: out of memory`. `apply-offline` refuses such a part with the same
+  error at exit 1, and a pull fails with the same error. The xz decoder of the
+  port gives this error for a stream that makes no progress. Only a write that
+  is neither implementation's reaches this;
 - a part the superblock carries inline. The port reads it from the metadata
   dict, in the name form and the path form. The tool reads no inline part: in
   both forms it opens `deltas/<fanout>/<rest>/<i>` in the repository and
@@ -3415,10 +3420,12 @@ details", "spki"). Fifty-two differences stand on `show`,
 - a part whose xz stream states a dictionary that needs more than 128 MiB of
   decoder memory. The port refuses it at exit 1 after the `PartMeta<i>` line
   with `error: invalid format: static delta: part payload needs more than 128
-  MiB of xz decoder memory`. The tool allocates what the stream states: a
-  234,413-byte part stating a 1.5 GiB dictionary reports at exit 0 with 1,549
-  MiB of resident memory. A part the tool's generator or the port's writes
-  states a 32 MiB dictionary;
+  MiB of xz decoder memory`. `apply-offline` refuses such a part with the
+  same error at exit 1 and writes no object, and a pull fails with the same
+  error. The tool allocates what the stream states: a 234,413-byte part
+  stating a 1.5 GiB dictionary reports at exit 0 with 1,549 MiB of resident
+  memory. A part the tool's generator or the port's writes states a 32 MiB
+  dictionary;
 - the line order of `indexes`. The tool prints the targets in the order the
   directory returns them, and the port sorts them. This is the hash-container
   carve-out of `CLAUDE.md`, "CLI compatibility is functional, not literal";

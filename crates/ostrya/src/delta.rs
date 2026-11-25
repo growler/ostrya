@@ -392,7 +392,11 @@ impl Repo {
     ///   the meta-entry before it decompresses a byte. A body that passes the
     ///   declared size never gets to the decoder.
     /// - An xz body then decompresses through the xz decoder of
-    ///   `async-compression` into the payload that the operations read.
+    ///   `async-compression` into the payload that the operations read. The
+    ///   decoder has a memory limit of 128 MiB. The dictionary size that the
+    ///   xz stream states sets the memory of the decoder, so the call refuses
+    ///   a part that states a larger dictionary before the decoder allocates
+    ///   it.
     /// - A payload of 128 KiB or less stays on the heap. A larger payload goes
     ///   to a temp file in the staging directory, mapped read-only. It costs
     ///   address space and staging space, and no resident heap.
@@ -447,6 +451,8 @@ impl Repo {
     ///   - mode and xattr tables larger than 128 MiB together, or a metadata
     ///     object or a symlink target larger than 128 MiB
     ///   - a symlink target that is not UTF-8
+    ///   - an xz stream that states a dictionary that needs more than 128 MiB
+    ///     of decoder memory
     /// - [`Error::Core`] if a part payload, an operand, a checksum, or an xattr
     ///   set does not decode, or if field 2 of the target commit or of an
     ///   attachment does not decode.
@@ -1429,8 +1435,9 @@ impl InlinePayload<'_> {
 /// Decodes the body of an inline part that [`verify_inline_part`] accepted.
 ///
 /// An uncompressed body is used where it lies, with no copy. An xz body
-/// decompresses through [`spill_to_blob`]: on the heap up to
-/// [`MMAP_THRESHOLD`], and into a mapped temp file in `staging` if larger.
+/// decompresses through [`spill_xz_body`]: under [`PART_XZ_MEM_LIMIT`] of
+/// decoder memory, on the heap up to [`MMAP_THRESHOLD`], and into a mapped
+/// temp file in `staging` if larger.
 pub(crate) async fn decode_inline_part<'a>(
     compression: u8,
     body: &'a [u8],
@@ -1438,12 +1445,7 @@ pub(crate) async fn decode_inline_part<'a>(
 ) -> Result<InlinePayload<'a>> {
     match compression {
         COMPRESSION_NONE => Ok(InlinePayload::Borrowed(body)),
-        COMPRESSION_XZ => {
-            let decoder = XzDecoder::new(Cursor::new(body));
-            Ok(InlinePayload::Owned(
-                spill_to_blob(decoder, staging, None).await?,
-            ))
-        }
+        COMPRESSION_XZ => Ok(InlinePayload::Owned(spill_xz_body(body, staging).await?)),
         other => Err(Error::InvalidFormat(format!(
             "static delta part compression byte {other:#x} is not supported"
         ))),
@@ -1617,7 +1619,8 @@ async fn decode_part(part_path: PathBuf, entry: &DeltaPart, staging: &RepoDir) -
 /// that expands without a limit is one that the publisher of the delta wrote.
 ///
 /// Both blobs go through [`spill_to_blob`], so the heap holds at most
-/// [`MMAP_THRESHOLD`] of the body and of the payload.
+/// [`MMAP_THRESHOLD`] of the body and of the payload. An xz body decompresses
+/// through [`spill_xz_body`], under [`PART_XZ_MEM_LIMIT`] of decoder memory.
 pub(crate) async fn decode_part_stream<R: AsyncRead + Unpin>(
     mut stream: R,
     entry: &DeltaPart,
@@ -1643,14 +1646,24 @@ pub(crate) async fn decode_part_stream<R: AsyncRead + Unpin>(
 
     match first[0] {
         COMPRESSION_NONE => Ok(body),
-        COMPRESSION_XZ => {
-            let decoder = XzDecoder::new(Cursor::new(body.as_slice()));
-            spill_to_blob(decoder, staging, None).await
-        }
+        COMPRESSION_XZ => spill_xz_body(body.as_slice(), staging).await,
         other => Err(Error::InvalidFormat(format!(
             "static delta part compression byte {other:#x} is not supported"
         ))),
     }
+}
+
+/// Decompresses an xz part body into a [`Blob`] through [`spill_to_blob`],
+/// under [`PART_XZ_MEM_LIMIT`] of decoder memory. A stream that needs more
+/// decoder memory gives the error of [`payload_error`].
+async fn spill_xz_body(body: &[u8], staging: &RepoDir) -> Result<Blob> {
+    let decoder = XzDecoder::with_mem_limit(Cursor::new(body), PART_XZ_MEM_LIMIT);
+    spill_to_blob(decoder, staging, None)
+        .await
+        .map_err(|err| match err {
+            Error::Io(err) => payload_error(err),
+            other => other,
+        })
 }
 
 /// The type of a part that the superblock carries inline in its metadata dict:
@@ -1662,13 +1675,14 @@ const INLINE_PART_SIG: &str = "(yay)";
 /// framing are in this tail is read once.
 const PAYLOAD_TAIL: usize = 1024 * 1024;
 
-/// The memory limit of the xz decoder that reads the statistics of a part.
+/// The memory limit of each xz decoder of a part: in an offline apply, in a
+/// pull, and in a read of the part statistics.
 ///
 /// The dictionary size that an xz stream states sets what the decoder
 /// allocates, so a small part can state a dictionary of gigabytes. A part that
 /// the generator of the `ostree` command or of ostrya writes states a 32 MiB
 /// dictionary in its xz block header.
-pub(crate) const STATS_XZ_MEM_LIMIT: u64 = 128 * 1024 * 1024;
+pub(crate) const PART_XZ_MEM_LIMIT: u64 = 128 * 1024 * 1024;
 
 /// How far [`part_stats_from`] read a payload after the pass that found its
 /// framing. The tests check which reads a payload took.
@@ -1705,7 +1719,7 @@ enum TailWalk {
 ///
 /// Each pass holds one [`IO_CHUNK`] buffer and the tail. A compressed pass
 /// also holds the state of the xz decoder. The dictionary that the stream
-/// states sets its size, and [`STATS_XZ_MEM_LIMIT`] is its limit.
+/// states sets its size, and [`PART_XZ_MEM_LIMIT`] is its limit.
 pub(crate) async fn part_stats_from<R>(source: R, entry: &DeltaPart) -> Result<DeltaPartStats>
 where
     R: AsyncRead + AsyncSeek + Unpin + Send,
@@ -1940,24 +1954,27 @@ async fn verify_part_source<R: AsyncRead + Unpin>(
 
 /// Returns the payload of an xz part source that is at the byte after its
 /// compression byte. The read is under the body size that `entry` declares and
-/// under [`STATS_XZ_MEM_LIMIT`] of decoder memory.
+/// under [`PART_XZ_MEM_LIMIT`] of decoder memory.
 fn xz_payload<'a, R>(source: &'a mut R, entry: &DeltaPart) -> impl AsyncRead + Send + Unpin + 'a
 where
     R: AsyncRead + Unpin + Send,
 {
     let body = source.take(entry.size.saturating_sub(1));
-    XzDecoder::with_mem_limit(BufReader::with_capacity(IO_CHUNK, body), STATS_XZ_MEM_LIMIT)
+    XzDecoder::with_mem_limit(BufReader::with_capacity(IO_CHUNK, body), PART_XZ_MEM_LIMIT)
 }
 
-/// Maps a payload read error. The result names a stream that needs more
-/// decoder memory than [`STATS_XZ_MEM_LIMIT`].
+/// Maps a payload read error. The memory-limit error of the xz decoder becomes
+/// an [`Error::InvalidFormat`] that names a stream that needs more decoder
+/// memory than [`PART_XZ_MEM_LIMIT`]. Each other error is an [`Error::Io`].
 fn payload_error(err: io::Error) -> Error {
-    // liblzma reports the limit as an `Other` error carrying this text, and a
-    // failed allocation as `OutOfMemory`.
-    if err.kind() == io::ErrorKind::OutOfMemory || err.to_string() == "memory limit reached" {
+    // liblzma reports the limit as an `Other` error carrying this text. An
+    // `OutOfMemory` error can come from a decoder that makes no progress, for
+    // example on a stream that ends early. It can also come from the read of
+    // the part source. In each case it stays an I/O error.
+    if err.to_string() == "memory limit reached" {
         return op_error(&format!(
             "part payload needs more than {} MiB of xz decoder memory",
-            STATS_XZ_MEM_LIMIT >> 20
+            PART_XZ_MEM_LIMIT >> 20
         ));
     }
     Error::Io(err)
@@ -3450,10 +3467,19 @@ mod tests {
         !crc
     }
 
-    /// An xz part whose block header states a 1.5 GiB dictionary is refused at
-    /// the decoder memory limit, before the dictionary is allocated.
-    #[test]
-    fn a_part_stating_a_huge_xz_dictionary_is_refused() {
+    /// The meta-entry of a part `file` whose checksum and size match it.
+    fn entry_for(file: &[u8]) -> DeltaPart {
+        DeltaPart {
+            part_csum: Checksum::sha256(file),
+            size: file.len() as u64,
+            uncompressed_size: 0,
+            objects: two_objects(),
+        }
+    }
+
+    /// An xz part file whose block header states a 1.5 GiB dictionary, and
+    /// the meta-entry that names it.
+    fn huge_dictionary_part() -> (Vec<u8>, DeltaPart) {
         let bytes = payload(0, 0, 3, &op(OP_OPEN_SPLICE_CLOSE, &[3, 0]));
         let (mut file, _) = part_file(&bytes, COMPRESSION_XZ, two_objects());
         // The block header follows the 12-byte stream header, after the
@@ -3464,18 +3490,88 @@ mod tests {
         file[header + 4] = 37;
         let crc = crc32(&file[header..header + 8]);
         file[header + 8..header + 12].copy_from_slice(&crc.to_le_bytes());
-        let entry = DeltaPart {
-            part_csum: Checksum::sha256(&file),
-            size: file.len() as u64,
-            uncompressed_size: 0,
-            objects: two_objects(),
-        };
+        let entry = entry_for(&file);
+        (file, entry)
+    }
+
+    /// An xz part file cut in its first block, and a meta-entry whose
+    /// checksum and size match the cut file. So the part checks pass, and the
+    /// decoder gets a stream that ends early.
+    fn truncated_xz_part() -> (Vec<u8>, DeltaPart) {
+        let bytes = payload(0, 0, 1000, &op(OP_OPEN_SPLICE_CLOSE, &[3, 0]));
+        let (mut file, _) = part_file(&bytes, COMPRESSION_XZ, two_objects());
+        // The compressed data starts after the compression byte, the 12-byte
+        // stream header, and the 12-byte block header.
+        file.truncate(1 + 12 + 12 + 4);
+        let entry = entry_for(&file);
+        (file, entry)
+    }
+
+    const MEM_LIMIT_ERROR: &str = "needs more than 128 MiB of xz decoder memory";
+
+    /// An xz part whose block header states a 1.5 GiB dictionary is refused at
+    /// the decoder memory limit, before the dictionary is allocated.
+    #[test]
+    fn a_part_stating_a_huge_xz_dictionary_is_refused() {
+        let (file, entry) = huge_dictionary_part();
         let err = block_on(part_stats_from(Cursor::new(file), &entry)).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("needs more than 128 MiB of xz decoder memory"),
-            "{err}"
-        );
+        assert!(err.to_string().contains(MEM_LIMIT_ERROR), "{err}");
+    }
+
+    /// The apply path refuses a part that states a 1.5 GiB dictionary at the
+    /// decoder memory limit, from a part file and from an inline body.
+    #[test]
+    fn the_apply_path_refuses_a_huge_xz_dictionary() {
+        let (file, entry) = huge_dictionary_part();
+        block_on(async {
+            let staging = staging_dir();
+            let err = decode_part_stream(Cursor::new(file.clone()), &entry, &staging)
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert!(err.to_string().contains(MEM_LIMIT_ERROR), "{err}");
+
+            let err = decode_inline_part(file[0], &file[1..], &staging)
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert!(err.to_string().contains(MEM_LIMIT_ERROR), "{err}");
+        });
+    }
+
+    /// An xz stream that ends early is an error of the stream, and not a
+    /// memory-limit error, on the statistics path and on the apply path. The
+    /// xz decoder reports a stream that makes no progress as an I/O error of
+    /// kind `OutOfMemory`. So a fixture that fails an earlier check, such as
+    /// the part checksum, fails the test.
+    #[test]
+    fn a_truncated_xz_part_is_not_a_memory_limit_error() {
+        fn assert_no_progress(err: &Error) {
+            assert!(
+                matches!(err, Error::Io(e) if e.kind() == io::ErrorKind::OutOfMemory),
+                "{err:?}"
+            );
+            assert!(!err.to_string().contains("xz decoder memory"), "{err}");
+        }
+
+        let (file, entry) = truncated_xz_part();
+        let err = block_on(part_stats_from(Cursor::new(file.clone()), &entry)).unwrap_err();
+        assert_no_progress(&err);
+
+        block_on(async {
+            let staging = staging_dir();
+            let err = decode_part_stream(Cursor::new(file.clone()), &entry, &staging)
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert_no_progress(&err);
+
+            let err = decode_inline_part(file[0], &file[1..], &staging)
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert_no_progress(&err);
+        });
     }
 
     /// A superblock file past the limit is refused on the bytes read. A file

@@ -2133,6 +2133,13 @@ A part file is `(y@ay)` before decompression: one compression byte, then the
 body. The byte is 0 for none or `x` for xz (lzma). `x` is the only compression
 a writer uses, and a reader accepts 0 and `x` alone.
 
+The dictionary size that the xz block header of a part states sets the memory
+of the xz decoder. A part that the generator of the tool or of the port writes
+states a 32 MiB dictionary. The port decompresses each xz part with a decoder
+memory limit of 128 MiB, in `apply-offline`, in a pull, and in `show`. It
+refuses a part whose xz stream needs more (`conformance/cli-surface.md`, "P2",
+`static-delta`).
+
 A `PART_PAYLOAD_FORMAT_V0` payload of `n` bytes ends with three framing offsets
 of `z` bytes each. `z` is the offset width of a GVariant container of `n` bytes
 (1, 2, 4, or 8). Read from the end, the offsets state the end of the mode

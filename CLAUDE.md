@@ -110,8 +110,11 @@ reference, or reading material.
    process over the `pgp` crate (rPGP), which is permissively licensed and
    links no C library, composefs/EROFS export, tar import/export, AWS S3
    push/pull, and ssh git-style push/pull.
-6. A development-only repository mode, `bare-user-shared`, as an optional
-   nice-to-have add-on.
+6. Two repository modes of the port alone, as optional add-ons.
+   `bare-user-shared` is for development only: a group of users share one
+   repository. `bare-user-private` is the host repository of a host that
+   mounts its deployments with composefs: each content object has the inode
+   mode 0400.
 
 Faithful on disk means byte-for-byte identical format, checksums, and
 algorithms. The API is redesigned to be idiomatic Rust rather than mirroring the

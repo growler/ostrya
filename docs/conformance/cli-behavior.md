@@ -132,6 +132,11 @@ mode:
   checkout modes. The object inode does not carry the logical mode
   (`../format-reference.md`, "bare-user-shared mode"), so the port never
   hardlinks it. The copy applies the logical mode from `user.ostreemeta`.
+- `bare-user-private`: a mode of the port alone. The port copies under both
+  checkout modes. The object inode is 0400 and does not carry the logical
+  mode (`../format-reference.md`, "bare-user-private mode"), so the port
+  never hardlinks it. The copy applies the logical mode from
+  `user.ostreemeta`.
 - `bare-split-xattrs`. Not observed: the result of the tool. The port copies
   under both checkout modes.
 - `archive`: copy under both checkout modes. Under the unprivileged checkout
@@ -153,9 +158,10 @@ destination are the same with the cache and without it. `cli-surface.md`,
 The tool hardlinks a symlink only under `bare` and the faithful checkout. The
 destination link count is then 2. In each other case the tool creates the
 symlink again, with link count 1. This includes `bare-user-only`, whose object
-is a real symlink. `bare-user` and `bare-user-shared` store a symlink as a
-regular file (`../format-reference.md`, "Repository modes and on-disk
-storage"), so a real destination symlink cannot share their inode.
+is a real symlink. `bare-user`, `bare-user-shared`, and `bare-user-private`
+store a symlink as a regular file (`../format-reference.md`, "Repository
+modes and on-disk storage"), so a real destination symlink cannot share their
+inode.
 
 The tool hardlinks an object if and only if the object inode is already
 exactly the target inode. `checkout -C` forces a copy and stops every
@@ -204,7 +210,7 @@ The tool treats each shape as follows:
 
 Not observed: the `-H` result of the tool in `bare-split-xattrs`.
 `cli-surface.md`, "P2", `checkout`, records the port rule for
-`bare-split-xattrs` and `bare-user-shared`.
+`bare-split-xattrs`, `bare-user-shared`, and `bare-user-private`.
 
 These rules hold for four commits of one shape each: one directory, one
 zero-length file, one one-byte file, and one symlink. They hold for `archive`,
@@ -374,6 +380,16 @@ the xattr set each make the entry different. The modification time, the inode,
 and the link count do not. These rules hold for each logical mode from `0400`
 through `04755`, against a destination of the same mode and against a
 destination of `0755`.
+
+The tool has no `bare-user-shared` and no `bare-user-private` mode. In these
+two modes, the port compares the permission bits of a destination with those
+of the object inode: 0644 in `bare-user-shared` and 0400 in
+`bare-user-private`. Under `-H`, the port refuses a regular file of non-zero
+length before the comparison, so the comparison reaches only a zero-length
+file. A checkout writes that file with its logical mode, so the file is
+identical only if its logical permission bits equal the bits of the object
+inode. `../format-reference.md`, "bare-user-shared mode" and
+"bare-user-private mode", state the rule.
 
 ### Type conflicts
 

@@ -15,7 +15,7 @@ Four properties govern every design decision below.
   reports as skipped, with the reason. Conformance is reported only when both
   implementations ran and their observations agreed.
 - The cost of Rust code grows with the number of verbs, and the verb set is
-  closed: corpora, setups, oracles, and probes. M0 and M1 hold 288 cells
+  closed: corpora, setups, oracles, and probes. M0 and M1 hold 336 cells
   between them today, M10 is growing with Phase 17, and eight families remain
   to write.
 - The harness drives the two binaries. It links neither implementation's

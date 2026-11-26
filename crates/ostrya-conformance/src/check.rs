@@ -82,7 +82,7 @@ impl Report {
 ///
 /// - No two cells have the same id.
 /// - In the families `M0` and `M1`, the `modes` values of each row cover the
-///   six [`MODES`] once each.
+///   seven [`MODES`] once each.
 /// - A record names each probe of [`PROBES`](probe::PROBES).
 /// - Each `spec:` value names a heading of a design document. See
 ///   [Spec anchors](#spec-anchors).
@@ -350,7 +350,7 @@ fn duplicates(matrix: &Matrix, errors: &mut Vec<String>) {
     }
 }
 
-/// Checks that the `modes` values of each row of `M0` and `M1` cover the six
+/// Checks that the `modes` values of each row of `M0` and `M1` cover the seven
 /// modes once each.
 fn completeness(matrix: &Matrix, errors: &mut Vec<String>) {
     let mut counts: BTreeMap<(String, String), BTreeMap<String, usize>> = BTreeMap::new();
@@ -706,6 +706,7 @@ mod tests {
             "bare-user",
             "bare-user-only",
             "bare-user-shared",
+            "bare-user-private",
         ];
         let matrix = Matrix {
             dir: PathBuf::from("t"),

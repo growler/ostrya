@@ -59,14 +59,15 @@ already-existing `Repo::create`/`Repo::create_at`. Every matrix cell whose
 and half of every transfer family -- is reachable through the CLI.
 
 The accepted `--mode` values are `archive`, `archive-z2`, `bare`, `bare-user`,
-`bare-user-only`, and the port extension `bare-user-shared`; `archive` and
-`archive-z2` name the same mode, and the config always serializes as
-`archive-z2`. `bare-split-xattrs` is deliberately excluded even though the
-tool's own `init --mode` accepts it (see "Global conventions" below): the port
-reads that mode and does not write it (`format-reference.md`,
-"bare-split-xattrs mode"), so exposing it here would create a repository
-nothing in the port could subsequently commit into. An unrecognized mode, and
-`bare-split-xattrs`, are both rejected the way "Global conventions" describes.
+`bare-user-only`, and the port extensions `bare-user-shared` and
+`bare-user-private`; `archive` and `archive-z2` name the same mode, and the
+config always serializes as `archive-z2`. `bare-split-xattrs` is
+deliberately excluded even though the tool's own `init --mode` accepts it
+(see "Global conventions" below): the port reads that mode and does not
+write it (`format-reference.md`, "bare-split-xattrs mode"), so exposing it
+here would create a repository nothing in the port could subsequently commit
+into. An unrecognized mode, and `bare-split-xattrs`, are both rejected the
+way "Global conventions" describes.
 
 ## P1 -- reading and resolution
 
@@ -2326,13 +2327,15 @@ a zero-length regular file is written at exit 0 and that a shape the mode pair
 hardlinks is refused at the link.
 
 Not observed: the `-H` table of the tool in `bare-split-xattrs`.
-`bare-user-shared` is a mode of the port alone (`../format-reference.md`,
-"bare-user-shared mode"). The port copies a regular file in `bare-user-shared`
-and `bare-split-xattrs` under both checkout modes. So under `-H` the port
-refuses a regular file of non-zero length in these two modes. `bare-user-shared`
-stores a symlink the way `bare-user` does, and `bare-split-xattrs` stores a real
-symlink the way `bare-user-only` does. So the port refuses a symlink in neither
-of the two modes.
+`bare-user-shared` and `bare-user-private` are modes of the port alone
+(`../format-reference.md`, "bare-user-shared mode" and "bare-user-private
+mode"). The port copies a regular file in `bare-user-shared`,
+`bare-user-private`, and `bare-split-xattrs` under both checkout modes. So
+under `-H` the port refuses a regular file of non-zero length in these three
+modes. `bare-user-shared` and `bare-user-private` store a symlink the way
+`bare-user` does, and `bare-split-xattrs` stores a real symlink the way
+`bare-user-only` does. So the port refuses a symlink in none of the three
+modes.
 
 `-M/--bareuseronly-dirs` reduces every directory the checkout creates to
 `mode & 0775`, at the destination root and at every depth below it. A directory
@@ -7095,7 +7098,10 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   sets it. In a mode other than `archive` each `.filez` object is built on
   request at `[archive] zlib-level`, and `deltas/` and `delta-indexes/` are
   not served. A path the server refuses and a path it does not find both get
-  404. `../format-reference.md`, "The archive view", states the rules.
+  404. `../format-reference.md`, "The archive view", states the rules. Each
+  content object of a `bare-user-private` repository has the inode mode
+  0400, so the server must run as the owner of the content objects or as
+  root.
 - The command also answers `GET /_ostrya/refs/v1?pattern=P&collection=C`.
   The body is the ref listing, a summary GVariant built for each request, of
   the refs that the entries of the query select. Each entry is a ref pattern
@@ -7260,7 +7266,7 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   each mode the port reads, with a summary, passes `ostree fsck` on the
   pulled repository, in `crates/ostrya-cli/tests/serve.rs`. The served
   summary states `archive-z2` in `ostree.summary.mode` in each mode,
-  `bare-user-shared` included.
+  `bare-user-shared` and `bare-user-private` included.
 - In a `bare-user` repository with a static delta, `ostrya summary --view`
   of the root summary names the delta. The served summary names no delta.
   A `bare-user` client of the tool pulls the objects loose, and
@@ -7324,10 +7330,16 @@ ostrya send [--repo=PATH] --one-way [--remote=REMOTE] [--compress[=LEVEL]]
   the reply of a path that is not found.
 - Without `--one-way`, the command takes no lock and writes no file in the
   repository. An account with read access to the repository serves an
-  `archive`, `bare-user`, `bare-user-only`, or `bare-user-shared`
-  repository. A `bare` or `bare-split-xattrs` repository needs an account
-  that can read every object and its extended attributes. A file that the
-  account cannot read ends the session with `internal`.
+  `archive` or `bare-user-shared` repository, because each object has the
+  inode mode 0644. A `bare-user` or `bare-user-only` repository needs an
+  account with read permission on each content object. The logical mode of
+  a file sets the inode mode of its object, so a file with the logical mode
+  0600 has an object with the inode mode 0600. Each content object of a
+  `bare-user-private` repository has the inode mode 0400, so the account
+  must be the owner of each content object or have privilege. A `bare` or
+  `bare-split-xattrs` repository needs an account that can read every object
+  and its extended attributes. A file that the account cannot read ends the
+  session with `internal`.
 - Standard output carries the frames of the session alone. The command
   writes `error: MESSAGE` to standard error on failure. For each directory
   under `refs/mirrors/` whose name is not a collection id, a `ListRefs` with
@@ -8534,10 +8546,11 @@ Observed by running the tool (2026.1).
 - `init --mode=<mode>` rejects a mode it does not recognize with `error:
   Invalid mode '<mode>' in repository configuration` and exits 1, before
   writing anything to the target directory. Confirmed for an unknown string
-  and for `bare-user-shared`, the port's own extension, which the tool does
-  not accept as an `--mode` value at all (`--help` documents `bare`,
-  `bare-user`, `bare-user-only`, `archive`; `archive-z2` and
-  `bare-split-xattrs` are also accepted though undocumented in `--help`).
+  and for `bare-user-shared` and `bare-user-private`, the port's own
+  extensions, which the tool does not accept as an `--mode` value at all
+  (`--help` documents `bare`, `bare-user`, `bare-user-only`, `archive`;
+  `archive-z2` and `bare-split-xattrs` are also accepted though undocumented
+  in `--help`).
 - A subcommand that takes a nested subcommand (`static-delta`) reports a
   missing one with its own usage text and `error: No command specified`, exit
   1, the same shape a bare `ostree` gets. That check comes before the

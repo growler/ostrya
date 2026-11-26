@@ -8,7 +8,7 @@ The goal is full interoperability wherever it is possible:
 
 - a repository `ostree` created and populated is operated by `ostrya`;
 - a repository `ostrya` created and populated, in every mode except
-  `bare-user-shared`, is operated by `ostree`;
+  `bare-user-shared` and `bare-user-private`, is operated by `ostree`;
 - either implementation serves as a `pull-local` source for the other;
 - the same holds for HTTP pull, static deltas, tar, composefs, and signatures.
 
@@ -32,7 +32,7 @@ A cell is identified by these axes.
 - `operated-by` -- the implementation that then performs the operation under
   test.
 - `mode` -- one of `archive`, `bare`, `bare-user`, `bare-user-only`,
-  `bare-user-shared`, `bare-split-xattrs`.
+  `bare-user-shared`, `bare-user-private`, `bare-split-xattrs`.
 - `src-mode` and `dst-mode` -- replace `mode` for the transfer families, where
   the source and destination repositories carry independent modes.
 - `op` -- the operation the operator applies.
@@ -250,7 +250,7 @@ is a declaration, and the harness reports its cells as skipped with the reason
 the `outcome` field states.
 
 Completeness rule: within one family, for each row key -- the corpus for M0, the
-operation and direction for M1 -- the `modes` values of the records cover all six
+operation and direction for M1 -- the `modes` values of the records cover all seven
 modes exactly once. A missing mode and a mode named twice are both errors. This
 makes the matrix provably complete rather than merely long.
 

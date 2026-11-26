@@ -83,8 +83,25 @@ note: The tool cannot read this mode, so the oracle is the cross-mode identity
  form; only the inode mode differs.
 
 family: M0
+corpus: C0
+modes: bare-user-private
+tier: T0
+outcome: full
+severity: interop
+identity: full
+oracle: checksum-agreement
+evidence: ostrya::commit::commit_object_is_byte_identical_across_modes,
+ ostrya::write::bare_user_private_shares_bare_user_identity_with_mode_0400
+spec: format-reference.md#bare-user-private-mode
+note: The tool cannot open this mode, so the oracle is the cross-mode identity
+ invariant. The first cited test commits the corpus in this mode and compares
+ the commit checksum with the archive fixture of the tool. The second test
+ compares the bytes and the user.ostreemeta value of each content object with
+ the bare-user fixture. Each content object has the inode mode 0400.
+
+family: M0
 corpus: C1
-modes: archive bare bare-user bare-user-only bare-user-shared
+modes: archive bare bare-user bare-user-only bare-user-shared bare-user-private
 tier: T0
 outcome: unobserved
 severity: interop
@@ -96,7 +113,7 @@ question: Confirm every mode bit in the corpus round-trips. All five values lie
 
 family: M0
 corpus: C2
-modes: archive bare bare-user bare-user-shared
+modes: archive bare bare-user bare-user-shared bare-user-private
 tier: T0
 outcome: unobserved
 severity: interop
@@ -157,9 +174,25 @@ evidence: ostrya_cli::cli::declared_ownership_is_one_commit_across_modes
 spec: format-reference.md#bare-user-shared-mode
 note: the tool cannot open this mode, so the oracle is the cross-mode identity
  invariant rather than a direct comparison, as it is for C0: the cited test
- commits the declared ownership into archive, bare-user, and bare-user-shared and
- holds the three checksums to each other, and the archive and bare-user rows
- above compare theirs against the tool.
+ commits the declared ownership into archive, bare-user, bare-user-shared, and
+ bare-user-private and holds the four checksums to each other, and the archive
+ and bare-user rows above compare theirs against the tool.
+
+family: M0
+corpus: C3
+modes: bare-user-private
+tier: T0
+outcome: full
+severity: interop
+identity: full
+oracle: checksum-agreement
+evidence: ostrya_cli::cli::declared_ownership_is_one_commit_across_modes
+spec: format-reference.md#bare-user-private-mode
+note: the tool cannot open this mode, so the oracle is the cross-mode identity
+ invariant, as it is for C0. The cited test commits the declared ownership into
+ archive, bare-user, bare-user-shared, and bare-user-private, and holds the four
+ checksums to each other. The archive and bare-user rows above compare their
+ checksums with the tool.
 
 family: M0
 corpus: C3
@@ -216,7 +249,7 @@ spec: format-reference.md#extended-attributes
 
 family: M0
 corpus: C4
-modes: archive bare bare-user-shared
+modes: archive bare bare-user-shared bare-user-private
 tier: T0
 outcome: unobserved
 severity: interop
@@ -251,7 +284,7 @@ spec: format-reference.md#extended-attributes
 
 family: M0
 corpus: C5 C6
-modes: archive bare bare-user bare-user-shared
+modes: archive bare bare-user bare-user-shared bare-user-private
 tier: T3
 outcome: unobserved
 severity: interop
@@ -279,7 +312,7 @@ spec: format-reference.md#extended-attributes
 
 family: M0
 corpus: C7
-modes: archive bare bare-user bare-user-shared
+modes: archive bare bare-user bare-user-shared bare-user-private
 tier: T4
 outcome: unobserved
 severity: interop
@@ -307,7 +340,7 @@ spec: format-reference.md#extended-attributes
 
 family: M0
 corpus: C8
-modes: archive bare bare-user bare-user-only bare-user-shared
+modes: archive bare bare-user bare-user-only bare-user-shared bare-user-private
 tier: T0
 outcome: unobserved
 severity: interop
@@ -322,7 +355,7 @@ question: Two paths sharing one inode and a third path with the same content on
 
 family: M0
 corpus: C9
-modes: archive bare bare-user bare-user-only bare-user-shared
+modes: archive bare bare-user bare-user-only bare-user-shared bare-user-private
 tier: T0
 outcome: unobserved
 severity: interop
@@ -342,7 +375,7 @@ note: `inventory` reports the stored size of each loose object, and this
 
 family: M0
 corpus: C10
-modes: archive bare bare-user bare-user-only bare-user-shared
+modes: archive bare bare-user bare-user-only bare-user-shared bare-user-private
 tier: T0
 outcome: unobserved
 severity: interop
@@ -398,8 +431,22 @@ note: the tool does not open this mode, so the port's refusal has no counterpart
  modes above, at exit 1, with no ref and no object.
 
 family: M0
+corpus: C11
+modes: bare-user-private
+tier: T0
+outcome: refused-clean
+severity: interop
+identity: n-a
+oracle: exit-status refs-bytes inventory
+evidence: -
+spec: format-reference.md#bare-user-private-mode
+note: the tool does not open this mode, so the port's refusal has no counterpart
+ to compare with. The port refuses the fifo and the socket as it does in the
+ four tool modes above, at exit 1, with no ref and no object.
+
+family: M0
 corpus: C12
-modes: archive bare bare-user bare-user-only bare-user-shared
+modes: archive bare bare-user bare-user-only bare-user-shared bare-user-private
 tier: T3
 outcome: unobserved
 severity: interop
@@ -412,7 +459,7 @@ question: As C11, for a character device and a block device. Real root is needed
 
 family: M0
 corpus: C13
-modes: archive bare-user bare-user-shared
+modes: archive bare-user bare-user-shared bare-user-private
 tier: T2
 outcome: unobserved
 severity: interop

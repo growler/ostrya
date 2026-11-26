@@ -1155,13 +1155,7 @@ pub(crate) fn stage_content_blocking(
     // The size does not change with the mode, owner, or xattrs, so one stat
     // gives the create mode and the on-disk size.
     let stat = repo_fs::stat_fd(temp.file_mut().as_fd())?;
-    apply_content_pre_seal(&mut temp, ctx.mode, ctx.verity, stat.mode, header)?;
-    seal_temp(&mut temp, ctx.verity)?;
-    apply_content_post_seal(&mut temp, ctx.mode, header)?;
-    if ctx.fsync && ctx.per_object_fsync {
-        temp.sync()?;
-    }
-    temp.publish(ctx.staging, &staging_name, Publish::KeepExisting, false)?;
+    stage_new_content(ctx, header, temp, stat.mode, &staging_name)?;
     Ok(StageOutcome {
         deduped: false,
         on_disk_size: stat.size,
@@ -1174,6 +1168,30 @@ pub(crate) fn stage_content_blocking(
     })
 }
 
+/// Runs steps 1 to 5 of [`stage_content_blocking`] on the temp file `temp` of
+/// a content object that `objects/` does not hold, and publishes the file as
+/// `staging_name` in the staging directory.
+///
+/// `create_mode` is the inode mode of `temp`, which
+/// [`apply_content_pre_seal`] reads. The value 0 makes that function set 0600
+/// if `ctx.verity` is not `no`.
+fn stage_new_content(
+    ctx: &StageCtx<'_>,
+    header: &FileHeader,
+    mut temp: TempFile,
+    create_mode: u32,
+    staging_name: &str,
+) -> Result<()> {
+    apply_content_pre_seal(&mut temp, ctx.mode, ctx.verity, create_mode, header)?;
+    seal_temp(&mut temp, ctx.verity)?;
+    apply_content_post_seal(&mut temp, ctx.mode, header)?;
+    if ctx.fsync && ctx.per_object_fsync {
+        temp.sync()?;
+    }
+    temp.publish(ctx.staging, staging_name, Publish::KeepExisting, false)?;
+    Ok(())
+}
+
 /// Stages a symlink content object.
 ///
 /// - In `bare` and `bare-user-only`, the object is a symlink. The function
@@ -1183,7 +1201,7 @@ pub(crate) fn stage_content_blocking(
 /// - In `bare-user` and `bare-user-shared`, it is a regular file that holds
 ///   the target and one NUL.
 /// - In `bare-user-private`, it is the same regular file. The function stages
-///   it with [`stage_content_blocking`], which sets the mode 0400.
+///   it with the steps of [`stage_content_blocking`], which set the mode 0400.
 /// - In archive mode, it is a framed archive header with no payload.
 ///
 /// The publish in the staging directory keeps an entry that the transaction
@@ -1237,14 +1255,20 @@ pub(crate) fn stage_symlink_blocking(
         }
         RepoMode::BareUserPrivate => {
             // A regular file that holds the target and one NUL. The content
-            // stager sets user.ostreemeta, seals, and then sets 0400, because
-            // the kernel checks a user.* xattr and the seal against the write
+            // steps set user.ostreemeta, seal, and then set 0400, because the
+            // kernel checks a user.* xattr and the seal against the write
             // permission of the inode.
             let mut content = target.clone().into_bytes();
             content.push(0);
             let mut temp = TempFile::create(ctx.staging)?;
             temp.file_mut().write_all(&content)?;
-            return stage_content_blocking(ctx, checksum, header, temp, target.len() as u64);
+            // The create mode 0 makes the pre-seal step set 0600 if `verity`
+            // is not `no`, with no stat. The create requests 0600, and the
+            // kernel only removes bits from the request. Thus the inode is
+            // 0600 or it has no owner read or no owner write, and the step
+            // gives the same inode as with the create mode from a stat.
+            stage_new_content(ctx, header, temp, 0, &staging_name)?;
+            content.len() as u64
         }
         RepoMode::Archive => {
             // A framed archive header with no payload.

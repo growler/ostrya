@@ -3,8 +3,9 @@
 /// The on-disk storage mode of a repository.
 ///
 /// The mode decides how a repository stores a [`File`] object and which
-/// loose-path extension the object gets. The mode strings are the tokens
-/// that the `ostree` command writes to `config` under `[core] mode=`.
+/// loose-path extension the object gets. The mode strings are the tokens of
+/// `[core] mode=` in `config`. The `ostree` command writes each of them except
+/// `bare-user-shared` and `bare-user-private`, the ostrya extensions.
 ///
 /// [`File`]: crate::ObjectType::File
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,7 +36,15 @@ pub enum RepoMode {
     /// Storage as in [`BareUser`](Self::BareUser), with the inode mode 0400 on
     /// each content object. Metadata objects keep 0644.
     ///
-    /// This mode is an ostrya extension.
+    /// The bytes of an object, its `user.ostreemeta` xattr, and each checksum
+    /// are the same as in [`BareUser`](Self::BareUser). A symlink object is a
+    /// regular file, and it also gets the inode mode 0400. A process that reads
+    /// a content object must be the owner of the object or have privilege. A
+    /// checkout copies or reflinks each regular file.
+    ///
+    /// This mode is an ostrya extension, for a host that mounts its
+    /// deployments with composefs. The `ostree` command refuses to open a
+    /// repository of this mode.
     BareUserPrivate,
 }
 

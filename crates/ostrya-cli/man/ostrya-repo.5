@@ -6,7 +6,7 @@ An ostrya repository is a directory.
 It holds content\-addressed objects, refs that name commits, and a configuration file.
 The format is the on\-disk format of an ostree repository.
 The \fB\%ostree\fR tool reads the objects that \fB\%ostrya\fR writes, and \fB\%ostrya\fR reads the objects that the tool writes.
-Some files and one mode are extensions of ostrya.
+Some files and two modes are extensions of ostrya.
 The section EXTENSIONS lists them.
 .PP
 \fB\%ostrya init\fR makes a repository.
@@ -60,6 +60,21 @@ A checkout copies or reflinks each regular file.
 \fB\%checkout \-\-require\-hardlinks\fR refuses a regular file of non-zero length.
 The \fB\%ostree\fR tool does not know this mode string and refuses to open the repository.
 The section PERMISSIONS gives the modes of the directories and the lock files.
+.TP
+\fB\%bare\-user\-private\fR
+An ostrya extension for a host that mounts its deployments with composefs.
+A file object has the bytes and the \fB\%user.ostreemeta\fR attribute of \fB\%bare\-user\fR, and the same checksums.
+The inode mode of each file object is 0400, a symbolic link included.
+ostrya sets the attribute, then the \%fs\-verity seal, then the mode.
+A process that reads a file object must run as the owner of the object or as root.
+The load of a file object reads it, for example in \fB\%ostrya ls\fR, \fB\%ostrya cat\fR, \fB\%ostrya static\-delta generate\fR, and \fB\%ostrya composefs\-image\fR.
+A checkout, \fB\%ostrya fsck\fR, \fB\%ostrya export\fR, \fB\%ostrya serve\fR, \fB\%ostrya send\fR, and a local pull from the repository also read file objects.
+A checkout copies or reflinks each regular file.
+\fB\%checkout \-\-require\-hardlinks\fR refuses a regular file of non-zero length.
+A local pull makes a hard link of a file object only from a \fB\%bare\-user\-private\fR repository.
+Each metadata object gets 0644.
+The directories, the files in \fB\%deltas/\fR, and the files in \fB\%tmp/\fR follow the rules of \fB\%bare\-user\fR, and the directories get no forced mode.
+The \fB\%ostree\fR tool does not know this mode string and refuses to open the repository.
 .PP
 In each mode, a metadata object is stored uncompressed with the inode mode 0644.
 .SH OBJECTS
@@ -367,7 +382,8 @@ In the summary and in an index, the name of a delta is the hexadecimal \fB\%<to>
 .SH PERMISSIONS
 In each mode other than \fB\%bare\-user\-shared\fR, ostrya makes a directory with the mode 0775 less the umask.
 An \fB\%objects/<xx>/\fR directory and a directory that a ref write makes below \fB\%refs/\fR get 0777 less the umask.
-It writes \fB\%config\fR, each ref file, each object, \fB\%summary\fR, \fB\%summary.sig\fR, each file in \fB\%extensions/ostrya/summary/\fR, and each file in \fB\%deltas/\fR and \fB\%delta\-indexes/\fR with the mode 0644.
+It writes \fB\%config\fR, each ref file, each metadata object, \fB\%summary\fR, \fB\%summary.sig\fR, each file in \fB\%extensions/ostrya/summary/\fR, and each file in \fB\%deltas/\fR and \fB\%delta\-indexes/\fR with the mode 0644.
+The section MODES gives the inode mode of a file object in each mode.
 .PP
 In each mode other than \fB\%bare\-user\-shared\fR, \fB\%deltas/\fR, \fB\%delta\-indexes/\fR, and each directory below them get 0755 less the umask.
 .PP
@@ -581,6 +597,8 @@ The finder skips the client repository.
 These parts of the layout are extensions of ostrya:
 .IP \(bu 2
 the mode \fB\%bare\-user\-shared\fR and its permissions;
+.IP \(bu 2
+the mode \fB\%bare\-user\-private\fR and the mode 0400 of its file objects;
 .IP \(bu 2
 the lock file \fB\%.update.lock\fR;
 .IP \(bu 2

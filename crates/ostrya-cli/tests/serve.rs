@@ -424,7 +424,9 @@ fn pull(path: &Path, mode: &str, url: &str, pki: Option<&Pki>, rev: &str) -> Str
 /// passes `ostree fsck`.
 ///
 /// The served summary states `archive-z2` in each mode, so the pull from a
-/// `bare-user-shared` repository reads the summary too.
+/// `bare-user-shared` or a `bare-user-private` repository reads the summary
+/// too. The root summary of these two modes states the mode string of the
+/// port.
 #[test]
 fn the_tool_pulls_from_every_mode() {
     if !ostree_available() {
@@ -439,6 +441,7 @@ fn the_tool_pulls_from_every_mode() {
         "bare-user",
         "bare-user-only",
         "bare-user-shared",
+        "bare-user-private",
         "bare-split-xattrs",
     ] {
         let path = tmp.path().join(mode);

@@ -526,7 +526,8 @@ has exactly one accepted spelling:
 ## Repository modes and on-disk storage
 
 Mode strings: `bare`, `bare-user`, `bare-user-only`, `archive-z2` (alias
-`archive`), `bare-split-xattrs`, and the port extension `bare-user-shared`.
+`archive`), `bare-split-xattrs`, and the port extensions `bare-user-shared` and
+`bare-user-private`.
 ARCHIVE always serializes back as `archive-z2`.
 
 - `bare`: real files with the logical uid, gid, mode, and xattrs on the inode.
@@ -544,6 +545,9 @@ ARCHIVE always serializes back as `archive-z2`.
 - `bare-user-shared`: a development-only port extension. It is `bare-user`
   storage with a fixed inode mode 0644, for group-shared repositories
   ("bare-user-shared mode").
+- `bare-user-private`: a port extension. It is `bare-user` storage with the
+  inode mode 0400 on each content object, for the host repository of a host
+  that mounts its deployments with composefs ("bare-user-private mode").
 
 "Write path: loose-object inode modes and durability" states the inode mode
 and the owner in each mode. `conformance/cli-behavior.md`, "Checkout",
@@ -1719,6 +1723,9 @@ Inode permission bits, by object class and repository mode:
   the mode.
 - `bare-user-shared`: `bare-user` storage, with every content inode at a fixed
   0644 ("bare-user-shared mode").
+- `bare-user-private`: `bare-user` storage, with every content inode at a
+  fixed 0400, a symlink object included. `user.ostreemeta` goes on before the
+  seal, and the mode goes on after the seal ("bare-user-private mode").
 - `bare-user-only`: the inode mode of a regular-file content object is the
   canonical `logical_perm & 0o755`. Group write and other write are removed,
   and no special bit stays (`0664` stores as `0644`, `0666` as `0644`, `0775`
@@ -1773,7 +1780,8 @@ The fanout directories `objects/<xx>/` are created with the request mode 0777,
 which the umask reduces. `objects/` itself is 0775. This is the same in every
 mode the tool writes. In `bare-user-shared` the port sets each directory it
 creates to 02770 with an `fchmod` after the create, whatever the umask
-("bare-user-shared mode").
+("bare-user-shared mode"). In `bare-user-private` the port forces no
+directory mode, and the umask applies as in `bare-user`.
 
 ### Durability and staging
 
@@ -1869,9 +1877,9 @@ mode, `archive-z2` included:
 
 - content objects: `.file` (bare family) and `.filez` (archive);
 - metadata objects: `.dirtree`, `.dirmeta`, and `.commit`;
-- symlink objects stored as regular files: `bare-user`, `bare-user-shared`, and
-  `archive` keep the content of a symlink in a regular file, so these objects
-  are sealed.
+- symlink objects stored as regular files: `bare-user`, `bare-user-shared`,
+  `bare-user-private`, and `archive` keep the content of a symlink in a
+  regular file, so these objects are sealed.
 
 fs-verity applies to regular files, so the write skips the real symlink
 objects of `bare` and `bare-user-only`. A deduplicated write (the object is
@@ -1938,14 +1946,20 @@ Publication into `objects/` does not change.
 The port writes a regular-file content object in this order:
 
 1. Before the seal, on the writable descriptor: `user.ostreemeta` in
-   `bare-user`, the fixed mode 0644 in `archive`, and the fixed mode 0644 and
-   `user.ostreemeta` in `bare-user-shared`. In `bare`, `bare-user`, and
-   `bare-user-only`, the port first sets the temp to 0600 if its create mode
-   has no owner read or no owner write.
+   `bare-user` and `bare-user-private`, the fixed mode 0644 in `archive`, and
+   the fixed mode 0644 and `user.ostreemeta` in `bare-user-shared`. In
+   `bare`, `bare-user`, `bare-user-only`, and `bare-user-private`, the port
+   first sets the temp to 0600 if its create mode has no owner read or no
+   owner write. It does this step only when the effective `fsverity` is not
+   `no`.
 2. The seal, on a read-only reopen, after the writable descriptor closes.
 3. After the seal, on the read-only descriptor and before the link:
    - in `bare`: the owner, then the logical xattrs, then the logical mode;
-   - in `bare-user` and `bare-user-only`: the canonical mode.
+   - in `bare-user` and `bare-user-only`: the canonical mode;
+   - in `bare-user-private`: the mode 0400.
+
+In `bare-user-private`, a symlink object takes the same three steps. Its
+content is the target and one NUL.
 
 `fork` copies the file descriptor table. A child process thus holds a copy of
 the writable staging descriptor until its `exec` closes it. While that copy is
@@ -3385,7 +3399,7 @@ The part holds these items:
 - the commit of `push-tree`;
 - the composefs image commit;
 - the protocol of the composefs mount daemon;
-- the mode `bare-user-shared`;
+- the modes `bare-user-shared` and `bare-user-private`;
 - the S3 bucket repository.
 
 The push protocol, the pull protocol, and the protocol of the mount daemon
@@ -6821,11 +6835,12 @@ repository with a bad `config` or `zlib-level` gets 404 for `HEAD` and 500
 for `GET`.
 
 The summary of an item states `archive-z2` in `ostree.summary.mode` in each
-mode, `bare-user-shared` included. Observed behavior: the tool refuses a
-summary that states `bare-user-shared`. So the tool pulls with a summary from
-a `bare-user-shared` repository only because the summary states
-`archive-z2`. The root summary states `bare-user-shared`,
-and the view never serves it.
+mode, `bare-user-shared` and `bare-user-private` included. Observed behavior:
+the tool refuses a summary that states `bare-user-shared`. So the tool pulls
+with a summary from a `bare-user-shared` repository only because the summary
+states `archive-z2`. Not observed: the refusal of a summary that states
+`bare-user-private`. The root summary states `bare-user-shared` or
+`bare-user-private` in these two modes, and the view never serves it.
 
 ### Read access
 
@@ -7949,9 +7964,11 @@ message.
 ## bare-user-shared mode
 
 `bare-user-shared` is a repository mode of the port for development. The
-tool has no such mode. A production repository (`/sysroot/ostree`) stays
-`bare`. The mode lets several users build images in one group-shared
-repository on a build machine, and it serves as a composefs backing store.
+tool has no such mode. A production host repository uses `bare`, or
+`bare-user-private` on a host that mounts its deployments with composefs
+("bare-user-private mode"). The mode lets several users build images in one
+group-shared repository on a build machine, and it serves as a composefs
+backing store.
 
 In `bare-user`, the inode permission bits of a regular-file object come from
 the logical mode of the file: `(mode & (S_IFREG|0775)) | S_IRUSR`. So a file
@@ -8048,25 +8065,173 @@ checkout restores the restrictive logical permissions. The permissions of the
 repository root directory control access from outside. This is an accepted
 property of a shared development repository.
 
-As in `bare-user`, the port never writes `ostree.sizes` in this mode. Only an
-`archive` repository writes the key ("The `ostree.sizes` key"), so the
-identity of a commit across modes needs no rule for this mode.
+As in `bare-user`, the port computes no `ostree.sizes` in this mode. Only an
+`archive` repository computes the key ("The `ostree.sizes` key"), so the
+identity of a commit across modes needs no rule for this mode. A commit that
+carries the key keeps it. Examples are a commit from a pull and the server
+commit of a push with the entries of the client.
 
 A checkout never hardlinks a regular file of this mode, because the inode
 does not carry the logical mode (`conformance/cli-behavior.md`, "Checkout",
 "Hardlink and copy").
+
+Under `checkout --require-hardlinks --union-identical`, the port refuses a
+regular file of non-zero length before the comparison. So the comparison
+reaches only a zero-length regular file. Such a file is identical to its
+object only if its permission bits are 0644, the bits of the object inode
+(`conformance/cli-behavior.md`, "Checkout", "Overwrite policy"). A checkout
+writes a zero-length file with its logical mode. So `checkout -H
+--union-identical` over an earlier `checkout -H` of the same commit exits 1
+at the first zero-length file whose logical permission bits are not 0644.
+The error is `error: checkout: <name>: destination entry already exists`.
 
 `fsck` and prune act as in `bare-user`. `fsck` checks
 `SHA256(header-from-xattr ‖ payload) == object name`. The mode has no
 auxiliary objects and no extra reachability edges. `fsck` does not check the
 inode mode.
 
-This mode is the composefs backing store of the port. Its `.file` objects
+This mode is a composefs backing store of the port. Its `.file` objects
 hold the raw payload at the loose paths that each image redirect names. So
 the repository serves as the lower layer of an image exported from any mode
 that holds the same tree. The fs-verity digest of each file covers the
 payload. The composefs uid mapping presents the owner at mount time, so the
 root-owned metadata is correct also inside a rootless container.
+
+## bare-user-private mode
+
+`bare-user-private` is a repository mode of the port. The tool has no such
+mode. The mode is the host repository of a host that mounts its deployments
+with composefs and makes no hardlink checkout. A repository with an
+unprivileged owner also works.
+
+Each content object has the inode mode 0400. The purpose of this mode is the
+backing inode of a composefs mount: the `.file` inode that the overlay reads.
+The mode does not hide the content of the repository from other users. Each
+metadata object gets 0644, and delta parts in `deltas/` and files in `tmp/`
+follow the rules of `bare-user`. The metadata objects hold each file name and
+each tree layout. The permissions of the repository root directory control access from
+other users.
+
+Each byte that carries identity is the same as in `bare-user`:
+
+- The content of an object is the raw payload. The `user.ostreemeta` xattr
+  holds the logical uid, gid, mode, and xattrs as `(uuua(ayay))`.
+- A symlink is stored as a regular file. Its content is the target and one
+  NUL.
+- The object identity is `SHA256(6-field header ‖ payload)`, as in each
+  other mode. So each dirtree and commit checksum is equal to the checksum in
+  `bare-user` and in `bare`.
+
+The inode modes:
+
+- Each content object gets the mode 0400 through an explicit `fchmod`, so
+  the umask has no effect. This includes a symlink object. No setuid bit, no
+  execute bit, and no read permission for other users stays on an object.
+  The `/root.cfs` object of an image commit is a content object, so it also
+  gets 0400 ("The composefs image commit").
+- Each metadata object and each `.commitmeta` gets 0644, as in each other
+  mode.
+- Directories, lock files, refs, the files in `deltas/` and
+  `delta-indexes/`, and the files in `tmp/` follow the rules of `bare-user`.
+  Each directory takes the umask, as in `bare-user`.
+
+The port writes a content object in this order: `user.ostreemeta`, then the
+fs-verity seal, then the mode 0400. The kernel checks a `user.*` xattr and
+`FS_IOC_ENABLE_VERITY` against the write permission of the inode. Root
+passes that check. On btrfs, for the owner of a 0400 file, `setxattr` of a
+`user.*` name gives `EACCES`, and `FS_IOC_ENABLE_VERITY` on a read-only
+descriptor gives `EACCES`. At 0600 both pass. If the effective
+`fsverity` is not `no` and the create mode of the temp file has no owner read
+or no owner write, the temp file first gets 0600. A symlink object takes the
+same steps ("Write path: loose-object inode modes and durability").
+
+A process that reads a content object must be the owner of the object or
+root. These readers are affected:
+
+- the load of a file object, for example in `ostrya ls`, `ostrya cat`,
+  `ostrya static-delta generate`, and `ostrya composefs-image`;
+- a checkout, `fsck`, and a tar export with `ostrya export`;
+- the archive view of `ostrya serve` and of `ostrya send`, which builds each
+  `.filez` from the object;
+- a local pull from the repository.
+
+A local pull keeps a hardlink of a source object only if the source inode has
+the uid and the gid that a new write gets. For a user who is not the owner,
+this check fails. The kernel setting `fs.protected_hardlinks` also refuses
+the link of a 0400 file to that user. The pull then reads the object to
+write it again, and the open of the source object gives `EACCES`.
+
+A composefs mount of a commit works. The mount shows the modes and the owners
+of the image. The overlay reads the objects with the credentials of the
+process that mounts the image, so that process must be the owner of the
+objects or root. A mount by root in the process passes. A mount through the
+mount daemon passes for a client that is not root, also for a client in a
+user namespace.
+
+A checkout never hardlinks an object of this mode. It copies or reflinks each
+regular file, and it applies the logical mode from `user.ostreemeta`.
+`checkout --require-hardlinks` refuses a regular file of non-zero length. It
+refuses no symlink: the checkout creates the link again, as in `bare-user`.
+
+Under `checkout --require-hardlinks --union-identical`, the port refuses a
+regular file of non-zero length before the comparison. So the comparison
+reaches only a zero-length regular file. Such a file is identical to its
+object only if its permission bits are 0400, the bits of the object inode
+(`conformance/cli-behavior.md`, "Checkout", "Overwrite policy"). A checkout
+writes a zero-length file with its logical mode. So `checkout -H
+--union-identical` over an earlier `checkout -H` of the same commit exits 1
+at the first zero-length file whose logical permission bits are not 0400.
+The error is `error: checkout: <name>: destination entry already exists`.
+
+A local pull into a repository of this mode can hardlink these objects:
+
+- a metadata object from a source of any mode;
+- a content object from a `bare-user-private` source. The link shares the
+  inode, so the object keeps the mode 0400.
+
+No symlink object is shared with `bare-user` or `bare-user-shared`. An import
+between this mode and another mode writes the object again:
+
+- A regular file between two modes other than `archive` is cloned into a new
+  file, or copied where the file system cannot clone.
+- A symlink object is written again from its target.
+- A regular file from an `archive` source or into an `archive` destination
+  goes through the content writer.
+
+The rules of the destination mode apply in each direction.
+
+The mode string is `[core] mode=bare-user-private`. The separate string keeps
+the tool out of the repository. Observed behavior with ostree 2026.1:
+
+- `ostree init --mode=bare-user-private` exits 1 with `error: Invalid mode
+  'bare-user-private' in repository configuration` and creates no directory.
+- The tool writes a `bare-user` repository with one commit. Then the
+  `config` of the repository gets `mode=bare-user-private`. `ostree refs`,
+  `fsck`, `ls`, `commit`, and `summary -u` each exit 1 with `error: opening
+  repo: Invalid mode 'bare-user-private' in repository configuration`. The
+  repository does not change.
+
+The root summary states `bare-user-private` in `ostree.summary.mode`. The
+summary that the archive view serves states `archive-z2` ("The archive
+view"). The `HelloReply` of a push session states `bare-user-private`.
+
+The mode is for new repositories alone. `ostrya init
+--mode=bare-user-private` makes one, and a pull fills it. The port does not
+convert a repository of another mode to this mode.
+
+As in `bare-user`, the port computes no `ostree.sizes` in this mode ("The
+`ostree.sizes` key"). A commit that carries the key keeps it. Examples are a
+commit from a pull and the server commit of a push with the entries of the
+client.
+
+`fsck` and prune act as in `bare-user`. `fsck` checks
+`SHA256(header-from-xattr ‖ payload) == object name`. `fsck` does not check
+the inode mode.
+
+The `.file` objects hold the raw payload at the loose paths that each image
+redirect names, as in `bare-user`. So the repository serves as the lower
+layer of an image exported from any mode that holds the same tree. The
+fs-verity digest of each file covers the payload.
 
 ## The S3 bucket repository
 

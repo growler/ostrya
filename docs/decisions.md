@@ -358,6 +358,65 @@ This form was rejected:
   directory into the live repository. `cli-surface.md`, "Global
   conventions", records the divergence from the tool.
 
+## The bare-user-private mode
+
+`bare-user-private` is a repository mode of the port. It is the host
+repository of a host that mounts its deployments with composefs alone and
+makes no hardlink checkout. A repository with an unprivileged owner also
+works. The name pairs with `bare-user-shared`: both modes use the
+`bare-user` storage, and only the permission policy changes.
+
+The rules of the mode:
+
+- Each content object has the inode mode 0400. This includes a symlink
+  object, which is a regular file. Each metadata object keeps 0644, as in
+  each other mode.
+- The 0400 mode protects the backing inode of a composefs mount, the `.file`
+  inode that the overlay reads. It does not hide the content of the
+  repository. Each metadata object gets 0644, delta parts and files in
+  `tmp/` follow the rules of `bare-user`, and the metadata objects hold each
+  file name and each tree layout.
+- Directories follow the rules of `bare-user`. The umask applies, and the
+  port forces no directory mode.
+- The mode is for new repositories alone. `ostrya init
+  --mode=bare-user-private` makes one, and a pull fills it.
+- A process that reads a content object must be the owner of the object or
+  root. A local pull from the repository is such a reader.
+- The write order of a content object is `user.ostreemeta`, then the
+  fs-verity seal, then the mode 0400. The kernel checks a `user.*` xattr and
+  `FS_IOC_ENABLE_VERITY` against the write permission of the inode. A
+  regular file and a symlink take the same code path, so one site holds the
+  order.
+- A checkout copies or reflinks each regular file. `checkout
+  --require-hardlinks` refuses a regular file of non-zero length and no
+  symlink.
+- A local pull hardlinks a content object only from a source of the same
+  mode. The link shares the inode, so the object keeps the mode 0400.
+- `fsck` does not check the inode mode of a content object, as in each
+  other mode.
+- `RepoMode` has no `#[non_exhaustive]` ("`#[non_exhaustive]` on the
+  public types").
+
+`format-reference.md`, "bare-user-private mode", states the format.
+
+These alternatives were rejected:
+
+- Forced directory modes, as in `bare-user-shared`. The mode serves one
+  owner, so the umask gives the directory modes. A forced mode also needs a
+  change of the module `repo_fs`.
+- The conversion of a repository of another mode. A pull into a new
+  repository gives the same objects and the same checksums.
+- An `fsck` check of the mode 0400. No other mode has an `fsck` check of the
+  inode mode, and a wrong mode does not change the content of an object.
+- `checkout --require-hardlinks` that refuses a symlink. The checkout
+  creates the link again, as in `bare-user` and `bare-user-shared`.
+- The mode 0400 before the xattr and the seal, or a write through the path
+  of a named file that sets the mode first. The kernel refuses the xattr and
+  the seal on a 0400 inode for an owner who is not root.
+- A `bare-user` repository with a `chmod 0400` over `objects/`. A later
+  write gives a new object the mode of `bare-user`, and a local pull links
+  objects with other modes.
+
 ## The read of the remotes directory
 
 The open selects the remotes directory of the handle in this order: the value
@@ -5703,6 +5762,9 @@ when the port owns its set of members and expects the set to grow.
   `Default::default()` and sets the fields, so a later field is additive.
 - `ostrya_server::ServeOptions` and `ostrya_mount::MountOptions` have the
   attribute. A caller starts from `Default::default()` and sets the fields.
+- `ostrya_core::RepoMode` does not have the attribute. An exhaustive
+  `match` over the enum makes each site answer for a new repository mode. A
+  new variant is a breaking change, and it takes a minor version before 1.0.
 - `ostrya_gvariant::Type` and `ostrya_gvariant::Value` do not have the
   attribute. The GVariant serialization specification closes the type
   alphabet, and the two enums name all of it. An exhaustive `match` over

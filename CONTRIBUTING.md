@@ -486,6 +486,14 @@ runs these checks when the tool is on `PATH`.
 A `bare-user-shared` repository is made from a `bare-user` repository: the
 test changes the mode of the objects and the `[core] mode` key.
 
+No fixture of a `bare-user-private` repository exists. The tests write such
+a repository with Ostrya and compare each object with the object of a
+`bare-user` repository of the same tree. The write-order tests
+`bare_user_private_modes_under_umask_0077` in `crates/ostrya/tests/write.rs`
+and `bare_user_private_seals_before_mode_0400` in
+`crates/ostrya/tests/fsverity.rs` prove the order only for a user that is
+not root. Under root, each of them writes a note to standard error.
+
 ### Absent fixtures
 
 A test that reads a composefs fixture, and

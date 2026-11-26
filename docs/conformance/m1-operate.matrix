@@ -61,6 +61,27 @@ family: M1
 created-by: t
 populated-by: t
 operated-by: p
+op: read-metadata read-content fsck diff config-read checkout-copy
+ checkout-hardlink commit-into refs-update prune summary-regenerate sign-verify
+ static-delta-generate static-delta-apply tar-export composefs-export
+ lock-exclusion
+modes: bare-user-private
+tier: T0
+outcome: impossible
+severity: interop
+identity: n-a
+oracle: exit-status
+evidence: -
+spec: format-reference.md#bare-user-private-mode
+note: The mode is a port extension. The tool refuses the mode string at init and
+ when it opens the repository, so it cannot create or populate a repository of
+ this mode, and this column has no producer. D2 below states the other
+ direction.
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
 op: read-metadata read-content fsck diff config-read checkout-copy tar-export
 modes: bare-split-xattrs
 tier: T0
@@ -317,6 +338,33 @@ note: Observed with ostree 2026.1. Every subcommand fails when the repository is
  repository is left unmodified. The route to the tool for this mode is a port-run
  pull-local into a tool-readable mode; object identity is preserved by design so
  that the migration is lossless. That migration is a cell in m2-pull-local.
+question: Add a test that pins this message and the exit status, so a future tool
+ release that changes the refusal is caught.
+
+family: M1
+created-by: p
+populated-by: p
+operated-by: t
+op: read-metadata read-content fsck diff config-read checkout-copy
+ checkout-hardlink commit-into refs-update prune summary-regenerate sign-verify
+ static-delta-generate static-delta-apply tar-export composefs-export
+ lock-exclusion
+modes: bare-user-private
+tier: T0
+outcome: refused-clean
+severity: interop
+identity: n-a
+oracle: exit-status stderr-text
+evidence: -
+spec: format-reference.md#bare-user-private-mode
+note: Observed with ostree 2026.1 on a repository whose config states
+ mode=bare-user-private. `ostree refs`, `fsck`, `ls`, `commit`, and `summary -u`
+ each fail when the repository is opened, before the operation runs, with
+ "error: opening repo: Invalid mode 'bare-user-private' in repository
+ configuration" and exit status 1. The repository does not change. The route to
+ the tool for this mode is a port-run pull-local into a tool-readable mode, as
+ the owner of the objects or as root. Object identity is the same in each mode,
+ so the pull keeps each checksum.
 question: Add a test that pins this message and the exit status, so a future tool
  release that changes the refusal is caught.
 

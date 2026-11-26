@@ -903,9 +903,9 @@ fn commit_ownership_and_timestamp_flags_match_the_tool() {
 /// store ownership. It has one checksum in `archive`, in `bare-user`, and in
 /// the ostrya extensions `bare-user-shared` and `bare-user-private`. The
 /// `ostree` command cannot open the extension modes, so the `bare-user-shared`
-/// cell of corpus `C3` rests on this test. The cells and
-/// `commit_ownership_and_timestamp_flags_match_the_tool` compare the other two
-/// modes directly with `ostree`.
+/// and `bare-user-private` cells of corpus `C3` rest on this test. The cells
+/// and `commit_ownership_and_timestamp_flags_match_the_tool` compare the other
+/// two modes directly with `ostree`.
 #[test]
 fn declared_ownership_is_one_commit_across_modes() {
     let tmp = TmpDir::new("commit-owner-modes");

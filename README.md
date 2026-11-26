@@ -91,6 +91,9 @@ Ostrya adds these functions, which the `ostree` command does not have:
   does not store `ostrya.related`.
 - The `bare-user-shared` mode, for development. It is `bare-user` storage
   with the fixed file mode 0644, for a repository that one group shares.
+- The `bare-user-private` mode, for a host that mounts its deployments with
+  composefs. It is `bare-user` storage with the file mode 0400 on each
+  content object.
 - The composefs image commit. A commit can name a second commit, whose tree
   holds its composefs image as the file `/root.cfs`. `ostrya commit
   --generate-composefs` writes the image commit and names it as the
@@ -126,8 +129,9 @@ the protocols of these functions.
 
 Ostrya and the `ostree` command use the same repository format. The `ostree`
 command reads each repository that Ostrya writes, and Ostrya reads each
-repository that the `ostree` command writes. The `bare-user-shared` mode is the
-exception, because only Ostrya writes it.
+repository that the `ostree` command writes. The `bare-user-shared` and
+`bare-user-private` modes are the exceptions, because only Ostrya writes
+them.
 
 The `ostrya` command is functionally compatible with the `ostree` command. A
 command that `ostrya` carries takes the same option names and values, does the

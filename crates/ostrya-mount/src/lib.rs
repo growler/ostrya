@@ -168,10 +168,15 @@
 //! # Repository modes
 //!
 //! The repository modes `bare`, `bare-user`, `bare-user-only`,
-//! `bare-split-xattrs`, and `bare-user-shared` can be mounted: each of them
-//! stores the raw content of a file at the loose path that the image names.
-//! An `archive` repository can hold images, but it cannot be mounted,
-//! because it stores compressed `.filez` objects.
+//! `bare-split-xattrs`, `bare-user-shared`, and `bare-user-private` can be
+//! mounted: each of them stores the raw content of a file at the loose path
+//! that the image names. An `archive` repository can hold images, but it
+//! cannot be mounted, because it stores compressed `.filez` objects.
+//!
+//! In `bare-user-private`, each content object has the inode mode 0400. The
+//! overlay reads the objects with the credentials of the process that mounts
+//! the image, so that process must be the owner of the objects or root. The
+//! mount shows the modes and the owners of the image.
 //!
 //! - [`Direct::mount_image`] does not read the mode. The caller gives the
 //!   `objects` directory of a repository of a mode that can be mounted. Over

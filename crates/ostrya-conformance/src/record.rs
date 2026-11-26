@@ -9,17 +9,18 @@ use std::path::{Path, PathBuf};
 
 use crate::deb822::{self, Paragraph};
 
-/// The six repository modes that a record can name.
+/// The seven repository modes that a record can name.
 ///
 /// [`check`](crate::check::check) refuses a value of `modes`, `src-mode`, or
 /// `dst-mode` that is not in this list. The mode grids of
 /// [`grids`](crate::report::grids) have one column for each mode, in this order.
-pub const MODES: [&str; 6] = [
+pub const MODES: [&str; 7] = [
     "archive",
     "bare",
     "bare-user",
     "bare-user-only",
     "bare-user-shared",
+    "bare-user-private",
     "bare-split-xattrs",
 ];
 

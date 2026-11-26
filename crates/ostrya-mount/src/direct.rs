@@ -44,11 +44,11 @@ impl Direct {
     /// guarantee.
     ///
     /// `objects` is the `objects` directory of a repository of the mode
-    /// `bare`, `bare-user`, `bare-user-only`, `bare-split-xattrs`, or
-    /// `bare-user-shared`. The call does not read the mode of the
-    /// repository. An `archive` repository stores compressed `.filez`
-    /// objects, so over its `objects` directory each regular file with
-    /// content fails to open.
+    /// `bare`, `bare-user`, `bare-user-only`, `bare-split-xattrs`,
+    /// `bare-user-shared`, or `bare-user-private`. The call does not read the
+    /// mode of the repository. An `archive` repository stores compressed
+    /// `.filez` objects, so over its `objects` directory each regular file
+    /// with content fails to open.
     ///
     /// `verity` is the `verity` option of the composefs overlay. The call
     /// does not read the config of the repository. Give [`Verity::Require`]

@@ -121,6 +121,28 @@ note: `bare-user-shared` is a port extension the tool has no `--mode` value
  cell's only assertions: the mode is accepted and the repository is created.
  The oracles record the port's artifacts and compare nothing.
 
+family: M10
+subcommand: init
+cell: init/mode=bare-user-private
+setup: empty-dir
+run: init --repo=$REPO --mode=bare-user-private
+ref-run: n-a
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status config-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#bare-user-private-mode
+note: `bare-user-private` is a port extension. The tool has no `--mode` value
+ for it: `ostree init --mode=bare-user-private` exits 1 with `error: Invalid
+ mode 'bare-user-private' in repository configuration`. The tool also refuses
+ to open a repository that ostrya created in this mode (`error: opening repo:
+ Invalid mode 'bare-user-private' in repository configuration`). The D2
+ direction of `m1-operate.matrix` states that refusal. `ref-run: n-a` leaves
+ the port's own claims as the only assertions of the cell: the mode is
+ accepted and the repository is created. The oracles record the artifacts of
+ the port and compare nothing.
+
 # ---------------------------------------------------------------------------
 # init -- rejection, and the cwd/OSTREE_REPO fallback it shares with every
 # other subcommand.

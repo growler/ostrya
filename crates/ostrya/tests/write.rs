@@ -3,8 +3,10 @@
 //! The tests write objects into real repositories and check these items:
 //!
 //! - archive and bare-user loose objects against the checked-in fixtures,
-//!   byte for byte, and the bare-user-shared objects that follow from
-//!   bare-user
+//!   byte for byte, and the bare-user-shared and bare-user-private objects
+//!   that follow from bare-user
+//! - the inode mode 0400 of each bare-user-private content object under a
+//!   umask of 0077
 //! - bare objects against the objects of the `ostree` command
 //! - a second write of an object, which is a no-op (dedup)
 //! - the free-space guard
@@ -231,6 +233,181 @@ fn bare_user_shared_shares_bare_user_identity_with_fixed_mode() {
             );
         }
     });
+}
+
+#[test]
+fn bare_user_private_shares_bare_user_identity_with_mode_0400() {
+    let tmp = TmpDir::new("write-private");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUserPrivate))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        // The checksums are the same as in bare-user (`write_fixture_tree`
+        // asserts them).
+        write_fixture_tree(&txn).await;
+        txn.commit().await.unwrap();
+
+        // The payload and `user.ostreemeta` are byte for byte the same as in
+        // bare-user. The inode mode is always 0400, for each logical mode.
+        for (hex, payload) in [(HELLO_TXT, HELLO), (EMPTY_TXT, EMPTY), (NESTED_TXT, NESTED)] {
+            assert_eq!(
+                object_bytes(&root, hex, ObjectType::File, RepoMode::BareUserPrivate),
+                payload
+            );
+            assert_eq!(
+                ostreemeta(&root, hex, RepoMode::BareUserPrivate),
+                fixture_ostreemeta("bare-user", hex),
+            );
+            assert_eq!(
+                inode_perm(&root, hex, ObjectType::File, RepoMode::BareUserPrivate),
+                0o400
+            );
+        }
+        // The symlink is a regular file that holds the target and one NUL.
+        assert_eq!(
+            object_bytes(&root, LINK, ObjectType::File, RepoMode::BareUserPrivate),
+            b"hello.txt\0"
+        );
+        assert_eq!(
+            ostreemeta(&root, LINK, RepoMode::BareUserPrivate),
+            fixture_ostreemeta("bare-user", LINK),
+        );
+        assert_eq!(
+            inode_perm(&root, LINK, ObjectType::File, RepoMode::BareUserPrivate),
+            0o400
+        );
+    });
+}
+
+/// The environment variable that names the marker file of the umask child.
+const UMASK_ENV: &str = "OSTRYA_WRITE_UMASK_CHILD";
+
+/// Returns the `user.ostreemeta` xattr of the file at `path`.
+fn ostreemeta_at(path: &Path) -> Vec<u8> {
+    let mut buf = vec![0u8; 256];
+    let n = rustix::fs::getxattr(path, "user.ostreemeta", &mut buf).unwrap();
+    buf.truncate(n);
+    buf
+}
+
+/// Asserts that the files at `a` and `b` have the same length and the same
+/// bytes. The check reads the two files in chunks of 8 KiB, so it does not
+/// keep a full file in memory. `what` names the pair in a failure message.
+fn assert_same_content(a: &Path, b: &Path, what: &Path) {
+    use std::io::Read as _;
+    const CHUNK: usize = 8192;
+    let mut a_file = std::fs::File::open(a).unwrap();
+    let mut b_file = std::fs::File::open(b).unwrap();
+    let len = a_file.metadata().unwrap().len();
+    assert_eq!(
+        len,
+        b_file.metadata().unwrap().len(),
+        "the length of {}",
+        what.display()
+    );
+    let mut a_buf = [0u8; CHUNK];
+    let mut b_buf = [0u8; CHUNK];
+    let mut offset = 0u64;
+    while offset < len {
+        let n = usize::try_from(len - offset).map_or(CHUNK, |rest| rest.min(CHUNK));
+        a_file.read_exact(&mut a_buf[..n]).unwrap();
+        b_file.read_exact(&mut b_buf[..n]).unwrap();
+        assert!(
+            a_buf[..n] == b_buf[..n],
+            "{}: the chunk at offset {offset} is different",
+            what.display()
+        );
+        offset += n as u64;
+    }
+}
+
+/// Under a umask of 0077, a `bare-user-private` repository stores each
+/// content object, regular file and symlink, at the inode mode 0400, and each
+/// metadata object at 0644. The bytes and `user.ostreemeta` of each content
+/// object are the same as in `bare-user`. An unprivileged owner cannot set a
+/// `user.*` xattr on a 0400 file, so the commit fails if the mode goes on
+/// before the xattr. Root skips that check. The umask is a property of the
+/// process, so the check runs in a child process. The child is this test
+/// binary, which runs this test alone.
+#[test]
+fn bare_user_private_modes_under_umask_0077() {
+    use common::modes::{build_tree, file_objects, repo_of};
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(marker) = std::env::var_os(UMASK_ENV) {
+        let marker = std::path::PathBuf::from(marker);
+        rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
+        if rustix::process::geteuid().is_root() {
+            eprintln!("note: root skips the permission check, so the write order has no effect");
+        }
+        let tmp = TmpDir::new("write-private-umask-child");
+        let src = build_tree(tmp.path());
+        block_on(async {
+            let (private, repo, commit) =
+                repo_of(tmp.path(), RepoMode::BareUserPrivate, &src).await;
+            let (plain, _, plain_commit) = repo_of(tmp.path(), RepoMode::BareUser, &src).await;
+            assert_eq!(
+                commit, plain_commit,
+                "the commit is the same as in bare-user"
+            );
+
+            let mut content = 0;
+            for fanout in std::fs::read_dir(private.join("objects")).unwrap() {
+                let fanout = fanout.unwrap();
+                for entry in std::fs::read_dir(fanout.path()).unwrap() {
+                    let path = entry.unwrap().path();
+                    let meta = std::fs::symlink_metadata(&path).unwrap();
+                    assert!(meta.file_type().is_file(), "{}", path.display());
+                    let perm = meta.permissions().mode() & 0o7777;
+                    if path.extension().is_some_and(|e| e == "file") {
+                        content += 1;
+                        assert_eq!(perm, 0o400, "{}", path.display());
+                        let rel = path.strip_prefix(&private).unwrap();
+                        let twin = plain.join(rel);
+                        assert_same_content(&path, &twin, rel);
+                        assert_eq!(
+                            ostreemeta_at(&path),
+                            ostreemeta_at(&twin),
+                            "{}",
+                            rel.display()
+                        );
+                    } else {
+                        assert_eq!(perm, 0o644, "{}", path.display());
+                    }
+                }
+            }
+            // hello, exec, empty, big, and link.
+            assert_eq!(content, 5);
+
+            // The logical mode of the executable reads back from the xattr.
+            let mut modes = Vec::new();
+            for checksum in file_objects(&repo, &commit).await {
+                modes.push(repo.load_file(&checksum).await.unwrap().mode);
+            }
+            assert!(modes.contains(&0o100755), "{modes:?}");
+
+            let report = repo.fsck(&FsckOptions::default()).await.unwrap();
+            assert!(report.is_ok(), "fsck reported {:?}", report.errors);
+        });
+        std::fs::write(marker, b"ran").unwrap();
+        return;
+    }
+    let tmp = TmpDir::new("write-private-umask");
+    let marker = tmp.path().join("ran");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "bare_user_private_modes_under_umask_0077",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(UMASK_ENV, &marker)
+        .status()
+        .expect("re-execute this test binary");
+    assert!(status.success(), "the child failed: {status}");
+    // If the filter matches no test name, the child runs nothing and exits
+    // 0. Only the marker proves that the check ran.
+    assert!(marker.exists(), "the child ran no check");
 }
 
 #[test]

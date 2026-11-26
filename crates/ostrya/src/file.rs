@@ -327,6 +327,9 @@ impl Repo {
     /// - `bare-user-shared`: the load is the same as in `bare-user`. The load
     ///   does not read the fixed inode mode that a writer applies, so one
     ///   loader serves both modes.
+    /// - `bare-user-private`: the load is the same as in `bare-user`. Each
+    ///   content object has the inode mode 0400, so the load must run as the
+    ///   owner of the object or with privilege.
     /// - `bare-split-xattrs`: the storage is bare (the real uid, gid, and
     ///   mode, real symlinks, and no `user.ostreemeta`). A separate
     ///   `.file-xattrs` object holds the logical xattrs. The load reaches it
@@ -344,8 +347,9 @@ impl Repo {
     ///   - a `bare`, `bare-user-only`, or `bare-split-xattrs` object is not a
     ///     regular file or a symlink, with the message `<path> is not a
     ///     regular file`
-    ///   - an `archive`, `bare-user`, or `bare-user-shared` object, or a
-    ///     `.file-xattrs-link`, is not a regular file, with the same message
+    ///   - an `archive`, `bare-user`, `bare-user-shared`, or
+    ///     `bare-user-private` object, or a `.file-xattrs-link`, is not a
+    ///     regular file, with the same message
     ///   - a symlink target is not valid UTF-8, or has an interior NUL
     ///   - the content of a `bare-user` symlink object is larger than 65536
     ///     bytes, with the message `<path> is larger than its cap of 65536
@@ -353,10 +357,10 @@ impl Repo {
     ///   - a `.file-xattrs-link` is larger than [`MAX_METADATA_SIZE`]
     /// - [`Error::InvalidFormat`] if a symlink is at `objects/<xx>`, at a
     ///   `.file-xattrs-link`, or at the object path in the `archive`,
-    ///   `bare-user`, and `bare-user-shared` modes. The message is `<path>
-    ///   passes through a symlink; ostrya refuses a symlink in the
-    ///   repository`. In the other modes, a symlink at the object path is a
-    ///   symlink object, and the load reads its target.
+    ///   `bare-user`, `bare-user-shared`, and `bare-user-private` modes. The
+    ///   message is `<path> passes through a symlink; ostrya refuses a
+    ///   symlink in the repository`. In the other modes, a symlink at the
+    ///   object path is a symlink object, and the load reads its target.
     /// - [`Error::Core`] if the file header, the `user.ostreemeta` value, or
     ///   the xattr set of a `.file-xattrs-link` does not parse.
     /// - [`Error::Io`] of kind [`InvalidData`](std::io::ErrorKind::InvalidData)
@@ -512,7 +516,7 @@ impl Repo {
                     FileKind::Regular { size } => size,
                     FileKind::Symlink { .. } => 0,
                 },
-                RepoMode::BareUser | RepoMode::BareUserShared => {
+                RepoMode::BareUser | RepoMode::BareUserShared | RepoMode::BareUserPrivate => {
                     bare_user_payload_size(dir, &path)?
                 }
                 RepoMode::Bare | RepoMode::BareUserOnly | RepoMode::BareSplitXattrs => {
@@ -594,7 +598,10 @@ impl Repo {
                     objects.open_object(&path)?;
                     probe_split_xattrs_link(objects, &path)?;
                 }
-                RepoMode::Archive | RepoMode::BareUser | RepoMode::BareUserShared => {
+                RepoMode::Archive
+                | RepoMode::BareUser
+                | RepoMode::BareUserShared
+                | RepoMode::BareUserPrivate => {
                     objects.open_regular(&path)?;
                 }
             }
@@ -798,7 +805,7 @@ fn load_by_mode(
 ) -> std::result::Result<Loaded, LoadError> {
     match mode {
         RepoMode::Archive => load_archive(dir, object_path, keep),
-        RepoMode::BareUser | RepoMode::BareUserShared => {
+        RepoMode::BareUser | RepoMode::BareUserShared | RepoMode::BareUserPrivate => {
             load_bare_user(dir, object_path, measure, keep)
         }
         RepoMode::Bare => load_bare(dir, object_path, measure, keep),
@@ -1391,6 +1398,16 @@ mod sealed_verity_tests {
     #[test]
     fn a_sealed_bare_user_only_object_yields_the_kernel_digest() {
         check_sealed_object_yields_the_kernel_digest("bare-user-only", RepoMode::BareUserOnly);
+    }
+
+    /// A bare-user-private object, sealed before the write path sets the inode
+    /// mode 0400, yields the kernel's digest.
+    #[test]
+    fn a_sealed_bare_user_private_object_yields_the_kernel_digest() {
+        check_sealed_object_yields_the_kernel_digest(
+            "bare-user-private",
+            RepoMode::BareUserPrivate,
+        );
     }
 
     /// A bare object, owned by the running user, yields the kernel's digest.

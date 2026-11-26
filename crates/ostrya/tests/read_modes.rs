@@ -203,3 +203,72 @@ fn reads_bare_user_shared_like_bare_user() {
         assert_eq!(read_payload(&file).await, b"shared\n");
     });
 }
+
+/// Returns the `(uuua(ayay))` stat metadata of `user.ostreemeta` with uid 0,
+/// gid 0, the logical mode `mode`, and no xattrs.
+fn ostreemeta_of(mode: u32) -> Vec<u8> {
+    let mut meta = Vec::new();
+    meta.extend_from_slice(&0u32.to_be_bytes()); // uid
+    meta.extend_from_slice(&0u32.to_be_bytes()); // gid
+    meta.extend_from_slice(&mode.to_be_bytes()); // mode
+    meta
+}
+
+#[test]
+fn reads_bare_user_private_like_bare_user() {
+    block_on(async {
+        let tmp = TmpDir::new("bup");
+        let root = tmp.path().join("repo");
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUserPrivate))
+            .await
+            .expect("create bare-user-private repo");
+
+        // The storage is the same as bare-user. The raw payload is on the
+        // inode, and the logical metadata is in `user.ostreemeta`. The inode
+        // has the mode 0400. The xattr goes on first, because the kernel
+        // checks a `user.*` xattr against the write permission of the inode.
+        let reg = csum(&"12".repeat(32));
+        let reg_path = object_path(&root, &reg, ObjectType::File, RepoMode::BareUserPrivate);
+        fs::write(&reg_path, b"private\n").unwrap();
+        let xattr_ok = rustix::fs::setxattr(
+            &reg_path,
+            "user.ostreemeta",
+            &ostreemeta_of(0o100755),
+            rustix::fs::XattrFlags::empty(),
+        )
+        .is_ok();
+        if !xattr_ok {
+            eprintln!("skipping bare-user-private read: user xattrs unsupported here");
+            return;
+        }
+        fs::set_permissions(&reg_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        // The reader reports the logical mode, never the 0400 of the inode.
+        let file = repo.load_file(&reg).await.unwrap();
+        assert_eq!((file.uid, file.gid, file.mode), (0, 0, 0o100755));
+        assert_eq!(file.kind, FileKind::Regular { size: 8 });
+        assert_eq!(read_payload(&file).await, b"private\n");
+
+        // A symlink is a regular file that holds the target and one NUL.
+        let link = csum(&"13".repeat(32));
+        let link_path = object_path(&root, &link, ObjectType::File, RepoMode::BareUserPrivate);
+        fs::write(&link_path, b"elsewhere\0").unwrap();
+        rustix::fs::setxattr(
+            &link_path,
+            "user.ostreemeta",
+            &ostreemeta_of(0o120777),
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+        fs::set_permissions(&link_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let file = repo.load_file(&link).await.unwrap();
+        assert_eq!((file.uid, file.gid, file.mode), (0, 0, 0o120777));
+        assert_eq!(
+            file.kind,
+            FileKind::Symlink {
+                target: "elsewhere".to_owned()
+            }
+        );
+    });
+}

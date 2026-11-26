@@ -122,7 +122,8 @@ fn check_mode(mode: RepoMode) -> Result<(), Error> {
         | RepoMode::BareUser
         | RepoMode::BareUserOnly
         | RepoMode::BareSplitXattrs
-        | RepoMode::BareUserShared => Ok(()),
+        | RepoMode::BareUserShared
+        | RepoMode::BareUserPrivate => Ok(()),
     }
 }
 
@@ -222,6 +223,7 @@ mod tests {
             RepoMode::BareUserOnly,
             RepoMode::BareSplitXattrs,
             RepoMode::BareUserShared,
+            RepoMode::BareUserPrivate,
         ] {
             check_mode(mode).unwrap();
         }

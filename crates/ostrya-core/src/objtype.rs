@@ -116,7 +116,8 @@ impl ObjectType {
                 | RepoMode::BareUser
                 | RepoMode::BareUserOnly
                 | RepoMode::BareSplitXattrs
-                | RepoMode::BareUserShared => "file",
+                | RepoMode::BareUserShared
+                | RepoMode::BareUserPrivate => "file",
             },
             ObjectType::DirTree => "dirtree",
             ObjectType::DirMeta => "dirmeta",
@@ -210,6 +211,10 @@ mod tests {
         assert_eq!(ObjectType::File.extension(RepoMode::Bare), "file");
         assert_eq!(ObjectType::File.extension(RepoMode::BareUser), "file");
         assert_eq!(ObjectType::File.extension(RepoMode::BareUserShared), "file");
+        assert_eq!(
+            ObjectType::File.extension(RepoMode::BareUserPrivate),
+            "file"
+        );
         assert_eq!(ObjectType::File.extension(RepoMode::Archive), "filez");
     }
 
@@ -230,6 +235,7 @@ mod tests {
             RepoMode::BareSplitXattrs,
             RepoMode::Archive,
             RepoMode::BareUserShared,
+            RepoMode::BareUserPrivate,
         ];
         for v in ALL {
             let ty = ObjectType::from_u32(v).unwrap();

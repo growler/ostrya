@@ -13,12 +13,13 @@ use ostrya::{
 use ostrya_core::{ContentHasher, FileHeader, Xattrs};
 
 /// The modes that ostrya writes.
-pub const WRITABLE: [RepoMode; 5] = [
+pub const WRITABLE: [RepoMode; 6] = [
     RepoMode::Archive,
     RepoMode::Bare,
     RepoMode::BareUser,
     RepoMode::BareUserOnly,
     RepoMode::BareUserShared,
+    RepoMode::BareUserPrivate,
 ];
 
 /// Builds a small tree in `base/src` and returns its path.

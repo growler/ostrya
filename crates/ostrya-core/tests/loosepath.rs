@@ -62,6 +62,7 @@ fn z_suffix_is_file_and_archive_only() {
         RepoMode::BareSplitXattrs,
         RepoMode::Archive,
         RepoMode::BareUserShared,
+        RepoMode::BareUserPrivate,
     ];
 
     // The auxiliary non-meta types have the same extension in every mode.

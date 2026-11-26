@@ -962,10 +962,10 @@ struct InitArgs {
     /// The storage mode of the new repository.
     ///
     /// The values are `archive`, `archive-z2`, `bare`, `bare-user`,
-    /// `bare-user-only`, and `bare-user-shared`. `archive` is an alias for
-    /// `archive-z2`, and the `config` file records `archive-z2`.
-    /// `bare-user-shared` is an ostrya extension. The command refuses any
-    /// other value and exits 1.
+    /// `bare-user-only`, `bare-user-shared`, and `bare-user-private`. `archive`
+    /// is an alias for `archive-z2`, and the `config` file records
+    /// `archive-z2`. `bare-user-shared` and `bare-user-private` are ostrya
+    /// extensions. The command refuses any other value and exits 1.
     #[arg(long, default_value = "bare")]
     mode: String,
     /// A globally unique id for this repository as a collection of refs.
@@ -7562,8 +7562,9 @@ async fn init(repo: RepoArgs<'_>, verbose: bool, name: &str, args: InitArgs) -> 
 /// Returns the repository mode for a value of `ostrya init --mode`.
 ///
 /// The accepted set is the set of the `ostree` command for the modes that both
-/// commands support. The set also holds `bare-user-shared`, an ostrya
-/// extension. An unknown value ends the process with an error.
+/// commands support. The set also holds `bare-user-shared` and
+/// `bare-user-private`, ostrya extensions. An unknown value ends the process
+/// with an error.
 ///
 /// `bare-split-xattrs` is not in the set, although `init --mode` of `ostree`
 /// accepts it. ostrya reads that mode and does not write it, so a repository in
@@ -7575,6 +7576,7 @@ fn parse_init_mode(mode: &str) -> RepoMode {
         "bare-user-only" => RepoMode::BareUserOnly,
         "archive" | "archive-z2" => RepoMode::Archive,
         "bare-user-shared" => RepoMode::BareUserShared,
+        "bare-user-private" => RepoMode::BareUserPrivate,
         _ => {
             eprintln!("error: Invalid mode '{mode}' in repository configuration");
             exit_process(1);

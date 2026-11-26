@@ -78,6 +78,10 @@ fn create_writes_exact_config_bytes() {
             CreateOptions::new(RepoMode::Bare).collection_id("org.example.Foo"),
             "[core]\nrepo_version=1\nmode=bare\ncollection-id=org.example.Foo\n",
         ),
+        (
+            CreateOptions::new(RepoMode::BareUserPrivate),
+            "[core]\nrepo_version=1\nmode=bare-user-private\n",
+        ),
     ];
     for (i, (opts, expected)) in cases.into_iter().enumerate() {
         let tmp = TmpDir::new(&format!("cfg{i}"));
@@ -246,6 +250,52 @@ fn create_then_reopen_roundtrip() {
     .expect("create");
     let repo = block_on(Repo::open(&repo_path)).expect("reopen");
     assert_eq!(repo.mode(), RepoMode::BareUser);
+}
+
+#[test]
+fn create_then_reopen_roundtrip_bare_user_private() {
+    let tmp = TmpDir::new("roundtrip-private");
+    let repo_path = tmp.path().join("repo");
+    block_on(Repo::create(
+        &repo_path,
+        CreateOptions::new(RepoMode::BareUserPrivate),
+    ))
+    .expect("create");
+    let repo = block_on(Repo::open(&repo_path)).expect("reopen");
+    assert_eq!(repo.mode(), RepoMode::BareUserPrivate);
+}
+
+/// A `bare-user-private` create forces no directory mode. The root and each
+/// directory of the layout get the same mode as in a `bare-user` create in
+/// the same process, with no set-group-ID bit.
+#[test]
+fn bare_user_private_forces_no_directory_mode() {
+    let tmp = TmpDir::new("private-dirs");
+    let plain = tmp.path().join("bare-user");
+    let private = tmp.path().join("bare-user-private");
+    block_on(Repo::create(&plain, CreateOptions::new(RepoMode::BareUser))).expect("create");
+    block_on(Repo::create(
+        &private,
+        CreateOptions::new(RepoMode::BareUserPrivate),
+    ))
+    .expect("create");
+    let mode_of = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    for dir in [
+        "",
+        "objects",
+        "refs/heads",
+        "refs/remotes",
+        "refs/mirrors",
+        "state",
+        "tmp",
+        "tmp/cache",
+        "extensions",
+    ] {
+        let mode = mode_of(&private.join(dir));
+        assert_eq!(mode, mode_of(&plain.join(dir)), "mode of {dir:?}");
+        assert_eq!(mode & 0o2000, 0, "set-group-ID bit on {dir:?}");
+        assert_ne!(mode, 0o2770, "shared mode on {dir:?}");
+    }
 }
 
 #[test]

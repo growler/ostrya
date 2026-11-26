@@ -281,9 +281,10 @@ fn a_built_filez_matches_the_archive_object() {
             }
             assert_eq!(symlinks, 1);
         }
-        // `bare`, `bare-user`, and `bare-user-shared` keep the owner, so the
-        // test compares the five objects of each of these modes.
-        assert_eq!(compared, 15);
+        // `bare`, `bare-user`, `bare-user-shared`, and `bare-user-private`
+        // keep the owner, so the test compares the five objects of each of
+        // these modes.
+        assert_eq!(compared, 20);
     });
 }
 

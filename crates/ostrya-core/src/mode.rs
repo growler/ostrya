@@ -32,6 +32,11 @@ pub enum RepoMode {
     /// This mode never applies the logical mode to the inode. It is an ostrya
     /// extension for development only.
     BareUserShared,
+    /// Storage as in [`BareUser`](Self::BareUser), with the inode mode 0400 on
+    /// each content object. Metadata objects keep 0644.
+    ///
+    /// This mode is an ostrya extension.
+    BareUserPrivate,
 }
 
 impl RepoMode {
@@ -47,6 +52,7 @@ impl RepoMode {
             "bare-split-xattrs" => RepoMode::BareSplitXattrs,
             "archive-z2" | "archive" => RepoMode::Archive,
             "bare-user-shared" => RepoMode::BareUserShared,
+            "bare-user-private" => RepoMode::BareUserPrivate,
             _ => return None,
         })
     }
@@ -62,6 +68,7 @@ impl RepoMode {
             RepoMode::BareSplitXattrs => "bare-split-xattrs",
             RepoMode::Archive => "archive-z2",
             RepoMode::BareUserShared => "bare-user-shared",
+            RepoMode::BareUserPrivate => "bare-user-private",
         }
     }
 
@@ -101,6 +108,7 @@ mod tests {
             RepoMode::BareSplitXattrs,
             RepoMode::Archive,
             RepoMode::BareUserShared,
+            RepoMode::BareUserPrivate,
         ] {
             assert_eq!(RepoMode::from_mode_str(mode.as_mode_str()), Some(mode));
         }

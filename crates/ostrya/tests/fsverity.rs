@@ -5,6 +5,8 @@
 //! set, and then examine the loose objects. They check these facts:
 //!
 //! - Each object that is stored as a regular file is sealed with fs-verity.
+//! - A `bare-user-private` content object is sealed before it gets the mode
+//!   0400.
 //! - The write path skips real symlink objects.
 //! - `maybe` is best effort.
 //! - `yes` fails where the file system cannot provide verity.
@@ -25,7 +27,7 @@ use std::process::Command;
 use common::{TmpDir, ostree_available};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Error,
-    MutableTree, Ref, Repo, RepoMode,
+    FsckOptions, MutableTree, Ref, Repo, RepoMode,
 };
 use ostrya_rt::block_on;
 use std::os::fd::AsFd;
@@ -158,6 +160,88 @@ fn seals_every_regular_object_when_supported() {
             assert!(is_sealed(path), "object not sealed: {}", path.display());
         }
     });
+}
+
+/// The environment variable that names the marker file of the umask child.
+const UMASK_ENV: &str = "OSTRYA_FSVERITY_UMASK_CHILD";
+
+/// A `bare-user-private` repository seals each content object before it sets
+/// the mode 0400, under a umask of 0077. An unprivileged owner cannot seal a
+/// 0400 file, so the commit fails if the mode goes on first. Root skips that
+/// check. The umask is a property of the process, so the check runs in a
+/// child process. The child is this test binary, which runs this test alone.
+#[test]
+fn bare_user_private_seals_before_mode_0400() {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(marker) = std::env::var_os(UMASK_ENV) {
+        let marker = PathBuf::from(marker);
+        rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
+        if rustix::process::geteuid().is_root() {
+            eprintln!("note: root skips the permission check, so the write order has no effect");
+        }
+        let tmp = TmpDir::new("fsverity-private-child");
+        let sealed = block_on(async {
+            if !fs_supports_verity(&tmp).await {
+                return false;
+            }
+            let base = tmp.path().join("private");
+            build_source(&base);
+            let src = base.join("src");
+            std::fs::write(src.join("exec"), b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(src.join("exec"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            std::fs::write(src.join("empty"), b"").unwrap();
+            let root = tmp.path().join("private-repo");
+            let repo = make_repo(&root, RepoMode::BareUserPrivate, "yes").await;
+            commit_source(&repo, &base).await.unwrap();
+
+            let (regulars, symlinks) = loose_objects(&root);
+            assert_eq!(
+                symlinks, 0,
+                "bare-user-private stores symlinks as regular files"
+            );
+            let mut content = 0;
+            for path in &regulars {
+                let perm = std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+                if path.extension().is_some_and(|e| e == "file") {
+                    content += 1;
+                    assert_eq!(perm, 0o400, "{}", path.display());
+                    let file = std::fs::File::open(path).unwrap();
+                    ostrya_sys::measure_verity(file.as_fd())
+                        .unwrap_or_else(|e| panic!("not sealed: {}: {e}", path.display()));
+                } else {
+                    assert_eq!(perm, 0o644, "{}", path.display());
+                    assert!(is_sealed(path), "object not sealed: {}", path.display());
+                }
+            }
+            // hello.txt, nested.txt, link, exec, and empty.
+            assert_eq!(content, 5);
+            let report = repo.fsck(&FsckOptions::default()).await.unwrap();
+            assert!(report.is_ok(), "fsck reported {:?}", report.errors);
+            true
+        });
+        std::fs::write(marker, if sealed { "ran" } else { "skipped" }).unwrap();
+        return;
+    }
+    let tmp = TmpDir::new("fsverity-private");
+    let marker = tmp.path().join("ran");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "bare_user_private_seals_before_mode_0400",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(UMASK_ENV, &marker)
+        .status()
+        .expect("re-execute this test binary");
+    assert!(status.success(), "the child failed: {status}");
+    // If the filter matches no test name, the child runs nothing and exits
+    // 0. Only the marker proves that the check ran.
+    match std::fs::read_to_string(&marker).as_deref() {
+        Ok("ran") => {}
+        Ok("skipped") => eprintln!("skipping: filesystem does not support fs-verity"),
+        other => panic!("the child ran no check: {other:?}"),
+    }
 }
 
 #[test]

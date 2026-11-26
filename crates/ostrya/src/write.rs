@@ -11,7 +11,8 @@
 //! The stager seals a regular-file content object with fs-verity before it
 //! applies the logical mode and owner, because `FS_IOC_ENABLE_VERITY` needs
 //! write permission on the inode. In bare mode the logical xattrs go on after
-//! the seal, between the owner and the mode.
+//! the seal, between the owner and the mode. In `bare-user-private` mode the
+//! stager sets `user.ostreemeta`, then seals, and then sets the mode 0400.
 
 use std::ffi::CString;
 use std::future::poll_fn;
@@ -57,6 +58,8 @@ const CANONICAL_PERM_MASK: u32 = 0o755;
 /// The fixed inode mode of metadata objects, and of archive and
 /// `bare-user-shared` content objects.
 const FIXED_MODE: u32 = 0o644;
+/// The fixed inode mode of a `bare-user-private` content object.
+const PRIVATE_MODE: u32 = 0o400;
 /// The chunk size of a streaming pass over the payload of a content object.
 ///
 /// [`Transaction::write_content`] copies in chunks of this size, and
@@ -651,6 +654,7 @@ impl Transaction {
     /// - In `bare-user` and `bare-user-shared`, a regular file with mode
     ///   `0644` that holds the target and one NUL. The `user.ostreemeta` xattr
     ///   holds the logical metadata.
+    /// - In `bare-user-private`, the same regular file with mode `0400`.
     /// - In `archive`, a framed archive header with no payload.
     ///
     /// # Mode
@@ -1178,6 +1182,8 @@ pub(crate) fn stage_content_blocking(
 ///   gets the owner and the xattrs before its publish.
 /// - In `bare-user` and `bare-user-shared`, it is a regular file that holds
 ///   the target and one NUL.
+/// - In `bare-user-private`, it is the same regular file. The function stages
+///   it with [`stage_content_blocking`], which sets the mode 0400.
 /// - In archive mode, it is a framed archive header with no payload.
 ///
 /// The publish in the staging directory keeps an entry that the transaction
@@ -1228,6 +1234,17 @@ pub(crate) fn stage_symlink_blocking(
                 do_fsync,
                 ctx.verity,
             )?
+        }
+        RepoMode::BareUserPrivate => {
+            // A regular file that holds the target and one NUL. The content
+            // stager sets user.ostreemeta, seals, and then sets 0400, because
+            // the kernel checks a user.* xattr and the seal against the write
+            // permission of the inode.
+            let mut content = target.clone().into_bytes();
+            content.push(0);
+            let mut temp = TempFile::create(ctx.staging)?;
+            temp.file_mut().write_all(&content)?;
+            return stage_content_blocking(ctx, checksum, header, temp, target.len() as u64);
         }
         RepoMode::Archive => {
             // A framed archive header with no payload.
@@ -1742,11 +1759,11 @@ pub(crate) fn flat_name(checksum: &Checksum, ty: ObjectType, mode: RepoMode) -> 
 /// the inode. `create_mode` is the inode mode of the temp file.
 ///
 /// In the modes that store the logical mode (`bare`, `bare-user`,
-/// `bare-user-only`), the function can first set the inode to 0600. It does so
-/// if `verity` is on and `create_mode` has no owner read or no owner write.
-/// Then a umask without owner write does not block the seal, the reopen, or
-/// the xattrs. [`apply_content_post_seal`] sets the final mode, and in bare mode
-/// the xattrs.
+/// `bare-user-only`) and in `bare-user-private`, the function can first set
+/// the inode to 0600. It does so if `verity` is on and `create_mode` has no
+/// owner read or no owner write. Then a umask without owner write does not
+/// block the seal, the reopen, or the xattrs. [`apply_content_post_seal`] sets
+/// the final mode, and in bare mode the xattrs.
 fn apply_content_pre_seal(
     temp: &mut TempFile,
     mode: RepoMode,
@@ -1758,7 +1775,10 @@ fn apply_content_pre_seal(
         && create_mode & 0o600 != 0o600
         && matches!(
             mode,
-            RepoMode::Bare | RepoMode::BareUser | RepoMode::BareUserOnly
+            RepoMode::Bare
+                | RepoMode::BareUser
+                | RepoMode::BareUserOnly
+                | RepoMode::BareUserPrivate
         )
     {
         // Owner write for the seal and the xattrs, owner read for the
@@ -1767,11 +1787,12 @@ fn apply_content_pre_seal(
     }
     match mode {
         RepoMode::Bare => {}
-        RepoMode::BareUser => {
+        RepoMode::BareUser | RepoMode::BareUserPrivate => {
             // The xattr goes on before the mode. The kernel checks a `user.*`
             // xattr against the write permission of the inode. The canonical
-            // inode mode of this repository mode has no owner-write bit if the
-            // logical mode has none (0444, 0555).
+            // inode mode of `bare-user` has no owner-write bit if the logical
+            // mode has none (0444, 0555). The inode mode of
+            // `bare-user-private` is 0400.
             set_ostreemeta(temp, header)?;
         }
         RepoMode::BareUserShared => {
@@ -1794,11 +1815,12 @@ fn apply_content_pre_seal(
 /// Applies the inode mode and the owner of a regular-file content object after
 /// the seal.
 ///
-/// In bare mode, the function also applies the logical xattrs. It runs on the
-/// temp file, which holds the read-only descriptor after a seal. The kernel
-/// checks the inode owner for `fchmod` and `fchown`, and the inode permission
-/// for an xattr. It does not check the access mode of the descriptor. A
-/// sealed inode accepts xattr changes.
+/// In bare mode, the function also applies the logical xattrs. In
+/// `bare-user-private` mode, it sets the mode 0400. It runs on the temp file,
+/// which holds the read-only descriptor after a seal. The kernel checks the
+/// inode owner for `fchmod` and `fchown`, and the inode permission for an
+/// xattr. It does not check the access mode of the descriptor. A sealed inode
+/// accepts xattr changes.
 fn apply_content_post_seal(temp: &mut TempFile, mode: RepoMode, header: &FileHeader) -> Result<()> {
     let perm = header.mode & PERM_MASK;
     match mode {
@@ -1825,6 +1847,7 @@ fn apply_content_post_seal(temp: &mut TempFile, mode: RepoMode, header: &FileHea
             // `ostree` command writes.
             temp.set_mode(perm & 0o755)?;
         }
+        RepoMode::BareUserPrivate => temp.set_mode(PRIVATE_MODE)?,
         RepoMode::BareUserShared | RepoMode::Archive => {}
         RepoMode::BareSplitXattrs => {
             return Err(Error::Unsupported(

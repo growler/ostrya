@@ -901,10 +901,11 @@ fn commit_ownership_and_timestamp_flags_match_the_tool() {
 
 /// A declared-ownership commit keeps the object identity across the modes that
 /// store ownership. It has one checksum in `archive`, in `bare-user`, and in
-/// the ostrya extension `bare-user-shared`. The `ostree` command cannot open
-/// the third mode, so the `bare-user-shared` cell of corpus `C3` rests on this
-/// test. The cells and `commit_ownership_and_timestamp_flags_match_the_tool`
-/// compare the other two modes directly with `ostree`.
+/// the ostrya extensions `bare-user-shared` and `bare-user-private`. The
+/// `ostree` command cannot open the extension modes, so the `bare-user-shared`
+/// cell of corpus `C3` rests on this test. The cells and
+/// `commit_ownership_and_timestamp_flags_match_the_tool` compare the other two
+/// modes directly with `ostree`.
 #[test]
 fn declared_ownership_is_one_commit_across_modes() {
     let tmp = TmpDir::new("commit-owner-modes");
@@ -917,6 +918,7 @@ fn declared_ownership_is_one_commit_across_modes() {
         ("archive", RepoMode::Archive),
         ("bare-user", RepoMode::BareUser),
         ("bare-user-shared", RepoMode::BareUserShared),
+        ("bare-user-private", RepoMode::BareUserPrivate),
     ] {
         let repo = base.join(format!("repo-{name}"));
         block_on(async {
@@ -38637,6 +38639,55 @@ fn shared_repo_modes_do_not_follow_the_umask() {
     for (name, mode) in layout_modes(&control) {
         let want = if name == ".lock" { 0o600 } else { 0o700 };
         assert_eq!(mode, want, "the {name} entry of the bare-user control");
+    }
+}
+
+/// `init --mode=bare-user-private` writes the mode to `config`. Under a umask
+/// of 0077, a commit stores each content object, regular file and symlink, at
+/// the inode mode 0400, and each metadata object at 0644. An unprivileged
+/// owner cannot set a `user.*` xattr on a 0400 file, so the commit fails if
+/// the mode goes on before the xattr. Root skips that check. The directories
+/// and the lock file follow the mask, as in a `bare-user` repository.
+#[test]
+fn init_bare_user_private_content_objects_are_0400_under_umask_077() {
+    if is_root() {
+        eprintln!("note: root skips the permission check, so the write order has no effect");
+    }
+    let tmp = TmpDir::new("umask-private");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let exec = base.join("src/exec");
+    std::fs::write(&exec, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let repo = init_and_commit_with_umask(base, "private-077", "bare-user-private", "077");
+    let config = std::fs::read_to_string(repo.join("config")).unwrap();
+    assert!(
+        config.lines().any(|line| line == "mode=bare-user-private"),
+        "{config}"
+    );
+
+    let mut content = 0;
+    for fanout in std::fs::read_dir(repo.join("objects")).unwrap() {
+        for entry in std::fs::read_dir(fanout.unwrap().path()).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            assert!(meta.file_type().is_file(), "{}", path.display());
+            let mode = meta.permissions().mode() & 0o7777;
+            if path.extension().is_some_and(|e| e == "file") {
+                content += 1;
+                assert_eq!(mode, 0o400, "{}", path.display());
+            } else {
+                assert_eq!(mode, 0o644, "{}", path.display());
+            }
+        }
+    }
+    // hello.txt, empty.txt, nested.txt, link, and exec.
+    assert_eq!(content, 5);
+
+    for (name, mode) in layout_modes(&repo) {
+        let want = if name == ".lock" { 0o600 } else { 0o700 };
+        assert_eq!(mode, want, "the {name} entry");
     }
 }
 

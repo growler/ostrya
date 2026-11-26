@@ -282,6 +282,7 @@ fn the_fixture_commit_lands_in_each_mode() {
         (RepoMode::BareUser, Encoding::Raw),
         (RepoMode::BareUserOnly, Encoding::Deflate),
         (RepoMode::BareUserShared, Encoding::Raw),
+        (RepoMode::BareUserPrivate, Encoding::Deflate),
     ];
     if common::receive::is_root() {
         modes.push((RepoMode::Bare, Encoding::Deflate));
@@ -328,8 +329,24 @@ fn the_fixture_commit_lands_in_each_mode() {
         let fsck = block_on(reopened.fsck(&FsckOptions::default())).unwrap();
         assert!(fsck.is_ok(), "{mode:?}: {fsck:?}");
         assert_eq!(fsck.commits_checked, 1);
-        if tool && mode != RepoMode::BareUserShared {
+        if tool && !matches!(mode, RepoMode::BareUserShared | RepoMode::BareUserPrivate) {
             tool_fsck(repo.path());
+        }
+        if mode == RepoMode::BareUserPrivate {
+            // Each content object has the inode mode 0400, and each other
+            // object has the mode 0644.
+            use std::os::unix::fs::PermissionsExt;
+            let mut content = 0;
+            for path in regular_objects(repo.path()) {
+                let perm = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+                if path.extension().is_some_and(|e| e == "file") {
+                    content += 1;
+                    assert_eq!(perm, 0o400, "{}", path.display());
+                } else {
+                    assert_eq!(perm, 0o644, "{}", path.display());
+                }
+            }
+            assert!(content > 0, "the session stored no content object");
         }
     }
 }
@@ -367,6 +384,8 @@ fn fsverity_yes_seals_every_object_the_session_writes() {
         (RepoMode::BareUserShared, Encoding::Deflate),
         (RepoMode::Archive, Encoding::Raw),
         (RepoMode::Archive, Encoding::Deflate),
+        (RepoMode::BareUserPrivate, Encoding::Raw),
+        (RepoMode::BareUserPrivate, Encoding::Deflate),
     ] {
         let tmp = TmpDir::new("recv-verity");
         let repo = new_repo(&tmp, mode, "[ex-integrity]\nfsverity=yes\n");
@@ -385,11 +404,17 @@ fn fsverity_yes_seals_every_object_the_session_writes() {
         let regulars = regular_objects(repo.path());
         assert!(!regulars.is_empty());
         for path in regulars {
-            assert!(
-                is_sealed(&path),
-                "{mode:?} {encoding:?}: {}",
-                path.display()
-            );
+            // A `bare-user-private` content object has the mode 0400, which
+            // refuses an open for writing to an owner without privilege. So
+            // the test measures the digest on a read-only descriptor.
+            let sealed = if mode == RepoMode::BareUserPrivate
+                && path.extension().is_some_and(|e| e == "file")
+            {
+                ostrya_sys::measure_verity(std::fs::File::open(&path).unwrap()).is_ok()
+            } else {
+                is_sealed(&path)
+            };
+            assert!(sealed, "{mode:?} {encoding:?}: {}", path.display());
         }
     }
 }

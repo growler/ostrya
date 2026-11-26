@@ -127,6 +127,7 @@ fn commit_object_is_byte_identical_across_modes() {
         RepoMode::Archive,
         RepoMode::BareUser,
         RepoMode::BareUserShared,
+        RepoMode::BareUserPrivate,
     ] {
         let tmp = TmpDir::new("commit-bytes");
         let base = tmp.path();

@@ -1850,6 +1850,11 @@ fn the_content_bytes_end_at_the_byte_total() {
             Compression::None,
         ),
         ("total-bare-user-shared", RepoMode::BareUserShared, deflate),
+        (
+            "total-bare-user-private",
+            RepoMode::BareUserPrivate,
+            deflate,
+        ),
         ("total-bare", RepoMode::Bare, deflate),
     ] {
         // A `bare` commit writes the owner 0:0 of its files.

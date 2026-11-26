@@ -376,10 +376,14 @@ impl Repo {
     ///   [`None`](CheckoutMode::None) creates the symlink again and does not
     ///   refuse it.
     ///
-    /// The `ostree` command does not carry `bare-user-shared` and
-    /// `bare-split-xattrs`, so no observation decides them. Each of these
-    /// modes stores a symlink as `bare-user` does and creates it again. Each
-    /// follows `bare-user` for a symlink and refuses none.
+    /// The `ostree` command does not write `bare-user-shared`,
+    /// `bare-user-private`, and `bare-split-xattrs`, and the tables do not
+    /// include these modes. For them, the port applies its own rules.
+    /// `bare-user-shared` and `bare-user-private` store a symlink as
+    /// `bare-user` does, and the checkout creates it again.
+    /// `bare-split-xattrs` stores a real symlink as `bare` does, and the
+    /// checkout creates it again under both checkout modes. Each of these
+    /// modes refuses no symlink.
     ///
     /// The checkout also compares the device of each directory that the walk
     /// enters with the device of the object store. This includes the
@@ -2051,12 +2055,13 @@ fn require_hardlinks_refuses_regular(policy: Policy) -> bool {
 /// that [`hardlink_symlink`] follows. `bare-user` under
 /// [`None`](CheckoutMode::None) creates the link again and does not refuse it.
 ///
-/// `bare-user-shared` and `bare-split-xattrs` are modes of ostrya that the
-/// `ostree` command does not write, so no observation decides them.
-/// `bare-user-shared` stores a symlink as `bare-user` does, and refuses
-/// nothing, as `bare-user` does. `bare-split-xattrs` stores a real symlink as
-/// `bare` does. It creates the link again and refuses nothing under both
-/// checkout modes, which is a choice of the port.
+/// The `ostree` command does not write `bare-user-shared`,
+/// `bare-user-private`, and `bare-split-xattrs`, and the observation does not
+/// include these modes. For them, the port applies its own rules.
+/// `bare-user-shared` and `bare-user-private` store a symlink as `bare-user`
+/// does, and refuse nothing, as `bare-user` does. `bare-split-xattrs` stores a
+/// real symlink as `bare` does. The checkout creates the link again and
+/// refuses nothing under both checkout modes.
 ///
 /// [`require_hardlinks_refuses`], the one caller, reads the switch itself.
 fn require_hardlinks_refuses_symlink(policy: Policy) -> bool {
@@ -2153,7 +2158,7 @@ mod tests {
     #[test]
     fn hardlink_regular_matrix() {
         use CheckoutMode::{None, User};
-        use RepoMode::{Archive, Bare, BareUser, BareUserOnly, BareUserShared};
+        use RepoMode::{Archive, Bare, BareUser, BareUserOnly, BareUserPrivate, BareUserShared};
 
         assert!(hardlink_regular(policy(Bare, None, false)));
         assert!(!hardlink_regular(policy(Bare, User, false)));
@@ -2163,6 +2168,8 @@ mod tests {
         assert!(hardlink_regular(policy(BareUserOnly, User, false)));
         assert!(!hardlink_regular(policy(BareUserShared, None, false)));
         assert!(!hardlink_regular(policy(BareUserShared, User, false)));
+        assert!(!hardlink_regular(policy(BareUserPrivate, None, false)));
+        assert!(!hardlink_regular(policy(BareUserPrivate, User, false)));
         assert!(!hardlink_regular(policy(Archive, None, false)));
         assert!(!hardlink_regular(policy(Archive, User, false)));
 
@@ -2176,13 +2183,15 @@ mod tests {
     #[test]
     fn hardlink_symlink_matrix() {
         use CheckoutMode::{None, User};
-        use RepoMode::{Archive, Bare, BareUser, BareUserOnly};
+        use RepoMode::{Archive, Bare, BareUser, BareUserOnly, BareUserPrivate};
 
         assert!(hardlink_symlink(policy(Bare, None, false)));
         assert!(!hardlink_symlink(policy(Bare, User, false)));
         assert!(!hardlink_symlink(policy(Bare, None, true)));
         assert!(!hardlink_symlink(policy(BareUser, None, false)));
         assert!(!hardlink_symlink(policy(BareUserOnly, None, false)));
+        assert!(!hardlink_symlink(policy(BareUserPrivate, None, false)));
+        assert!(!hardlink_symlink(policy(BareUserPrivate, User, false)));
         assert!(!hardlink_symlink(policy(Archive, None, false)));
     }
 
@@ -2194,7 +2203,9 @@ mod tests {
     #[test]
     fn require_hardlinks_regular_matrix() {
         use CheckoutMode::{None, User};
-        use RepoMode::{Archive, Bare, BareSplitXattrs, BareUser, BareUserOnly, BareUserShared};
+        use RepoMode::{
+            Archive, Bare, BareSplitXattrs, BareUser, BareUserOnly, BareUserPrivate, BareUserShared,
+        };
 
         assert!(!require_hardlinks_refuses_regular(require_policy(
             Bare, None
@@ -2222,6 +2233,14 @@ mod tests {
         )));
         assert!(require_hardlinks_refuses_regular(require_policy(
             BareUserShared,
+            User
+        )));
+        assert!(require_hardlinks_refuses_regular(require_policy(
+            BareUserPrivate,
+            None
+        )));
+        assert!(require_hardlinks_refuses_regular(require_policy(
+            BareUserPrivate,
             User
         )));
         assert!(require_hardlinks_refuses_regular(require_policy(
@@ -2248,7 +2267,9 @@ mod tests {
     #[test]
     fn require_hardlinks_symlink_matrix() {
         use CheckoutMode::{None, User};
-        use RepoMode::{Archive, Bare, BareSplitXattrs, BareUser, BareUserOnly, BareUserShared};
+        use RepoMode::{
+            Archive, Bare, BareSplitXattrs, BareUser, BareUserOnly, BareUserPrivate, BareUserShared,
+        };
 
         assert!(require_hardlinks_refuses_symlink(require_policy(
             Archive, None
@@ -2282,6 +2303,14 @@ mod tests {
         )));
         assert!(!require_hardlinks_refuses_symlink(require_policy(
             BareUserShared,
+            User
+        )));
+        assert!(!require_hardlinks_refuses_symlink(require_policy(
+            BareUserPrivate,
+            None
+        )));
+        assert!(!require_hardlinks_refuses_symlink(require_policy(
+            BareUserPrivate,
             User
         )));
         assert!(!require_hardlinks_refuses_symlink(require_policy(

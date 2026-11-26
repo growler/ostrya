@@ -1633,8 +1633,8 @@ impl Repo {
     ///
     /// The pull reads only the ownership of the source inode. It trusts that
     /// the permission bits and the xattrs match the header of the object, and
-    /// does not check them. In `archive`, `bare-user`, and `bare-user-shared`
-    /// the checksum of the object covers neither.
+    /// does not check them. In `archive`, `bare-user`, `bare-user-shared`, and
+    /// `bare-user-private` the checksum of the object covers neither.
     ///
     /// Out-of-band changes to the inodes of a source thus go into this
     /// repository. Examples are a copy that dropped modes and a `chmod` over
@@ -6360,6 +6360,19 @@ mod tests {
             (RepoMode::BareUser, RepoMode::BareUser, copy, 0),
             (RepoMode::BareUser, RepoMode::BareUser, untrusted, 0),
             (RepoMode::BareUser, RepoMode::BareUserShared, untrusted, 2),
+            (
+                RepoMode::BareUserPrivate,
+                RepoMode::BareUserPrivate,
+                untrusted,
+                0,
+            ),
+            (
+                RepoMode::BareUserPrivate,
+                RepoMode::BareUserPrivate,
+                untrusted,
+                2,
+            ),
+            (RepoMode::BareUser, RepoMode::BareUserPrivate, untrusted, 0),
         ] {
             for goes_bad in [true, false] {
                 let (dir, strict, names, _, dst) = strict_fixture("untrusted", src_mode, dst_mode);

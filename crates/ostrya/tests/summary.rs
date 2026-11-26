@@ -3564,6 +3564,60 @@ fn the_summary_files_take_the_shared_modes() {
     });
 }
 
+/// In a `bare-user-private` repository, the directories and the files that the
+/// write of the summaries makes get the same modes as in a `bare-user`
+/// repository in the same process. No directory gets the set-group-ID bit or
+/// the shared mode `02770`. The root summary states the mode
+/// `bare-user-private`.
+#[test]
+fn the_summary_files_take_the_default_modes_in_a_private_repository() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TmpDir::new("summary-private");
+    let plain = tmp.path().join("bare-user");
+    let private = tmp.path().join("bare-user-private");
+    block_on(async {
+        for (repo_dir, mode) in [
+            (&plain, RepoMode::BareUser),
+            (&private, RepoMode::BareUserPrivate),
+        ] {
+            let repo = Repo::create(repo_dir, ostrya::CreateOptions::new(mode))
+                .await
+                .unwrap();
+            let signer = ostrya::DummySigner::new(b"sig".to_vec());
+            repo.regenerate_summaries(&fixed(), &[&signer])
+                .await
+                .unwrap();
+        }
+    });
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    for dir in ["extensions/ostrya", "extensions/ostrya/summary"] {
+        let got = mode(&private.join(dir));
+        assert_eq!(got, mode(&plain.join(dir)), "{dir}");
+        assert_eq!(got & 0o2000, 0, "set-group-ID bit on {dir}");
+        assert_ne!(got, 0o2770, "shared mode on {dir}");
+    }
+    let files = |repo_dir: &Path| {
+        [
+            repo_dir.join("summary"),
+            repo_dir.join("summary.sig"),
+            item_file(repo_dir, "anonymous", ""),
+            item_file(repo_dir, "anonymous", ".sig"),
+            item_file(repo_dir, "anonymous", ".access"),
+        ]
+    };
+    for (file, reference) in files(&private).iter().zip(files(&plain)) {
+        assert_eq!(mode(file), mode(&reference), "{file:?}");
+    }
+
+    let bytes = std::fs::read(private.join("summary")).unwrap();
+    let summary = Summary::parse(&bytes).unwrap();
+    assert_eq!(
+        summary.metadata_value("ostree.summary.mode"),
+        Some(&Value::Str("bare-user-private".into()))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The summary write under `[core] auto-update-summary`.
 // ---------------------------------------------------------------------------

@@ -544,6 +544,7 @@ mod tests {
             RepoMode::Archive,
             RepoMode::BareUser,
             RepoMode::BareUserShared,
+            RepoMode::BareUserPrivate,
         ] {
             let rules = ModeRules::new(mode, false);
             assert!(rules.check_content(&csum(), &setuid).is_ok());

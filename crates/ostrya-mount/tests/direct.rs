@@ -20,6 +20,9 @@
 //!   image commit give the same tree, with `verity=off` and with
 //!   `verity=require`. With `verity=require`, the build compares the digest
 //!   of the image with the key of the commit.
+//! - In `bare-user-private`, each content object has the mode 0400, and the
+//!   stored image and the built image give the committed tree, with the
+//!   modes, the owners, and the xattrs of the image.
 //! - The unmount detaches the loop device, for the image file of an image
 //!   commit and for a memory file.
 //! - A read-write mount writes each change to `<target>/overlay`, and the
@@ -265,6 +268,68 @@ fn mount_built_and_mount_stored_give_the_same_tree() {
             let built = built_tree(&repo, &commit, &built_at).await;
             assert_eq!(built, stored, "fsverity={fsverity}");
             assert_eq!(stored, walk(&base.join("src"), &[]));
+        });
+    }
+}
+
+/// A `bare-user-private` repository gives each content object the mode 0400,
+/// the image object of the image commit included. The image holds the
+/// logical modes, so the mount shows the committed tree. The stored image
+/// and the built image give the same tree, with `verity=off` and with
+/// `verity=require`.
+#[test]
+fn a_bare_user_private_repository_mounts_with_the_image_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    if !require_mount() {
+        return;
+    }
+    for (fsverity, timestamp) in [("no", 90), ("yes", 91)] {
+        let scratch = TmpDir::new("private");
+        if fsverity == "yes" && !require_verity(scratch.path()) {
+            continue;
+        }
+        let base = scratch.path().join("tree");
+        build_source(&base);
+        let root = scratch.path().join("repo");
+        let (stored_at, _stored_guard) = mount_point(&scratch, "stored");
+        let (built_at, _built_guard) = mount_point(&scratch, "built");
+        block_on(async {
+            let repo = new_repo(
+                &root,
+                RepoMode::BareUserPrivate,
+                &format!("[ex-integrity]\nfsverity={fsverity}\n"),
+            )
+            .await;
+            let commit = commit_tree(&repo, &base, timestamp, Key::Image).await;
+
+            let mut content = 0;
+            for dir in std::fs::read_dir(root.join("objects")).unwrap().flatten() {
+                if !dir.file_type().unwrap().is_dir() {
+                    continue;
+                }
+                for obj in std::fs::read_dir(dir.path()).unwrap().flatten() {
+                    let path = obj.path();
+                    let mode = obj.metadata().unwrap().permissions().mode() & 0o7777;
+                    if path.extension().is_some_and(|e| e == "file") {
+                        content += 1;
+                        assert_eq!(mode, 0o400, "fsverity={fsverity}: {}", path.display());
+                        if fsverity == "yes" {
+                            let file = std::fs::File::open(&path).unwrap();
+                            ostrya_sys::measure_verity(file.as_fd())
+                                .unwrap_or_else(|e| panic!("not sealed: {}: {e}", path.display()));
+                        }
+                    } else {
+                        assert_eq!(mode, 0o644, "fsverity={fsverity}: {}", path.display());
+                    }
+                }
+            }
+            // The six regular files, the symlink, and the image.
+            assert_eq!(content, 8, "fsverity={fsverity}");
+
+            let (stored, _) = stored_tree(&repo, &commit, &stored_at).await;
+            let built = built_tree(&repo, &commit, &built_at).await;
+            assert_eq!(stored, walk(&base.join("src"), &[]), "fsverity={fsverity}");
+            assert_eq!(built, stored, "fsverity={fsverity}");
         });
     }
 }

@@ -1413,7 +1413,7 @@ fn a_missing_object_of_a_complete_image_commit_is_not_found() {
 
 /// A `bare-user-only` repository writes the image commit in the fixed
 /// shape, and the image commit of one tree has the same checksum in the
-/// `bare-user-only`, `bare-user`, and `archive` modes.
+/// `bare-user-only`, `bare-user`, `archive`, and `bare-user-private` modes.
 #[test]
 fn the_image_commit_is_the_same_in_each_mode() {
     let scratch = TmpDir::new("cfs-commit-modes");
@@ -1423,6 +1423,7 @@ fn the_image_commit_is_the_same_in_each_mode() {
             RepoMode::BareUserOnly,
             RepoMode::BareUser,
             RepoMode::Archive,
+            RepoMode::BareUserPrivate,
         ]
         .into_iter()
         .enumerate()
@@ -1459,6 +1460,7 @@ fn the_image_commit_is_the_same_in_each_mode() {
         }
         assert_eq!(images[0], images[1]);
         assert_eq!(images[0], images[2]);
+        assert_eq!(images[0], images[3]);
     });
 }
 

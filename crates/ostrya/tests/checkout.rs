@@ -573,6 +573,86 @@ fn bare_user_shared_roundtrip_is_stable() {
     });
 }
 
+/// A `bare-user-private` content object has the inode mode 0400, so no
+/// checkout can hardlink it. Under each checkout mode, the checkout copies
+/// each regular file into a new inode with the logical mode, and the object
+/// keeps the mode 0400. A re-commit of the checkout gives the same commit
+/// checksum.
+#[test]
+fn bare_user_private_checkout_copies_each_file() {
+    let tmp = TmpDir::new("co-bup-copy");
+    let base = tmp.path();
+    let src = base.join("src");
+    build_source(&src);
+    let repo_dir = base.join("repo");
+
+    block_on(async {
+        let repo = Repo::create(&repo_dir, CreateOptions::new(RepoMode::BareUserPrivate))
+            .await
+            .unwrap();
+        let commit = commit_tree_stable(&repo, base, "src").await;
+        let rev = commit.to_hex();
+        let src_tree = collect_tree(&src);
+        let regular = [
+            "hello.txt",
+            "exec.sh",
+            "secret",
+            "empty.txt",
+            "subdir/nested.txt",
+        ];
+        let mut checksums = BTreeMap::new();
+        for file in regular.iter().copied().chain(["link"]) {
+            checksums.insert(file, file_checksum(&repo, &rev, file).await);
+        }
+
+        for (name, checkout_mode) in [
+            ("co-none", CheckoutMode::None),
+            ("co-user", CheckoutMode::User),
+        ] {
+            let mut opts = CheckoutOptions::new(checkout_mode);
+            let base_fd = std::fs::File::open(base).unwrap();
+            repo.checkout_at(&mut opts, base_fd.as_fd(), Path::new(name), &commit)
+                .await
+                .unwrap();
+            let co = base.join(name);
+            assert_eq!(
+                collect_tree(&co),
+                src_tree,
+                "{name} has the logical modes and the content of the source"
+            );
+
+            for file in regular {
+                let dest = co.join(file);
+                assert_ne!(
+                    dev_ino(&dest),
+                    object_dev_ino(&repo_dir, &checksums[file], RepoMode::BareUserPrivate),
+                    "{name}/{file} is a copy of the object"
+                );
+                assert_eq!(
+                    std::fs::symlink_metadata(&dest).unwrap().nlink(),
+                    1,
+                    "{name}/{file} has one link"
+                );
+            }
+
+            let copy = commit_tree_stable(&repo, base, name).await;
+            assert_eq!(
+                commit, copy,
+                "a bare-user-private commit -> {name} -> re-commit round-trip is stable"
+            );
+        }
+
+        for (file, csum) in &checksums {
+            let object = repo_dir.join("objects").join(loose_path(
+                csum,
+                ObjectType::File,
+                RepoMode::BareUserPrivate,
+            ));
+            assert_eq!(mode_of(&object), 0o400, "the object of {file}");
+        }
+    });
+}
+
 /// Commits subtree `sub` of `base` with a fixed timestamp, so a second commit
 /// of the same tree gives the same commit checksum.
 async fn commit_tree_stable(repo: &Repo, base: &Path, sub: &str) -> Checksum {
@@ -1837,6 +1917,7 @@ fn require_hardlinks_refuses_at_the_entry() {
             ("bare", RepoMode::Bare),
             ("bare-user", RepoMode::BareUser),
             ("bare-user-only", RepoMode::BareUserOnly),
+            ("bare-user-private", RepoMode::BareUserPrivate),
         ] {
             let repo = Repo::create(
                 &base.join(format!("repo-{mode_name}")),

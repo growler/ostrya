@@ -261,11 +261,17 @@ impl Repo {
     /// An item with no summary, and a summary whose `.access` file does not
     /// match, get `found` set to `false`.
     ///
-    /// The session opens no transaction and takes no lock. For an `archive`,
-    /// `bare-user`, `bare-user-only`, or `bare-user-shared` repository, read
-    /// access to the repository is sufficient. For a `bare` or
-    /// `bare-split-xattrs` repository, the account must be able to read every
-    /// object and its extended attributes.
+    /// The session opens no transaction and takes no lock. For an `archive`
+    /// or `bare-user-shared` repository, read access to the repository is
+    /// sufficient, because each object has the inode mode 0644. For a
+    /// `bare-user` or `bare-user-only` repository, the account must have read
+    /// permission on each content object. The logical mode of the file sets
+    /// the inode mode of its object, so a file with the logical mode 0600 has
+    /// an object with the inode mode 0600. Each content object of a
+    /// `bare-user-private` repository has the inode mode 0400, so the account
+    /// must be the owner of each content object or have privilege. For a
+    /// `bare` or `bare-split-xattrs` repository, the account must be able to
+    /// read every object and its extended attributes.
     ///
     /// # Framing and memory
     ///

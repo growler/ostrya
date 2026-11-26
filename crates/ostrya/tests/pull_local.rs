@@ -382,6 +382,14 @@ fn has_ostreemeta(path: &Path) -> bool {
     has_xattr(path, "user.ostreemeta")
 }
 
+/// Returns the `user.ostreemeta` xattr of a loose object.
+fn ostreemeta(path: &Path) -> Vec<u8> {
+    let mut buf = [0u8; 256];
+    let n = rustix::fs::getxattr(path, "user.ostreemeta", &mut buf)
+        .unwrap_or_else(|e| panic!("getxattr(user.ostreemeta) on {}: {e}", path.display()));
+    buf[..n].to_vec()
+}
+
 /// Returns a group of the process other than `own`, or `None` if the process is
 /// in one group only. A test uses it to give a source object an ownership that
 /// no write into the destination repository produces.
@@ -946,6 +954,62 @@ fn force_copy_clones_the_object_instead_of_linking() {
     });
 }
 
+/// Two `bare-user-private` repositories store each object in the same form,
+/// inode included, so the pull links each object of the source. Under
+/// `FORCE_COPY`, the pull writes each object on a new inode. In both cases a
+/// content object has the mode 0400 and a metadata object the mode 0644.
+#[test]
+fn a_bare_user_private_source_links_into_the_same_mode() {
+    let tmp = TmpDir::new("pull-private-link");
+    block_on(async {
+        let base = tmp.path();
+        let mode = RepoMode::BareUserPrivate;
+        let (src_dir, src, _c1, c2) = source_repo(base, mode).await;
+        let reached = src.traverse_commit(&c2, 0).await.unwrap();
+        assert!(!reached.is_empty());
+
+        for (dst_name, flags) in [
+            ("linked", PullFlags::empty()),
+            ("copied", PullFlags::FORCE_COPY),
+        ] {
+            let (dst_dir, dst) = make_repo(base, dst_name, mode).await;
+            pull_main(&dst, &src, flags).await;
+            for name in &reached {
+                let object = name.loose_path(mode).replace('/', "");
+                let src_ino = object_ino(&src_dir, &object).unwrap();
+                let dst_ino = object_ino(&dst_dir, &object).unwrap();
+                if flags.contains(PullFlags::FORCE_COPY) {
+                    assert_ne!(
+                        src_ino, dst_ino,
+                        "{dst_name}: {name} should be a fresh inode"
+                    );
+                } else {
+                    assert_eq!(
+                        src_ino, dst_ino,
+                        "{dst_name}: {name} should share the source inode"
+                    );
+                }
+                let want = if name.ty == ObjectType::File {
+                    0o400
+                } else {
+                    0o644
+                };
+                assert_eq!(
+                    object_mode(&dst_dir, &object),
+                    Some(want),
+                    "{dst_name}: the mode of {name}"
+                );
+            }
+            let report = dst.fsck(&FsckOptions::new()).await.unwrap();
+            assert!(
+                report.is_ok(),
+                "{dst_name}: fsck reported {:?}",
+                report.errors
+            );
+        }
+    });
+}
+
 #[test]
 fn a_refused_link_imports_a_content_object_through_its_header() {
     let tmp = TmpDir::new("pull-refused-link");
@@ -1175,68 +1239,81 @@ fn a_cloned_metadata_object_takes_the_destination_policy() {
     });
 }
 
+/// The test runs in `bare-user-shared` and in `bare-user-private`. In
+/// `bare-user-private`, each content object that the pull writes also gets the
+/// mode 0400.
 #[test]
 fn differing_ownership_refuses_the_link_and_writes_the_destinations_own() {
     let tmp = TmpDir::new("pull-owner-gate");
     block_on(async {
-        let base = tmp.path();
-        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::BareUserShared).await;
-        let own = std::fs::symlink_metadata(&src_dir).unwrap().gid();
+        // Each source repository takes the group of the test directory.
+        let own = std::fs::symlink_metadata(tmp.path()).unwrap().gid();
         let Some(gid) = required_other_group(own) else {
             return;
         };
-        let (dst_dir, dst) = make_repo_in_group(base, "dst", RepoMode::BareUserShared, gid).await;
+        for mode in [RepoMode::BareUserShared, RepoMode::BareUserPrivate] {
+            let base = &tmp.path().join(mode.as_mode_str());
+            std::fs::create_dir(base).unwrap();
+            let (src_dir, src, _c1, c2) = source_repo(base, mode).await;
+            assert_eq!(std::fs::symlink_metadata(&src_dir).unwrap().gid(), own);
+            let (dst_dir, dst) = make_repo_in_group(base, "dst", mode, gid).await;
 
-        // The baseline: the owner of an object that a write into the
-        // destination makes. Its group is the group of the setgid directory,
-        // and the group of the process differs from it.
-        build_tree(&base.join("baseline"), b"baseline\n");
-        let baseline = commit_tree(&dst, base, "baseline", "baseline", None).await;
-        let want = std::fs::symlink_metadata(object_path(
-            &dst_dir,
-            &ostrya::ObjectName::new(baseline, ostrya::ObjectType::Commit),
-            RepoMode::BareUserShared,
-        ))
-        .unwrap();
-        assert_eq!(want.gid(), gid);
-        assert_ne!(want.gid(), own);
+            // The baseline: the owner of an object that a write into the
+            // destination makes. Its group is the group of the setgid
+            // directory, and the group of the process differs from it.
+            build_tree(&base.join("baseline"), b"baseline\n");
+            let baseline = commit_tree(&dst, base, "baseline", "baseline", None).await;
+            let want = std::fs::symlink_metadata(object_path(
+                &dst_dir,
+                &ostrya::ObjectName::new(baseline, ostrya::ObjectType::Commit),
+                mode,
+            ))
+            .unwrap();
+            assert_eq!(want.gid(), gid);
+            assert_ne!(want.gid(), own);
 
-        dst.pull_local(
-            &src,
-            PullOptions {
-                refs: vec!["main".to_owned()],
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
+            dst.pull_local(
+                &src,
+                PullOptions {
+                    refs: vec!["main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
 
-        // A shared source inode brings the group of the source into the
-        // destination. The group of the destination is the group that can
-        // repair it, so the pull writes each object as a new inode.
-        let reached = src.traverse_commit(&c2, 0).await.unwrap();
-        assert!(!reached.is_empty());
-        for name in &reached {
-            let object = name.loose_path(RepoMode::BareUserShared).replace('/', "");
-            assert_ne!(
-                object_ino(&src_dir, &object),
-                object_ino(&dst_dir, &object),
-                "{name} should be a fresh inode"
-            );
-            let got =
-                std::fs::symlink_metadata(object_path(&dst_dir, name, RepoMode::BareUserShared))
-                    .unwrap();
-            assert_eq!(
-                (got.uid(), got.gid()),
-                (want.uid(), want.gid()),
-                "{name} should carry the destination's ownership"
+            // A shared source inode brings the group of the source into the
+            // destination. The group of the destination is the group that can
+            // repair it, so the pull writes each object as a new inode.
+            let reached = src.traverse_commit(&c2, 0).await.unwrap();
+            assert!(!reached.is_empty());
+            for name in &reached {
+                let object = name.loose_path(mode).replace('/', "");
+                assert_ne!(
+                    object_ino(&src_dir, &object),
+                    object_ino(&dst_dir, &object),
+                    "{mode:?}: {name} should be a fresh inode"
+                );
+                let got = std::fs::symlink_metadata(object_path(&dst_dir, name, mode)).unwrap();
+                assert_eq!(
+                    (got.uid(), got.gid()),
+                    (want.uid(), want.gid()),
+                    "{mode:?}: {name} should carry the destination's ownership"
+                );
+                if mode == RepoMode::BareUserPrivate && name.ty == ObjectType::File {
+                    assert_eq!(got.mode() & 0o7777, 0o400, "the mode of {name}");
+                }
+            }
+
+            // The `ostree` command does not check this repository, because it
+            // refuses to open a repository of this mode.
+            let report = dst.fsck(&ostrya::FsckOptions::new()).await.unwrap();
+            assert!(
+                report.is_ok(),
+                "{mode:?}: fsck reported {:?}",
+                report.errors
             );
         }
-
-        // The `ostree` command does not check this repository, because it
-        // refuses to open a bare-user-shared repository.
-        let report = dst.fsck(&ostrya::FsckOptions::new()).await.unwrap();
-        assert!(report.is_ok(), "fsck reported {:?}", report.errors);
     });
 }
 
@@ -1488,8 +1565,138 @@ fn a_symlink_object_is_shared_between_bare_user_and_bare_user_shared() {
     });
 }
 
+/// A pull between `bare-user-private` and another mode writes each content
+/// object again on a new inode, with the inode policy of the destination. This
+/// includes the symlink object, because no other mode stores it at 0400. The
+/// inode modes of a content object:
+///
+/// - `bare-user-private`: 0400.
+/// - `bare-user`: `(mode & 0775) | 0400` for a regular file, 0644 for a
+///   symlink.
+/// - `bare-user-only`: `mode & 0755` for a regular file. A symlink is a real
+///   symlink.
+/// - `bare-user-shared` and `archive`: 0644.
+///
+/// Between two modes that store `user.ostreemeta`, the destination stores the
+/// `user.ostreemeta` of the source. Each destination reads back the logical
+/// metadata of the source.
+#[test]
+fn a_cross_mode_pull_applies_the_destination_mode_in_each_direction() {
+    use RepoMode::{Archive, BareUser, BareUserOnly, BareUserPrivate, BareUserShared};
+    let stores_ostreemeta = |mode| matches!(mode, BareUser | BareUserShared | BareUserPrivate);
+    let tmp = TmpDir::new("pull-private-cross");
+    block_on(async {
+        // One `bare-user-private` source serves each pair that starts in that
+        // mode. A `bare-user-only` destination imports an object only under
+        // the name that its own stored form hashes to, so the source commit
+        // uses canonical permissions.
+        let private_base = tmp.path().join("private-src");
+        std::fs::create_dir(&private_base).unwrap();
+        let private_src = canonical_source_repo(&private_base, BareUserPrivate).await;
+
+        for (src_mode, dst_mode) in [
+            (BareUser, BareUserPrivate),
+            (BareUserPrivate, BareUser),
+            (BareUserShared, BareUserPrivate),
+            (BareUserPrivate, BareUserShared),
+            (Archive, BareUserPrivate),
+            (BareUserPrivate, Archive),
+            (BareUserOnly, BareUserPrivate),
+            (BareUserPrivate, BareUserOnly),
+        ] {
+            let what = format!("{} -> {}", src_mode.as_mode_str(), dst_mode.as_mode_str());
+            let base = tmp.path().join(format!(
+                "{}-{}",
+                src_mode.as_mode_str(),
+                dst_mode.as_mode_str()
+            ));
+            std::fs::create_dir(&base).unwrap();
+            let built;
+            let (src_dir, src, _c1, c2) = if src_mode == BareUserPrivate {
+                &private_src
+            } else {
+                built = source_repo(&base, src_mode).await;
+                &built
+            };
+            let (dst_dir, dst) = make_repo(&base, "dst", dst_mode).await;
+            pull_main(&dst, src, PullFlags::empty()).await;
+
+            let mut regular = 0;
+            let mut symlinks = 0;
+            for name in src.traverse_commit(c2, 0).await.unwrap() {
+                if name.ty != ObjectType::File {
+                    continue;
+                }
+                let src_path = object_path(src_dir, &name, src_mode);
+                let dst_path = object_path(&dst_dir, &name, dst_mode);
+                let src_meta = std::fs::symlink_metadata(&src_path).unwrap();
+                let dst_meta = std::fs::symlink_metadata(&dst_path).unwrap();
+                assert_ne!(
+                    (src_meta.dev(), src_meta.ino()),
+                    (dst_meta.dev(), dst_meta.ino()),
+                    "{what}: {name} should be a fresh inode"
+                );
+
+                let file = src.load_file(&name.checksum).await.unwrap();
+                if file.is_symlink() {
+                    symlinks += 1;
+                } else {
+                    regular += 1;
+                }
+                assert_eq!(
+                    dst_meta.file_type().is_symlink(),
+                    dst_mode == BareUserOnly && file.is_symlink(),
+                    "{what}: the file type of {name}"
+                );
+                let want = match dst_mode {
+                    BareUserPrivate => 0o400,
+                    BareUser if file.is_symlink() => 0o644,
+                    BareUser => (file.mode & 0o775) | 0o400,
+                    BareUserOnly if file.is_symlink() => 0o777,
+                    BareUserOnly => file.mode & 0o755,
+                    _ => 0o644,
+                };
+                assert_eq!(
+                    dst_meta.mode() & 0o7777,
+                    want,
+                    "{what}: the inode mode of {name}"
+                );
+                if stores_ostreemeta(dst_mode) {
+                    let stored = ostreemeta(&dst_path);
+                    if stores_ostreemeta(src_mode) {
+                        assert_eq!(
+                            stored,
+                            ostreemeta(&src_path),
+                            "{what}: the user.ostreemeta of {name}"
+                        );
+                    }
+                }
+                let landed = dst.load_file(&name.checksum).await.unwrap();
+                assert_eq!(
+                    (landed.uid, landed.gid, landed.mode),
+                    (file.uid, file.gid, file.mode),
+                    "{what}: the logical metadata of {name}"
+                );
+            }
+            // hello.txt, exec.sh, and subdir/nested.txt, and the symlink.
+            assert_eq!((regular, symlinks), (3, 1), "{what}");
+
+            let report = dst.fsck(&FsckOptions::new()).await.unwrap();
+            assert!(report.is_ok(), "{what}: fsck reported {:?}", report.errors);
+        }
+    });
+}
+
+/// A destination with `fsverity=yes` seals each object that a pull writes. The
+/// test runs with a `bare-user` destination, with a `bare-user-private`
+/// destination, and with a `bare-user-private` source and destination. A
+/// `bare-user-private` content object has the mode 0400, which refuses an open
+/// for writing to an owner without privilege. So the test measures the digest
+/// of such an object on a read-only descriptor, and checks each other object
+/// as [`is_sealed`] does.
 #[test]
 fn a_verity_destination_seals_every_imported_object() {
+    use RepoMode::{BareUser, BareUserPrivate};
     let tmp = TmpDir::new("pull-verity");
     block_on(async {
         let base = tmp.path();
@@ -1497,46 +1704,102 @@ fn a_verity_destination_seals_every_imported_object() {
             eprintln!("skipping: filesystem does not support fs-verity");
             return;
         }
-        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::BareUser).await;
-        let (dst_dir, dst) = verity_repo(base, "dst", RepoMode::BareUser, "yes").await;
+        let user_base = base.join("bare-user-src");
+        std::fs::create_dir(&user_base).unwrap();
+        let user_src = source_repo(&user_base, BareUser).await;
+        let private_base = base.join("bare-user-private-src");
+        std::fs::create_dir(&private_base).unwrap();
+        let private_src = source_repo(&private_base, BareUserPrivate).await;
 
-        dst.pull_local(
-            &src,
-            PullOptions {
-                refs: vec!["main".to_owned()],
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
+        // Returns `true` if the object is sealed. A 0400 object is measured on
+        // a read-only descriptor.
+        let sealed = |path: &Path| {
+            if std::fs::symlink_metadata(path).unwrap().mode() & 0o7777 == 0o400 {
+                let file = std::fs::File::open(path).unwrap();
+                ostrya_sys::measure_verity(file.as_fd()).is_ok()
+            } else {
+                is_sealed(path)
+            }
+        };
 
-        // bare-user stores each object as a regular file, and this destination
-        // seals each regular-file object that it writes. A hardlink cannot
-        // carry that seal. fs-verity is a property of an inode, so a seal on a
-        // shared inode also seals the copy of the source. As a result, each
-        // object arrives sealed on a new inode, and the source stays unchanged.
-        let names = object_names(&dst_dir);
-        assert!(!names.is_empty(), "the pull imported nothing");
-        for flat in &names {
-            assert!(
-                is_sealed(&flat_object_path(&dst_dir, flat)),
-                "imported object not sealed: {flat}"
-            );
-            assert_ne!(
-                object_ino(&src_dir, flat),
-                object_ino(&dst_dir, flat),
-                "{flat} should be a fresh inode"
-            );
-            assert!(
-                !is_sealed(&flat_object_path(&src_dir, flat)),
-                "the pull sealed the source's copy: {flat}"
-            );
+        for (src_mode, dst_mode) in [
+            (BareUser, BareUser),
+            (BareUser, BareUserPrivate),
+            (BareUserPrivate, BareUserPrivate),
+        ] {
+            let what = format!("{} -> {}", src_mode.as_mode_str(), dst_mode.as_mode_str());
+            let (src_dir, src, _c1, c2) = if src_mode == BareUser {
+                &user_src
+            } else {
+                &private_src
+            };
+            let (dst_dir, dst) = verity_repo(
+                base,
+                &format!("dst-{}-{}", src_mode.as_mode_str(), dst_mode.as_mode_str()),
+                dst_mode,
+                "yes",
+            )
+            .await;
+
+            dst.pull_local(
+                src,
+                PullOptions {
+                    refs: vec!["main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            // bare-user and bare-user-private store each object as a regular
+            // file, and this destination seals each regular-file object that
+            // it writes. A hardlink cannot carry that seal. fs-verity is a
+            // property of an inode, so a seal on a shared inode also seals the
+            // copy of the source. As a result, each object arrives sealed on a
+            // new inode, and the source stays unchanged. This includes a pull
+            // between two `bare-user-private` repositories, which links each
+            // object when the destination does not seal.
+            let names = object_names(&dst_dir);
+            assert!(!names.is_empty(), "{what}: the pull imported nothing");
+            let mut content = 0;
+            for flat in &names {
+                let dst_path = flat_object_path(&dst_dir, flat);
+                if dst_mode == BareUserPrivate {
+                    let want = if flat.ends_with(".file") {
+                        content += 1;
+                        0o400
+                    } else {
+                        0o644
+                    };
+                    assert_eq!(
+                        object_mode(&dst_dir, flat),
+                        Some(want),
+                        "{what}: the mode of {flat}"
+                    );
+                }
+                assert!(
+                    sealed(&dst_path),
+                    "{what}: imported object not sealed: {flat}"
+                );
+                assert_ne!(
+                    object_ino(src_dir, flat),
+                    object_ino(&dst_dir, flat),
+                    "{what}: {flat} should be a fresh inode"
+                );
+                assert!(
+                    !sealed(&flat_object_path(src_dir, flat)),
+                    "{what}: the pull sealed the source's copy: {flat}"
+                );
+            }
+            if dst_mode == BareUserPrivate {
+                assert!(content > 0, "{what}: the pull imported no content object");
+            }
+            for name in src.traverse_commit(c2, 0).await.unwrap() {
+                assert!(dst.has_object(name.ty, &name.checksum).await.unwrap());
+            }
+            let report = dst.fsck(&ostrya::FsckOptions::new()).await.unwrap();
+            assert!(report.is_ok(), "{what}: fsck reported {:?}", report.errors);
         }
-        for name in src.traverse_commit(&c2, 0).await.unwrap() {
-            assert!(dst.has_object(name.ty, &name.checksum).await.unwrap());
-        }
-        let report = dst.fsck(&ostrya::FsckOptions::new()).await.unwrap();
-        assert!(report.is_ok(), "fsck reported {:?}", report.errors);
     });
 }
 
@@ -2085,50 +2348,50 @@ fn a_cross_mode_clone_is_trusted_and_untrusted_verifies_it() {
         bytes[0] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
 
-        // A bare-family clone moves the payload and does not hash it, so a
-        // trusted pull carries the corruption across modes. The same-mode link
-        // does the same. A re-ingest catches the corruption.
-        let (trusted_dir, trusted) = make_repo(base, "trusted", RepoMode::BareUserShared).await;
-        trusted
-            .pull_local(
-                &src,
-                PullOptions {
-                    refs: vec!["main".to_owned()],
-                    ..PullOptions::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            std::fs::read(object_path(
-                &trusted_dir,
-                &content,
-                RepoMode::BareUserShared
-            ))
-            .unwrap(),
-            bytes
-        );
+        for mode in [RepoMode::BareUserShared, RepoMode::BareUserPrivate] {
+            let mode_name = mode.as_mode_str();
+            // A bare-family clone moves the payload and does not hash it, so a
+            // trusted pull carries the corruption across modes. The same-mode
+            // link does the same. A re-ingest catches the corruption.
+            let (trusted_dir, trusted) =
+                make_repo(base, &format!("trusted-{mode_name}"), mode).await;
+            trusted
+                .pull_local(
+                    &src,
+                    PullOptions {
+                        refs: vec!["main".to_owned()],
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(object_path(&trusted_dir, &content, mode)).unwrap(),
+                bytes,
+                "{mode_name}"
+            );
 
-        // `UNTRUSTED` reads the staged object once, after the clone, and
-        // rejects it.
-        let (untrusted_dir, untrusted) =
-            make_repo(base, "untrusted", RepoMode::BareUserShared).await;
-        let err = untrusted
-            .pull_local(
-                &src,
-                PullOptions {
-                    refs: vec!["main".to_owned()],
-                    flags: PullFlags::UNTRUSTED,
-                    ..PullOptions::default()
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, Error::ChecksumMismatch { expected, .. } if expected == content.checksum),
-            "unexpected error: {err}"
-        );
-        assert!(object_names(&untrusted_dir).is_empty());
+            // `UNTRUSTED` reads the staged object once, after the clone, and
+            // rejects it.
+            let (untrusted_dir, untrusted) =
+                make_repo(base, &format!("untrusted-{mode_name}"), mode).await;
+            let err = untrusted
+                .pull_local(
+                    &src,
+                    PullOptions {
+                        refs: vec!["main".to_owned()],
+                        flags: PullFlags::UNTRUSTED,
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::ChecksumMismatch { expected, .. } if expected == content.checksum),
+                "{mode_name}: unexpected error: {err}"
+            );
+            assert!(object_names(&untrusted_dir).is_empty(), "{mode_name}");
+        }
     });
 }
 

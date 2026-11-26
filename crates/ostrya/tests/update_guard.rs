@@ -201,9 +201,10 @@ fn a_symlink_at_the_lock_file_fails_begin_update() {
 }
 
 /// In a `bare-user-shared` repository, the lock file gets mode 0660 under a
-/// umask of 0077. The umask is a property of the process, so the check runs
-/// in a child process. The child is this test binary, which runs this test
-/// alone.
+/// umask of 0077. In a `bare-user-private` repository, the lock file takes the
+/// mode that the umask gives, 0600. The umask is a property of the process, so
+/// the check runs in a child process. The child is this test binary, which
+/// runs this test alone.
 #[test]
 fn a_shared_repository_forces_the_lock_file_mode() {
     if let Some(marker) = std::env::var_os(UMASK_ENV) {
@@ -212,14 +213,17 @@ fn a_shared_repository_forces_the_lock_file_mode() {
         let dir = marker.with_file_name("child");
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(masked_lock_mode(&dir), 0o600, "umask 0077 applies");
-        let path = dir.join("repo");
-        block_on(async {
-            let repo = Repo::create(&path, CreateOptions::new(RepoMode::BareUserShared))
-                .await
-                .unwrap();
-            repo.begin_update().await.unwrap().finish().await.unwrap();
-        });
-        assert_eq!(mode_of(&path.join(UPDATE_LOCK_FILE)), 0o660);
+        for (name, mode, want) in [
+            ("shared", RepoMode::BareUserShared, 0o660),
+            ("private", RepoMode::BareUserPrivate, 0o600),
+        ] {
+            let path = dir.join(name);
+            block_on(async {
+                let repo = Repo::create(&path, CreateOptions::new(mode)).await.unwrap();
+                repo.begin_update().await.unwrap().finish().await.unwrap();
+            });
+            assert_eq!(mode_of(&path.join(UPDATE_LOCK_FILE)), want, "{mode:?}");
+        }
         std::fs::write(marker, b"ran").unwrap();
         return;
     }

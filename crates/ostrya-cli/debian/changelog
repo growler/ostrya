@@ -1,8 +1,29 @@
-ostrya (0.16.0) UNRELEASED; urgency=medium
+ostrya (0.16.0) unstable; urgency=medium
 
-  * New upstream release.
+  * commit --consume removes the dir= sources and PATH after it writes
+    the commit and the refs and prints its output. A run that writes no
+    commit removes no source. The command keeps each entry that
+    --skip-list names, with the directories that hold it.
+  * push-tree --consume removes DIR after the push. DIR stays on each
+    push error.
+  * With [core] auto-update-summary true, commit, pull, pull-local,
+    refs --create, refs --delete, and media import write each summary
+    again after a run that writes or removes a ref under refs/heads/ or
+    refs/mirrors/. receive --one-way writes no summary.
+  * commit --skip-list does not open an entry that the skip list names.
+  * A verification refuses more than 64 signatures under the key of one
+    engine, at exit 1.
+  * static-delta apply-offline and pull refuse a delta part whose xz
+    stream needs more than 128 MiB of decoder memory.
+  * init --mode=bare-user-private makes a repository whose content
+    objects have the inode mode 0400.
+  * fsck stops at an object that it cannot read because of a permission
+    error, names the object, and deletes no object.
+  * pull-local names the path of a source object that it cannot read.
+  * serve writes an error line for each request that gets 500 because
+    of a read error.
 
- -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Tue, 24 Nov 2026 09:03:31 +0100
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Thu, 26 Nov 2026 16:50:38 +0100
 
 ostrya (0.15.0) unstable; urgency=medium
 

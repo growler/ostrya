@@ -1043,7 +1043,16 @@ until the maintainer asks for that step in words.
    to the command or its package, and the line of the maintainer with the
    date in the `date -R` format. If the command and the package do not
    change, the one item is `New upstream release.`
-5. Lock `build.les` and `test.les` again for amd64 and arm64. A lock records
+5. Add a section `## [<version>] - <date>` at the top of the release list
+   of `CHANGELOG.md`, in the form of the section before it. The date is the
+   date of the release commit in the `YYYY-MM-DD` format. The section has a
+   part `### Library` for the published crates and a part `### CLI` for the
+   `ostrya` command, `ostrya-mountd`, and their packages. List each change
+   since the release before it. Start an item with `Breaking:` if code or
+   config that uses the release before it needs a change. Each change to
+   the public Rust API that breaks a caller has such an item. Start an item
+   with `Fix:` if it corrects a defect.
+6. Lock `build.les` and `test.les` again for amd64 and arm64. A lock records
    the content of the source tree, so each change to the tree needs new
    locks.
 
@@ -1053,13 +1062,14 @@ until the maintainer asks for that step in words.
    done
    ```
 
-6. Run the gates of `.github/workflows/ci.yml`. Run the tests with
+7. Run the gates of `.github/workflows/ci.yml`. Run the tests with
    `OSTRYA_REQUIRE_MULTIGROUP=1 OSTRYA_REQUIRE_GNUPG=1 OSTRYA_REQUIRE_S3=1`,
    as CI does.
-7. Commit as `chore(release): bump the workspace version to <version>`. The
+8. Commit as `chore(release): bump the workspace version to <version>`. The
    commit includes the man pages of step 3, the changelog entries of step 4,
-   and the four lock files of step 5.
-8. Run `cargo publish --workspace --dry-run --locked`. This uploads nothing.
+   the section of `CHANGELOG.md` of step 5, and the four lock files of step
+   6.
+9. Run `cargo publish --workspace --dry-run --locked`. This uploads nothing.
    It refuses an uncommitted tracked file, so it comes after the commit. Fix
    a failure with `git commit --amend`.
-9. Make a signed tag: `git tag -s -m 'ostrya <version>' v<version>`.
+10. Make a signed tag: `git tag -s -m 'ostrya <version>' v<version>`.

@@ -12,6 +12,146 @@ first.
 An item that starts with `Breaking:` needs a change in code or config that uses
 the release before it. An item that starts with `Fix:` corrects a defect.
 
+## [0.16.0] - 2026-11-26
+
+### Library
+
+- Breaking: `sign::signatures_for` returns `Result<Vec<Vec<u8>>>`. It
+  refuses a dict that holds more than 64 byte strings under the key of one
+  engine with `Error::Signature`, and the message is `the signature dict
+  holds more than 64 signatures under '<key>'`.
+  `sign::MAX_SIGNATURES_PER_ENGINE` is the limit.
+- Breaking: `SigningKey::has_signed` returns `Result<bool>`. The search, and
+  `Repo::has_signed_commit`, give the error of `signatures_for`.
+- Breaking: `RepoMode` has the variant `BareUserPrivate`, with the mode
+  string `bare-user-private`. A `match` over `RepoMode` with no wildcard arm
+  needs an arm for it. The mode is an Ostrya extension: `bare-user` storage
+  with the inode mode 0400 on each content object, a symlink object
+  included. Metadata objects keep 0644. Each checksum is the same as in
+  `bare-user`. A process that reads a content object must be the owner of
+  the object or have privilege.
+- Breaking: in a walk of a file system source,
+  `Transaction::write_dfd_to_mtree` calls the filter of `CommitModifier`
+  before it opens the entry. The `FileMeta` that the filter gets holds no
+  xattrs from the disk. The walk opens an entry and reads its xattrs only
+  when the filter keeps it.
+- Breaking: under `CommitModifierFlags::CONSUME`, the walk does not open or
+  remove an entry that the filter skips. That entry stays, and each
+  directory that holds it stays, the walk root included.
+- Fix: a walk of a file system source commits a tree in which the filter
+  skips an entry that does not open, for example a file at mode 0000.
+- `ostrya::remove_source_tree` removes a source tree after a commit. It
+  holds a fixed number of descriptors, keeps the paths of its `keep` set
+  with the directories that hold them, keeps a directory whose last path
+  component is `.`, and refuses a symlink at the path.
+- `Repo::regenerate_summaries_if_configured` writes each summary again when
+  `[core] auto-update-summary` or `commit-update-summary` is true, as
+  `Repo::regenerate_summaries` does. The key groups that `sign-summary` of
+  `[ex-ostrya server]` names sign each summary, the GPG keys first. In a
+  repository with a collection id, it writes no new `ostree-metadata`
+  commit.
+- `Repo::pull_with_report` and `Repo::pull_local_with_report` give a
+  `PullReport`: the `PullStats` and a `RefChange` for each ref that the pull
+  created or moved, remote refs included, with the old commit and the new
+  commit. `CollectionPullStats::changed_refs` gives the same list.
+- Each verification reads at most 64 signature blobs under the key of one
+  engine and refuses more before a verifier of that engine runs, also when
+  a valid signature is present: `Repo::verify_commit`,
+  `Repo::verify_summary`, `Repo::verify_static_delta`,
+  `DeltaSuperblock::verify`, `sign::verify_all`, the checks of a pull, and
+  the receive endpoint. The receive endpoint gives `signature-required`.
+- The GPG verifier refuses more than 64 signature packets in all blobs of
+  one call, before it verifies a packet.
+- The receive endpoint signs a commit with each server key when the client
+  dict holds 64 blobs of the engine.
+- A checkout of a `bare-user-private` repository copies or reflinks each
+  regular file, and `CheckoutOptions::require_hardlinks` refuses a regular
+  file of non-zero length. A local pull hardlinks a content object only from
+  a `bare-user-private` source.
+- Fix: `Repo::apply_static_delta_offline` and a pull decode the xz body of
+  each static delta part with at most 128 MiB of decoder memory. A part
+  whose stream states a larger dictionary fails with `Error::InvalidFormat`
+  and the message `static delta: part payload needs more than 128 MiB of xz
+  decoder memory`, before the decoder allocates the dictionary.
+- Fix: a checkout removes the named temp file of a copy on each error path,
+  and when the checkout future drops. The rustdoc of `Repo::checkout_at`,
+  "Cancellation", states what a drop leaves in the destination.
+- `Repo::fsck` ends the run with an `Error::Io` of the kind
+  `PermissionDenied` when the read of an object fails with a permission
+  error. Each read error of the operating system on the commit that a ref
+  names or on a dirtree also ends the run, with the kind of that error. The
+  text names the object: `objects/<xx>/<rest>: <reason>`. Such a run
+  deletes no object and marks no commit as partial, also with
+  `FsckOptions::delete`. Another read error of a dirmeta, of a content
+  object, or of a commit that no ref names stays a
+  `FsckErrorKind::Corrupt` finding.
+- `Repo::pull_local`: an `Error::Io` from the load of a content object of
+  the source, from the read of a content object that a pull under
+  `PullFlags::UNTRUSTED` links, or from the load of a metadata object under
+  `PullFlags::UNTRUSTED`, names the path of the object in the source:
+  `<source>/objects/<xx>/<rest>: <reason>`. The kind of the error stays.
+- `Repo::pull`: an `Error::Io` from the load of a content object of a
+  localcache repository names the path of the object in that repository,
+  in the same form.
+- `ostrya-server`: `ServerEvent::ReadFailed` reports each request that gets
+  500 because of a read error of the archive view or of the ref listing,
+  with the method, the request path, and the error. It is an error event.
+
+### CLI
+
+- `ostrya commit --consume` writes the commit and the refs and prints its
+  output, then removes each `dir=` source and PATH. A run that writes no
+  commit removes no source. If a removal fails, the command prints the path
+  and the error, removes the other sources, and exits 1. The command does
+  not open or remove an entry that `--skip-list` names, and it keeps each
+  directory that holds such an entry. A line `/` keeps the whole source. If
+  the last component of the path is `.`, for example `./`, the command
+  removes the contents and keeps the directory.
+- `ostrya push-tree --consume` removes DIR after the push and the output
+  line. DIR stays on each push error. If the push fails at or after the
+  write of the refs, a warning line states that DIR is kept.
+- With `[core] auto-update-summary` true, `ostrya commit`, `pull`,
+  `pull-local`, `refs --create`, `refs --delete`, and `media import` write
+  each summary again after a run that writes or removes a ref that a
+  summary lists: a ref or an alias under `refs/heads/` or `refs/mirrors/`.
+  A run that changes remote refs alone writes no summary.
+  `pull --mirror` with no ref keeps the summary that it copies from the
+  remote. `sign-summary` of `[ex-ostrya server]` names the keys that sign
+  each summary. In a repository with a collection id, these commands write
+  no new `ostree-metadata` commit.
+  `ostrya receive --one-way` does not read the key and writes no summary.
+  `ostrya-config(1)` gives the rules.
+- `ostrya commit --skip-list` does not open an entry that the skip list
+  names. A file or a directory that does not open, for example at mode
+  0000, gives a commit at exit 0, as with the `ostree` command.
+- `sign --verify`, `summary --verify`, `static-delta verify`,
+  `static-delta apply-offline` with a key, `show`, `log`, `pull`, and
+  `pull-local` when they verify refuse a dict with more than 64 signatures
+  under the key of one engine with `error: signature: the signature dict
+  holds more than 64 signatures under '<key>'` at exit 1. `remote fsck`
+  gives the message as a finding. The `ostree` command reads each blob.
+  `cli-surface.md`, "The signature limit of one engine", records the
+  difference.
+- `ostrya static-delta apply-offline` and `ostrya pull` refuse a static
+  delta part whose xz stream needs more than 128 MiB of decoder memory, at
+  exit 1, with `error: invalid format: static delta: part payload needs
+  more than 128 MiB of xz decoder memory`. `apply-offline` writes no
+  object.
+- `ostrya init --mode=bare-user-private` makes a repository of the mode
+  `bare-user-private`. `mount.ostrya` and `ostrya-mountd` mount it. The
+  `ostree` command refuses to open such a repository.
+- `ostrya fsck` stops at an object that it cannot read because of a
+  permission error, with `error: i/o error: objects/<xx>/<rest>: Permission
+  denied` and exit 1. It deletes no object and marks no commit, also with
+  `--delete`. The `ostree` command deletes such an object under `--delete`.
+  A read error on the commit of a ref or on a dirtree ends the run with the
+  same form of line.
+- `ostrya pull-local` names the path of a source object that it cannot
+  read.
+- `ostrya serve` writes one `error: METHOD PATH: the read failed, and the
+  server answers 500: ERROR` line for each request that gets 500 because of
+  a read error.
+
 ## [0.15.0] - 2026-11-23
 
 ### Library

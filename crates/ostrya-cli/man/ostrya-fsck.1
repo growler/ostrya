@@ -12,6 +12,8 @@ The command loads the commit of each ref, lists each commit in the store, and re
 .PP
 The walk runs to its end and writes each finding on standard error. A ref to a missing commit, a missing dirtree, or a failed binding check ends the run early. If the command finds an error or skips a partial commit, it exits \%1.
 .PP
+A permission error on the read of an object ends the run with one \fB\%error:\fR line that names the path of the object, and exit status \%1. Each read error on the commit of a ref or on a dirtree ends the run in the same way. The command then deletes no object, marks no commit, and adds no tombstone. Another read error is a finding of a corrupt object.
+.PP
 After the walk, the command checks the attachments in field \%2 of each commit that it verified. It writes one line on standard error for each attachment that is absent, partial, or defective, and exits \%1. An attachment is also partial if one of its own attachments is absent or partial, at each depth. The command marks a commit with an absent or a partial attachment as partial, so a later pull fetches the attachment. \%\-\-no\-mark\-partial and \%\-\-no\-mark\-attachments each stop these marks.
 .PP
 The refs of the \fB\%collection\-id\fR of the repository are the local refs. For each ref under \fB\%refs/mirrors/<collection\-id>/\fR of that id, the command writes the line \fB\%Ref under the own collection id, not read: refs/mirrors/ID/NAME\fR on standard output, also with \%\-\-quiet. The ref resolve, the listing of \fB\%refs \-c\fR, the ref listing, the summary, and the archive view of \fB\%serve\fR and \fB\%send\fR ignore such a ref, and a prune keeps its commit. The line is not an error. The command checks the commit of such a ref as the commit of each other collection ref.
@@ -43,9 +45,9 @@ Let \%\-\-add\-tombstones run after a walk that found a corrupt object.
 The object walk always runs to its end and reports each error, with or without this option. \%\-\-delete also gives this permission.
 .TP
 \fB\-\-delete\fR
-Delete each object whose checksum differs from its name.
+Delete each corrupt object.
 .IP
-The command also marks each commit that reaches a deleted object as partial. A metadata object that does not parse stays, and the command reports it.
+A corrupt object is an object whose checksum differs from its name, or an object whose read or check failed. The command also marks each commit that reaches a deleted object as partial. A metadata object that does not parse stays, and the command reports it. A permission error on an object, and a read error on the commit of a ref or on a dirtree, end the run before the delete, so the command deletes no object and marks no commit.
 .TP
 \fB\-\-verify\-bindings\fR
 Verify that the commit of each ref is bound to that ref.

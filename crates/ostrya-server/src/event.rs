@@ -65,6 +65,21 @@ pub enum ServerEvent {
         /// The text of the auth item.
         item: String,
     },
+    /// The server answered a request with 500, because the read of the
+    /// answer failed, for example with `EACCES` on an object.
+    ///
+    /// The server reports the event one time for each such request: a `GET`
+    /// or a `HEAD` of the archive view, and a ref listing. A body that fails
+    /// after the server sent the status 200 gives no event.
+    #[non_exhaustive]
+    ReadFailed {
+        /// The method of the request.
+        method: String,
+        /// The path of the request as the client sent it, with no query.
+        path: String,
+        /// The text of the error of the read.
+        error: String,
+    },
 }
 
 impl ServerEvent {
@@ -73,11 +88,14 @@ impl ServerEvent {
     /// refused.
     ///
     /// [`InvalidCollectionDir`](ServerEvent::InvalidCollectionDir) is a
-    /// warning. [`BadClaims`](ServerEvent::BadClaims) and
-    /// [`StaleSummary`](ServerEvent::StaleSummary) are errors.
+    /// warning. [`BadClaims`](ServerEvent::BadClaims),
+    /// [`StaleSummary`](ServerEvent::StaleSummary), and
+    /// [`ReadFailed`](ServerEvent::ReadFailed) are errors.
     pub fn is_warning(&self) -> bool {
         match self {
-            ServerEvent::BadClaims { .. } | ServerEvent::StaleSummary { .. } => false,
+            ServerEvent::BadClaims { .. }
+            | ServerEvent::StaleSummary { .. }
+            | ServerEvent::ReadFailed { .. } => false,
             ServerEvent::InvalidCollectionDir { .. } => true,
         }
     }
@@ -109,7 +127,36 @@ impl fmt::Display for ServerEvent {
                  server answers 404 for it; run `ostrya summary -u`",
                 Escaped(item)
             ),
+            ServerEvent::ReadFailed {
+                method,
+                path,
+                error,
+            } => write!(
+                f,
+                "{} {}: the read failed, and the server answers 500: {}",
+                Escaped(method),
+                Escaped(path),
+                Escaped(error)
+            ),
         }
+    }
+}
+
+/// Reports a [`ServerEvent::ReadFailed`] for a request of `method` and
+/// `path` whose read failed with `error`, if the server has the callback
+/// `on_event`.
+pub(crate) fn report_read_failed(
+    on_event: Option<&EventSink>,
+    method: &str,
+    path: &str,
+    error: &ostrya::Error,
+) {
+    if let Some(on_event) = on_event {
+        on_event(&ServerEvent::ReadFailed {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            error: error.to_string(),
+        });
     }
 }
 
@@ -129,6 +176,11 @@ impl StaleSummaries {
             reported: Mutex::new(HashSet::new()),
             on_event,
         }
+    }
+
+    /// Returns the callback of the events of the server, or `None`.
+    pub(crate) fn on_event(&self) -> Option<&EventSink> {
+        self.on_event.as_ref()
     }
 
     /// Reports `item` as a [`ServerEvent::StaleSummary`] if the server did
@@ -231,6 +283,23 @@ mod tests {
             event.to_string(),
             "the summary of the auth item tls:a\\nb does not match the client groups, and \
              the server answers 404 for it; run `ostrya summary -u`"
+        );
+        assert!(!event.is_warning());
+    }
+
+    /// The line of a failed read names the method, the path, and the error,
+    /// and escapes each control character. The event is an error.
+    #[test]
+    fn the_line_of_a_failed_read_escapes_the_path() {
+        let event = ServerEvent::ReadFailed {
+            method: "GET".to_owned(),
+            path: "/objects/ab/c\nforged line.filez".to_owned(),
+            error: "i/o error: Permission denied (os error 13)".to_owned(),
+        };
+        assert_eq!(
+            event.to_string(),
+            "GET /objects/ab/c\\nforged line.filez: the read failed, and the server answers \
+             500: i/o error: Permission denied (os error 13)"
         );
         assert!(!event.is_warning());
     }

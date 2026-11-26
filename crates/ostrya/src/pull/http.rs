@@ -917,6 +917,10 @@ impl Repo {
     ///   commit that it fetches, before it stages that commit.
     /// - [`Error::Io`] with `EISDIR` if a directory is at the name of a
     ///   marker that the pull removes after its transaction commits.
+    /// - [`Error::Io`] if the load of a content object of a localcache
+    ///   repository fails with an error of the operating system, for example
+    ///   `EACCES`. The error keeps the kind of that error, and its text is
+    ///   `<path of the localcache repository>/objects/<xx>/<rest>: <reason>`.
     /// - [`Error::Io`] for an I/O error of the file system.
     ///
     /// # Examples

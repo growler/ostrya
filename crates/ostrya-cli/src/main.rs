@@ -385,6 +385,12 @@ enum Command {
     /// ends the run early. If the command finds an error or skips a partial
     /// commit, it exits 1.
     ///
+    /// A permission error on the read of an object ends the run with one
+    /// `error:` line that names the path of the object, and exit status 1.
+    /// Each read error on the commit of a ref or on a dirtree ends the run in
+    /// the same way. The command then deletes no object, marks no commit, and
+    /// adds no tombstone. Another read error is a finding of a corrupt object.
+    ///
     /// After the walk, the command checks the attachments in field 2 of each
     /// commit that it verified. It writes one line on standard error for each
     /// attachment that is absent, partial, or defective, and exits 1. An
@@ -815,7 +821,10 @@ enum Command {
     /// the command writes one `warning: STEP: MESSAGE` line to standard error
     /// for each warning of the session. When a ref listing finds a directory
     /// under `refs/mirrors/` whose name is not a collection id, the command
-    /// writes one `warning:` line that names it, one time in each run. With
+    /// writes one `warning:` line that names it, one time in each run. When a
+    /// read fails, for example on an object that the command cannot open,
+    /// the request gets 500, and the command writes one `error:` line that
+    /// names the method, the request path, and the error. With
     /// `[core] auto-update-summary=true`, each push that changes a ref writes
     /// the root summary and each summary of an item again, signed with the
     /// key groups of `sign-summary`.
@@ -2827,11 +2836,15 @@ struct FsckArgs {
     /// without this option. --delete also gives this permission.
     #[arg(short, long)]
     all: bool,
-    /// Delete each object whose checksum differs from its name.
+    /// Delete each corrupt object.
     ///
-    /// The command also marks each commit that reaches a deleted object as
-    /// partial. A metadata object that does not parse stays, and the command
-    /// reports it.
+    /// A corrupt object is an object whose checksum differs from its name,
+    /// or an object whose read or check failed. The command also marks each
+    /// commit that reaches a deleted object as partial. A metadata object
+    /// that does not parse stays, and the command reports it. A permission
+    /// error on an object, and a read error on the commit of a ref or on a
+    /// dirtree, end the run before the delete, so the command deletes no
+    /// object and marks no commit.
     #[arg(long)]
     delete: bool,
     /// Verify that the commit of each ref is bound to that ref.

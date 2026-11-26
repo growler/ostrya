@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::io::ErrorKind;
 use std::pin::Pin;
 
 use futures_lite::AsyncReadExt;
@@ -12,7 +13,7 @@ use ostrya_core::{
     Checksum, Commit, ContentHasher, DirMetaRef, DirTree, DirTreeRef, ObjectName, ObjectType,
 };
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, io_error};
 use crate::refs::CollectionRefEntry;
 use crate::related::{self, RelatedEntry, RelationField, RelationWarning};
 use crate::repo::Repo;
@@ -69,9 +70,15 @@ pub struct FsckOptions {
     /// A later run verifies again each commit that the run did not mark, and
     /// gives the same finding.
     pub mark_attachments: bool,
-    /// The switch that unlinks each object whose checksum differs from its name.
+    /// The switch that unlinks each corrupt object: each object whose
+    /// checksum differs from its name, and each object with a
+    /// [`Corrupt`](FsckErrorKind::Corrupt) finding.
     ///
     /// The option of the `ostree fsck` command is `--delete`.
+    ///
+    /// A read that fails with a permission error ends the run before the
+    /// unlinks. Such a run unlinks no object and marks no commit as partial.
+    /// [`Repo::fsck`] states each read error that ends the run.
     ///
     /// The run also marks each commit that reaches a deleted object as
     /// partial. The run writes these markers first, and unlinks the objects
@@ -186,6 +193,10 @@ pub enum FsckErrorKind {
         actual: Checksum,
     },
     /// The object is present, and a read or a parse of it failed.
+    ///
+    /// A read that fails with a permission error is no finding. It ends the
+    /// run with an [`Error::Io`]. Each read error of the operating system on
+    /// a commit that a ref names or on a dirtree also ends the run.
     Corrupt(String),
 }
 
@@ -718,6 +729,18 @@ impl Repo {
     /// and marks nothing. The run records each other fault and continues, so
     /// one run reports each fault that it can reach.
     ///
+    /// A read of an object that fails with a permission error (`EACCES` or
+    /// `EPERM`) ends the run with an [`Error::Io`]. Such an object is no
+    /// finding. The run unlinks no object, marks no commit as partial, and
+    /// writes no tombstone. Another read error has an effect that depends on
+    /// the object:
+    ///
+    /// - A commit that a ref names, and a dirtree: each read error of the
+    ///   operating system, for example `EIO`, ends the run in the same way.
+    /// - A dirmeta, a content object, and a commit that no ref names: another
+    ///   read error, for example `EIO`, gives a
+    ///   [`Corrupt`](FsckErrorKind::Corrupt) finding.
+    ///
     /// [`FsckReport::failure`] holds the condition, and
     /// [`FsckReport::reached`] holds the phase.
     ///
@@ -748,10 +771,18 @@ impl Repo {
     ///   content object does not serialize, or if `[core] fsync` is not a
     ///   boolean.
     /// - [`Error::Io`] if a read or a write on the file system fails. These
-    ///   are the listing of the refs and of the objects, the read of a commit
-    ///   that a ref names or of a dirtree, the check for a `.commitpartial`
-    ///   marker, the unlink of an object, and the write of a marker or a
-    ///   tombstone.
+    ///   are the listing of the refs and of the objects, the check for a
+    ///   `.commitpartial` marker, the unlink of an object, and the write of a
+    ///   marker or a tombstone.
+    /// - [`Error::Io`] if the read of a commit that a ref names or of a
+    ///   dirtree fails with an error of the operating system, or if the read
+    ///   of another object fails with a permission error. The error keeps the
+    ///   kind of the error of the operating system, for example
+    ///   [`PermissionDenied`](std::io::ErrorKind::PermissionDenied). The text
+    ///   of the error is `objects/<xx>/<rest>: <reason>`, with the path of
+    ///   the object in the repository. For a content object in a
+    ///   `bare-split-xattrs` repository, the file that failed can be the
+    ///   xattrs object of that content object.
     /// - [`Error::InvalidFormat`] if a commit that a ref names, or a dirtree,
     ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is
     ///   not a regular file, or if a symlink is on its path. The listing of
@@ -910,7 +941,12 @@ impl Repo {
         fsync: bool,
         ctx: &mut Ctx,
     ) -> Result<std::result::Result<Option<Vec<u8>>, FsckFailure>> {
-        let Some(bytes) = self.held_object_bytes(ObjectType::Commit, &commit).await? else {
+        let object = ObjectName::new(commit, ObjectType::Commit);
+        let held = self
+            .held_object_bytes(ObjectType::Commit, &commit)
+            .await
+            .map_err(|e| self.object_read_error(object, e))?;
+        let Some(bytes) = held else {
             return Ok(Err(FsckFailure::RefTarget {
                 ref_name: display.to_owned(),
                 commit,
@@ -921,7 +957,6 @@ impl Repo {
         if actual == commit {
             return Ok(Ok(Some(bytes)));
         }
-        let object = ObjectName::new(commit, ObjectType::Commit);
         ctx.record(object, FsckErrorKind::ChecksumMismatch { actual });
         if opts.delete {
             self.fsck_unlink_object(object, fsync).await?;
@@ -1094,8 +1129,9 @@ impl Repo {
     ///
     /// The function records a checksum mismatch, an unreadable object, or an
     /// absent object. It reads each object in the set, whatever the findings
-    /// before it. One read buffer serves each content object in the set, so a
-    /// store of many small objects allocates once.
+    /// before it. A read that fails with a permission error ends the run. One
+    /// read buffer serves each content object in the set, so a store of many
+    /// small objects allocates once.
     async fn fsck_verify_objects(&self, order: &[ObjectName], ctx: &mut Ctx) -> Result<()> {
         let mut buf: Vec<u8> = Vec::new();
         for name in order {
@@ -1129,7 +1165,11 @@ impl Repo {
                 }
             }
             Err(Error::ObjectNotFound { .. }) => ctx.record(name, FsckErrorKind::Missing),
-            // The run records a read failure as corruption and continues.
+            // A permission error ends the run. The run records each other read
+            // failure as corruption and continues.
+            Err(Error::Io(e)) if e.kind() == ErrorKind::PermissionDenied => {
+                return Err(self.object_io_error(name, e));
+            }
             Err(Error::Io(e)) => ctx.record(name, FsckErrorKind::Corrupt(e.to_string())),
             Err(e) => return Err(e),
         }
@@ -1154,6 +1194,9 @@ impl Repo {
                 ctx.record(name, FsckErrorKind::Missing);
                 return Ok(());
             }
+            Err(Error::Io(e)) if e.kind() == ErrorKind::PermissionDenied => {
+                return Err(self.object_io_error(name, e));
+            }
             Err(Error::Io(e)) => {
                 ctx.record(name, FsckErrorKind::Corrupt(e.to_string()));
                 return Ok(());
@@ -1176,6 +1219,9 @@ impl Repo {
             match reader.read(buf).await {
                 Ok(0) => break,
                 Ok(n) => hasher.update(&buf[..n]),
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                    return Err(self.object_io_error(name, e));
+                }
                 Err(e) => {
                     ctx.record(
                         name,
@@ -1191,6 +1237,31 @@ impl Repo {
             ctx.record(name, FsckErrorKind::ChecksumMismatch { actual });
         }
         Ok(())
+    }
+
+    /// Returns the [`Error::Io`] of a read of the loose object `name` that
+    /// failed with `err`. The text names the path of the object in the
+    /// repository: `objects/<xx>/<rest>: <reason>`.
+    ///
+    /// For a content object in a `bare-split-xattrs` repository, the file
+    /// that failed can be the xattrs object of that content object. The path
+    /// names the content object.
+    fn object_io_error(&self, name: ObjectName, err: std::io::Error) -> Error {
+        io_error(
+            &std::path::Path::new("objects").join(name.loose_path(self.mode())),
+            err,
+        )
+    }
+
+    /// Returns `err` with the path of the loose object `name` in its text, as
+    /// [`object_io_error`](Self::object_io_error) gives it, if `err` is an
+    /// [`Error::Io`] that carries an OS error. The error keeps its kind. Each
+    /// other error comes back unchanged.
+    fn object_read_error(&self, name: ObjectName, err: Error) -> Error {
+        match err {
+            Error::Io(e) if e.raw_os_error().is_some() => self.object_io_error(name, e),
+            other => other,
+        }
     }
 
     /// Names the verified commits that reach each faulty object.
@@ -1574,7 +1645,8 @@ fn walk_subtree<'a, S: WalkSink + Send>(
         }
         let Some(bytes) = repo
             .held_object_bytes(ObjectType::DirTree, &dirtree)
-            .await?
+            .await
+            .map_err(|e| repo.object_read_error(name, e))?
         else {
             return Ok(Err(dirtree));
         };

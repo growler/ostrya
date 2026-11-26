@@ -18,6 +18,8 @@
 //!
 //! The server reports each directory under `refs/mirrors/` whose name fails
 //! the collection-id rule one time, as a [`ServerEvent::InvalidCollectionDir`].
+//! A build that fails gets 500, and the server reports it as a
+//! [`ServerEvent::ReadFailed`].
 
 use std::collections::HashSet;
 use std::io;
@@ -34,7 +36,7 @@ use ostrya::access::ReadAccess;
 use ostrya::{MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_PATTERNS, RefSelector, Repo};
 
 use crate::body::ServeBody;
-use crate::event::{EventSink, ServerEvent};
+use crate::event::{EventSink, ServerEvent, report_read_failed};
 use crate::receive_auth::Refusal;
 use crate::router::{empty, percent_decode, refused, with_length};
 use crate::stall::Stall;
@@ -55,7 +57,7 @@ const COLLECTION_KEY: &str = "collection";
 const MAX_LISTINGS: usize = 4;
 
 /// The ref listings of one server: the count of the listings in flight over
-/// all connections, and the warnings of the listings.
+/// all connections, and the events of the listings.
 pub(crate) struct Listings {
     /// The count of the listings in flight.
     in_flight: Arc<AtomicUsize>,
@@ -111,7 +113,9 @@ impl Listings {
 /// flight, the request gets 503 with `Retry-After: 1`. These checks come in
 /// this order, before the build. A query entry that is not a ref pattern, or
 /// that is over the limits of one entry, is a bad query. The listing is
-/// built in the request task, and holds the refs that the client reads.
+/// built in the request task, and holds the refs that the client reads. An
+/// error of the build gets 500, and `listings` reports one
+/// [`ServerEvent::ReadFailed`].
 pub(crate) async fn handle(
     repo: &Repo,
     listings: &Listings,
@@ -145,7 +149,10 @@ pub(crate) async fn handle(
             let body = ServeBody::stream(reader, Some(len), stall.track());
             with_length(Response::new(body), Some(len))
         }
-        Err(_) => empty(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => {
+            report_read_failed(listings.on_event.as_ref(), method.as_str(), PATH, &error);
+            empty(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }
 

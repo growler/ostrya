@@ -1522,6 +1522,71 @@ fn serve_warns_one_time_for_each_invalid_collection_dir() {
     assert_eq!(stderr, format!("{}{}", line("a..b"), line("bad")));
 }
 
+/// Returns `true` if the process runs as root. The function reads the user
+/// id from `/proc/self/status`.
+fn is_root() -> bool {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|ids| ids.split_whitespace().nth(1))
+        == Some("0")
+}
+
+/// A `GET` of the `.filez` of a content object of mode 0000 gets 500, and
+/// the server writes one `error:` line on standard error. The line names the
+/// method, the request path, and the reason. Standard output holds the URL
+/// alone.
+#[test]
+fn serve_reports_an_unreadable_object() {
+    use std::io::Read;
+
+    if is_root() {
+        eprintln!("skipping: root reads a file of mode 0000");
+        return;
+    }
+    let tmp = TmpDir::new("serve-unreadable");
+    let src = build_tree(tmp.path());
+    let path = tmp.path().join("repo");
+    server_repo(&path, "bare-user", &src, &[]);
+    let objects = path.join("objects");
+    let stored = std::fs::read_dir(&objects)
+        .unwrap()
+        .flat_map(|fanout| std::fs::read_dir(fanout.unwrap().path()).unwrap())
+        .map(|entry| entry.unwrap().path())
+        .find(|file| file.extension().is_some_and(|ext| ext == "file"))
+        .expect("a content object");
+    std::fs::set_permissions(&stored, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let target = format!(
+        "/{}z",
+        stored.strip_prefix(&path).unwrap().to_str().unwrap()
+    );
+    let mut command = serve_command(&path);
+    command.arg("--listen=127.0.0.1:0").stderr(Stdio::piped());
+    let mut serving = Serving::spawn(&mut command);
+    let response = raw(
+        &serving.url,
+        format!("GET {target} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 500 "), "{response}");
+    assert_eq!(serving.rest(), "");
+    let mut stderr = String::new();
+    serving
+        .child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 1, "{stderr}");
+    assert!(
+        lines[0].starts_with(&format!("error: GET {target}: ")),
+        "{stderr}"
+    );
+    assert!(lines[0].contains("Permission denied"), "{stderr}");
+}
+
 /// `ostrya serve` takes the proxy settings from `[ex-ostrya server]`, and an
 /// option replaces the key of its name:
 ///

@@ -131,7 +131,9 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 ///      its build until its response body drops.
 ///
 ///   Then the server builds the listing with the read rights of the client.
-///   Each error of the build gets 500. For each directory under
+///   Each error of the build gets 500, and the server reports one
+///   [`ServerEvent::ReadFailed`](crate::ServerEvent::ReadFailed) to
+///   [`ServeOptions::on_event`]. For each directory under
 ///   `refs/mirrors/` whose name fails the collection-id rule, the server
 ///   reports one [`ServerEvent::InvalidCollectionDir`](crate::ServerEvent::InvalidCollectionDir)
 ///   to [`ServeOptions::on_event`] in the life of the server, and the
@@ -143,6 +145,12 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 ///   that the view refuses gets the same response, so a client cannot tell
 ///   a private path from an absent one.
 /// - If the view returns an error, the response is 500 with an empty body.
+///   The server reports one
+///   [`ServerEvent::ReadFailed`](crate::ServerEvent::ReadFailed) to
+///   [`ServeOptions::on_event`] for the request. The event names the method,
+///   the path of the request as the client sent it, and the error, for
+///   example `EACCES` on an object. A body that fails after the status 200
+///   gives no event.
 /// - A response with a known length carries `Content-Length`. A `.filez`
 ///   built on request carries no `Content-Length`.
 /// - The server reads a file of the archive view in frames of at most

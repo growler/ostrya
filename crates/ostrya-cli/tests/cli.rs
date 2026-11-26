@@ -32324,6 +32324,93 @@ fn fsck_delete_matches_the_tool() {
     assert_fsck_agrees(base, &repo, "delete-twice", &["--delete"]);
 }
 
+/// A content object, a dirtree object, or the commit that a ref names, of
+/// mode 0000, ends `fsck` with exit 1 and one `error: ` line that names the
+/// object path and the reason. The run reports no corruption. With and
+/// without `--delete`, the object stays and the run writes no
+/// `.commitpartial` marker.
+#[test]
+fn fsck_stops_at_an_unreadable_object_and_deletes_nothing() {
+    if is_root() {
+        eprintln!("skipping: root reads a file of mode 0000");
+        return;
+    }
+    let tmp = TmpDir::new("fsck-unreadable");
+    let base = tmp.path();
+    let repo = build_fsck_repo(base, "repo", RepoMode::BareUser, 1);
+    // The repository holds one commit, and the ref `test` names it.
+    let objects: Vec<PathBuf> = [ObjectType::File, ObjectType::DirTree, ObjectType::Commit]
+        .into_iter()
+        .map(|ty| {
+            let checksum = fsck_reachable_object(&repo, "test", ty);
+            fsck_object_path(&repo, &checksum, ty, RepoMode::BareUser)
+        })
+        .collect();
+    let before = fsck_inventory(&repo);
+    let repo_arg = format!("--repo={}", repo.display());
+    for object in objects {
+        let permissions = std::fs::metadata(&object).unwrap().permissions();
+        std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let relative = object.strip_prefix(&repo).unwrap().display().to_string();
+        for args in [vec![], vec!["-a"], vec!["--delete"]] {
+            let mut line = vec!["fsck", repo_arg.as_str()];
+            line.extend_from_slice(&args);
+            let run = ostrya(&line, None, &FSCK_ENV);
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            assert_eq!(run.status.code(), Some(1), "{relative} {args:?}: {stderr}");
+            assert_eq!(
+                stderr,
+                format!("error: i/o error: {relative}: Permission denied\n"),
+                "{relative} {args:?}"
+            );
+            assert!(object.exists(), "{relative} {args:?}: the object stays");
+            assert_eq!(fsck_inventory(&repo), before, "{relative} {args:?}");
+        }
+        std::fs::set_permissions(&object, permissions).unwrap();
+    }
+}
+
+/// `pull-local` of a source with a content object of mode 0000 exits 1, into
+/// an `archive` destination, and with `--untrusted` into a `bare-user`
+/// destination. The error line names the path of the object in the source
+/// and the reason, with no errno number. The destination gets no ref.
+#[test]
+fn pull_local_names_an_unreadable_source_object() {
+    if is_root() {
+        eprintln!("skipping: root reads a file of mode 0000");
+        return;
+    }
+    let tmp = TmpDir::new("pull-local-unreadable");
+    let base = tmp.path();
+    let src = build_fsck_repo(base, "src", RepoMode::BareUser, 1);
+    let checksum = fsck_reachable_object(&src, "test", ObjectType::File);
+    let object = fsck_object_path(&src, &checksum, ObjectType::File, RepoMode::BareUser);
+    std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o000)).unwrap();
+    for (name, mode, extra) in [
+        ("archive", RepoMode::Archive, None),
+        ("untrusted", RepoMode::BareUser, Some("--untrusted")),
+    ] {
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = create_repo(&dir, mode);
+        let mut args = vec!["pull-local", "--repo", dest.to_str().unwrap()];
+        args.extend(extra);
+        args.extend([src.to_str().unwrap(), "test"]);
+        let run = ostrya(&args, None, &[]);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(1), "{name}: {stderr}");
+        assert_eq!(
+            stderr,
+            format!(
+                "error: i/o error: {}: Permission denied\n",
+                object.display()
+            ),
+            "{name}"
+        );
+        assert_nothing_pulled(&dest, name);
+    }
+}
+
 /// If a referenced object is absent, `fsck` reports it after the walk as
 /// `.file` in each repository mode. It marks each commit that reaches the
 /// object as partial. An absent dirtree is the exception: it ends the run.

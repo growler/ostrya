@@ -6814,6 +6814,19 @@ Over HTTP, `ostrya serve` applies these rules:
   `Content-Length: 0`.
 - No response of the view carries `Content-Type`.
 
+For each request that gets 500 from an error of the view, `ostrya serve`
+writes one error line to standard error:
+
+```text
+error: METHOD PATH: the read failed, and the server answers 500: ERROR
+```
+
+`PATH` is the request path as the client sent it, before the decode and
+with no query. `ERROR` is the text of the error, for example `i/o error:
+Permission denied (os error 13)` for a content object that the server cannot
+open. The line writes each control character as an escape sequence, for
+example `\n`. A body that fails after the status 200 gives no line.
+
 A `HEAD` gets the status and the `Content-Length` of a `GET`, with no body.
 For a `.filez` built on request, a `HEAD` reads no byte of the object, no
 xattr, and no `config`. In a `bare-split-xattrs` repository, both methods
@@ -6951,7 +6964,9 @@ order:
 
 `ostrya serve` writes one warning line to standard error for each directory
 that a listing leaves out for its name ("The ref listing"), one time in each
-run.
+run. For each request that gets 500 in step 5, it writes one error line, in
+the form of an error of the view ("The archive view"). `PATH` is
+`/_ostrya/refs/v1`, with no query.
 
 A listing gets 200 with `Content-Length`. The body is the raw listing, with
 no frame. A 400, a 405, a 500, and a 503 have an empty body and

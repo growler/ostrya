@@ -223,7 +223,7 @@ use ostrya_core::{
     Checksum, Commit, ContentHasher, DirTree, ObjectName, ObjectType, Ref, RepoMode, Value,
 };
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, io_error};
 use crate::file::FileKind;
 use crate::refs::{ref_relpath, refspec_ref};
 use crate::related::{self, RelatedRule};
@@ -1995,6 +1995,11 @@ impl Repo {
     ///   `src` fails, for example with `EACCES`, or if the path of a requested
     ///   ref names a directory or goes through a file, before the pull writes
     ///   an object.
+    /// - [`Error::Io`] if the load of a content object of `src`, or of a
+    ///   metadata object of `src` under [`PullFlags::UNTRUSTED`], fails with
+    ///   an error of the operating system, for example `EACCES`. The error
+    ///   keeps the kind of that error, and its text is
+    ///   `<path of src>/objects/<xx>/<rest>: <reason>`.
     pub async fn pull_local(&self, src: &Repo, opts: PullOptions) -> Result<PullStats> {
         self.pull_local_named(src, opts, false)
             .await
@@ -2783,7 +2788,10 @@ impl Repo {
             // that it hashes, so a source that changes after the read cannot
             // pass the hash. The write charges each object in full.
             if flags.contains(PullFlags::UNTRUSTED) {
-                let bytes = src.load_object_bytes(name.ty, &name.checksum).await?;
+                let bytes = src
+                    .load_object_bytes(name.ty, &name.checksum)
+                    .await
+                    .map_err(|e| source_object_error(src, name, e))?;
                 #[cfg(test)]
                 import_seam::run(self.repo_fd());
                 txn.write_metadata_owned(name.ty, Some(&name.checksum), bytes)
@@ -2806,7 +2814,10 @@ impl Repo {
         // A second verification of them reads the payload twice, so the pull
         // makes none.
         let loaded = if checks.any() {
-            let file = src.load_file(&name.checksum).await?;
+            let file = src
+                .load_file(&name.checksum)
+                .await
+                .map_err(|e| source_object_error(src, name, e))?;
             checks.check(&name.checksum, &file.meta())?;
             Some(file)
         } else {
@@ -2815,9 +2826,13 @@ impl Repo {
 
         // Two repositories of one mode store a content object in the same form,
         // inode included, so the import shares the source inode.
+        // A linked object is the inode of the source object, so an error of
+        // its read names the source object.
         if same_mode && link_import(txn, src, name, flags).await? {
             if untrusted {
-                verify_staged_content(txn, name, checks, verify_buf).await?;
+                verify_staged_content(txn, name, checks, verify_buf)
+                    .await
+                    .map_err(|e| source_object_error(src, name, e))?;
             }
             return Ok(());
         }
@@ -2829,7 +2844,10 @@ impl Repo {
         // metadata read.
         let file = match loaded {
             Some(file) => file,
-            None => src.load_file(&name.checksum).await?,
+            None => src
+                .load_file(&name.checksum)
+                .await
+                .map_err(|e| source_object_error(src, name, e))?,
         };
         let meta = file.meta();
         match &file.kind {
@@ -2838,7 +2856,9 @@ impl Repo {
                     && link_import(txn, src, name, flags).await?
                 {
                     if untrusted {
-                        verify_staged_content(txn, name, checks, verify_buf).await?;
+                        verify_staged_content(txn, name, checks, verify_buf)
+                            .await
+                            .map_err(|e| source_object_error(src, name, e))?;
                     }
                     return Ok(());
                 }
@@ -5209,6 +5229,23 @@ async fn link_import(
         flags.contains(PullFlags::FORCE_COPY),
     )
     .await
+}
+
+/// Returns `err` with the path of the loose object `name` of `src` in its
+/// text, if `err` is an [`Error::Io`] that carries an OS error. The error
+/// keeps its kind. Each other error comes back unchanged.
+///
+/// For a content object of a `bare-split-xattrs` source, the file that
+/// failed can be the xattrs object of that content object. The path names
+/// the content object.
+fn source_object_error(src: &Repo, name: ObjectName, err: Error) -> Error {
+    match err {
+        Error::Io(e) if e.raw_os_error().is_some() => io_error(
+            &src.path().join("objects").join(name.loose_path(src.mode())),
+            e,
+        ),
+        other => other,
+    }
 }
 
 /// Stores the regular-file content object `name` of the `archive` repository

@@ -7575,6 +7575,76 @@ fn make_unreadable(repo_dir: &Path, name: &ObjectName, mode: RepoMode) {
     .unwrap();
 }
 
+/// A content object of mode 0000 in a `bare-user` source fails a pull into
+/// an `archive` destination, a pull with `FORCE_COPY` into a `bare-user`
+/// destination, and an untrusted pull into a `bare-user` destination. The
+/// untrusted pull links the object and fails at the read of the link. A
+/// dirmeta object of mode 0000 fails an untrusted pull into an `archive`
+/// destination. Each error is an [`Error::Io`] of the kind
+/// `PermissionDenied`, and its text names the path of the object in the
+/// source. No pull writes a ref.
+#[test]
+fn an_unreadable_source_object_names_its_path() {
+    if is_root() {
+        eprintln!("skipping: root reads a file of mode 0000");
+        return;
+    }
+    let tmp = TmpDir::new("pull-unreadable-object");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::BareUser).await;
+        let content = nested_content(&src, &c2).await;
+        let dirmeta = src
+            .traverse_commit(&c2, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|name| name.ty == ObjectType::DirMeta)
+            .expect("the commit holds a dirmeta");
+        let cases = [
+            ("archive", RepoMode::Archive, PullFlags::NONE, content),
+            ("copy", RepoMode::BareUser, PullFlags::FORCE_COPY, content),
+            ("link", RepoMode::BareUser, PullFlags::UNTRUSTED, content),
+            (
+                "untrusted",
+                RepoMode::Archive,
+                PullFlags::UNTRUSTED,
+                dirmeta,
+            ),
+        ];
+        for (name, mode, flags, object) in cases {
+            let path = object_path(&src_dir, &object, RepoMode::BareUser);
+            let permissions = std::fs::metadata(&path).unwrap().permissions();
+            make_unreadable(&src_dir, &object, RepoMode::BareUser);
+            let (_, dst) = make_repo(base, name, mode).await;
+            let err = dst
+                .pull_local(
+                    &src,
+                    PullOptions {
+                        refs: vec!["main".to_owned()],
+                        flags,
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            match err {
+                Error::Io(e) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{name}");
+                    assert_eq!(
+                        e.to_string(),
+                        format!("{}: Permission denied", path.display()),
+                        "{name}"
+                    );
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+            assert!(dst.list_refs(None).await.unwrap().is_empty(), "{name}");
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+    });
+}
+
 /// Creates a destination of `mode` under `base/<name>` that holds `commit` of
 /// `src` complete, with no ref. The pull copies each object, so the
 /// destination shares no inode with the source. A mode change in the source

@@ -23,7 +23,7 @@ use rustix::io::Errno;
 use crate::config::{
     EX_OSTRYA, REMOTES_CONFIG_DIR, RemoteFile, RepoConfig, remote_group, remote_group_name,
 };
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, io_error};
 use crate::repo::{MAX_CONFIG_SIZE, RemotesDir};
 use crate::repo_fs::{
     FsError, FsResultExt, Named, Publish, Published, Reason, ensure_named_dir, list_fd, open_named,
@@ -445,21 +445,6 @@ fn fs_error(display: &Path, err: FsError) -> Error {
         )),
         FsError::Exists => io_error(display, Errno::EXIST),
     }
-}
-
-/// Returns an [`Error::Io`] with the kind of `err` and the message
-/// `<path>: <reason>`.
-fn io_error(path: &Path, err: impl Into<std::io::Error>) -> Error {
-    let err = err.into();
-    let reason = err.to_string();
-    let reason = match reason.find(" (os error ") {
-        Some(cut) => &reason[..cut],
-        None => reason.as_str(),
-    };
-    Error::Io(std::io::Error::new(
-        err.kind(),
-        format!("{}: {reason}", path.display()),
-    ))
 }
 
 #[cfg(test)]

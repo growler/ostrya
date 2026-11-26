@@ -3007,7 +3007,7 @@ one alike. `--delete` takes no such gate of its own: the objects it unlinks and
 the commits it marks are the same set with `-a` and without it in both
 implementations.
 
-Ten divergences stand at `fsck`:
+Eleven divergences stand at `fsck`:
 
 - the progress line. The tool writes `fsck objects (n/total) pct%` to standard
   output: the first update, the last one, and about one more a second between
@@ -3091,7 +3091,23 @@ Ten divergences stand at `fsck`:
   output alone: the ref resolve, the ref listings, the summary, and the
   archive view of the port ignore such a ref, and the line names it. Both check the commit of the ref, so a missing commit ends both
   runs at exit 1. `../format-reference.md`, "The pull of collection refs",
-  states the rule.
+  states the rule;
+- an object that the run cannot read, for example an object of mode 0000
+  under its owner. The tool reads it as a corrupt object (`cli-behavior.md`,
+  "CLI output formats", `fsck`, "An object that the run cannot read"). With
+  `--delete`, the tool deletes the object, an intact object included, and
+  marks each commit that reaches it as partial. The port ends the run at the
+  first read of an object that fails with a permission error (`EACCES` or
+  `EPERM`). It writes `error: i/o error: objects/<xx>/<rest>: Permission
+  denied` and exits 1, with each option. It deletes no object, marks no
+  commit, and writes no tombstone. Both exit 1. Without `--delete`, both
+  leave the repository unchanged. In the port, each read error of the
+  operating system on the commit of a ref or on a dirtree, for example
+  `EIO`, ends the run in the same way, with the path of the object. Another
+  read error on a dirmeta, on a content object, or on a commit that no ref
+  names is a corrupt object in the port too, and `--delete` deletes it. In a
+  `bare-split-xattrs` repository, the file that failed can be the xattrs
+  object of the content object that the line names.
 
 `fsck --add-tombstones` deletes a commit object and leaves a branch ref
 standing over it, so repeated runs walk a broken branch backwards one commit
@@ -4589,6 +4605,30 @@ ends on the same assertion (`SIGABRT`, exit 134 from a shell), and the port
 refuses the value at exit 1. The port opens the source repository and each
 `--localcache-repo` first, and refuses the value before it reads a ref or an
 object of the source. Neither writes an object or a ref.
+
+A content object of a `bare-user` source that the reader cannot open, for
+example an object of mode 0000 under its owner, parts the two
+(`cli-behavior.md`, "A source object that pull-local cannot read"):
+
+- Into an `archive` destination, both exit 1 and write no ref and no
+  object. The tool writes `error: Opening content object O: openat:
+  Permission denied`. The port writes `error: i/o error:
+  SRC/objects/<xx>/<rest>.file: Permission denied`, where `SRC` is the path
+  of the source as the command line gives it. The port gives the same form
+  of line under `--force-copy` into a `bare-user` destination, and for a
+  metadata object under `--untrusted`. The difference is in the text alone.
+- Into a `bare-user` destination, the tool links the object, then opens it,
+  and exits 1 with `error: Importing O.file: Opening content object O:
+  openat: Permission denied`. With `--untrusted`, the port links the object,
+  then reads the link, and exits 1 with the same form of line as into an
+  `archive` destination. It writes no ref and no object. Without
+  `--force-copy` and without `--untrusted`, the port links the object and
+  does not open it, so the pull imports the commit, writes the ref, and
+  exits 0. The object in the destination is the same inode, with the mode
+  0000. A later `fsck` of the destination stops at the object.
+
+In a `bare-split-xattrs` source, the file that the port cannot read can be
+the xattrs object of the content object that the line names.
 
 `pull-local` reads `[core] auto-update-summary` by the rule of `pull` above.
 With `--remote`, a `REF` operand writes a remote ref, and an `@ID:REF`
@@ -7101,7 +7141,10 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   404. `../format-reference.md`, "The archive view", states the rules. Each
   content object of a `bare-user-private` repository has the inode mode
   0400, so the server must run as the owner of the content objects or as
-  root.
+  root. An error of the view, for example an object that the server cannot
+  open, gets 500 with an empty body. For each such request, the command
+  writes one line to standard error:
+  `error: METHOD PATH: the read failed, and the server answers 500: ERROR`.
 - The command also answers `GET /_ostrya/refs/v1?pattern=P&collection=C`.
   The body is the ref listing, a summary GVariant built for each request, of
   the refs that the entries of the query select. Each entry is a ref pattern
@@ -7115,7 +7158,9 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   with `Allow: GET`. The command holds at most 4 listings at the same time. A
   request over this limit gets 503 with `Retry-After: 1`. For each directory
   under `refs/mirrors/` whose name is not a collection id, a listing writes
-  one `warning:` line to standard error, one time in each run.
+  one `warning:` line to standard error, one time in each run. A listing
+  whose build fails gets 500, and the command writes one `error:` line for
+  the request, as for an error of the view.
   `../format-reference.md`, "The ref listing", states the rules.
 - The command always runs the receive endpoint of a push. The client
   groups of the config give the push rights.

@@ -12,7 +12,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::os::fd::AsFd;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -726,7 +726,8 @@ fn the_ref_listing_is_served() {
 
 /// A listed ref that names an absent commit fails the build. Each such
 /// request gets 500 with an empty body and frees its place, so a listing
-/// after more of them than the server holds at the same time gets 200.
+/// after more of them than the server holds at the same time gets 200. The
+/// server reports one error event for each failed request.
 #[test]
 fn a_failed_listing_gets_500() {
     let tmp = TmpDir::new("listing-500");
@@ -736,7 +737,8 @@ fn a_failed_listing_gets_500() {
         format!("{}\n", "ab".repeat(32)),
     )
     .unwrap();
-    with_server(repo.clone(), local(), |addrs| async move {
+    let (opts, events) = with_event_sink(local());
+    with_server(repo.clone(), opts, |addrs| async move {
         let target = "/_ostrya/refs/v1?pattern=absent";
         for _ in 0..6 {
             let (head, body) = exchange(addrs[0], &ask("GET", target)).await;
@@ -754,6 +756,76 @@ fn a_failed_listing_gets_500() {
                 .bytes
         );
     });
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 6, "{events:?}");
+    for event in events.iter() {
+        assert!(!event.is_warning(), "{event:?}");
+        let line = event.to_string();
+        assert!(line.starts_with("GET /_ostrya/refs/v1: "), "{line}");
+    }
+}
+
+/// Returns `opts` with an event callback, and the events that the callback
+/// receives.
+fn with_event_sink(
+    mut opts: ServeOptions,
+) -> (
+    ServeOptions,
+    Arc<std::sync::Mutex<Vec<ostrya_server::ServerEvent>>>,
+) {
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = events.clone();
+    opts.on_event = Some(Arc::new(move |event: &ostrya_server::ServerEvent| {
+        sink.lock().unwrap().push(event.clone());
+    }));
+    (opts, events)
+}
+
+/// Returns `true` if the process runs as root. The function reads the user
+/// id from `/proc/self/status`.
+fn is_root() -> bool {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|ids| ids.split_whitespace().nth(1))
+        == Some("0")
+}
+
+/// A `GET` and a `HEAD` of the `.filez` of a content object of mode 0000 get
+/// 500 with an empty body. The server reports one error event for each
+/// request. The event names the method, the request path, and the reason.
+#[test]
+fn an_unreadable_object_gets_500_and_an_event() {
+    if is_root() {
+        eprintln!("skipping: root reads a file of mode 0000");
+        return;
+    }
+    let tmp = TmpDir::new("unreadable-500");
+    let (path, repo, _, file) = block_on(repo(tmp.path()));
+    let stored = path
+        .join("objects")
+        .join(loose_path(&file, ObjectType::File, RepoMode::BareUser));
+    std::fs::set_permissions(&stored, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (opts, events) = with_event_sink(local());
+    let target = format!("/{}", object_path(ObjectType::File, &file));
+    let request = target.clone();
+    with_server(repo, opts, |addrs| async move {
+        for method in ["GET", "HEAD"] {
+            let (head, body) = exchange(addrs[0], &ask(method, &request)).await;
+            assert!(head.starts_with("HTTP/1.1 500 "), "{method}: {head}");
+            assert_eq!(header(&head, "content-length"), Some("0"), "{method}");
+            assert!(body.is_empty(), "{method}");
+        }
+    });
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2, "{events:?}");
+    for (event, method) in events.iter().zip(["GET", "HEAD"]) {
+        assert!(!event.is_warning(), "{event:?}");
+        let line = event.to_string();
+        assert!(line.starts_with(&format!("{method} {target}: ")), "{line}");
+        assert!(line.contains("Permission denied"), "{line}");
+    }
 }
 
 /// A bad pair of the query and an entry that is not a ref pattern get 400

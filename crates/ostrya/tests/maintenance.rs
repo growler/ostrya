@@ -1384,6 +1384,73 @@ fn fsck_delete_unlinks_and_marks() {
     });
 }
 
+/// Returns `true` if the tests run as root. Root can read a file of mode
+/// `0000`.
+fn is_root() -> bool {
+    rustix::process::geteuid().is_root()
+}
+
+/// A content object, a dirmeta object, a dirtree object, and the commit that
+/// a ref names, each of mode 0000, each end the run with an
+/// [`ostrya::Error::Io`] of the kind `PermissionDenied`. The error names the
+/// path of the object in the repository. With and without `delete`, the
+/// object stays and no commit is marked partial.
+#[test]
+fn fsck_stops_at_an_unreadable_object() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if is_root() {
+        eprintln!("skipping: root reads a file of mode 0000");
+        return;
+    }
+    let tmp = TmpDir::new("maint-fsck-unreadable");
+    block_on(async {
+        let base = tmp.path();
+        let (repo, c1, c2) = build_two_commit_repo(base, RepoMode::BareUser).await;
+        let repo_dir = base.join("repo");
+        let reachable = repo.traverse_commit(&c2, 0).await.unwrap();
+        let mut objects: Vec<ObjectName> =
+            [ObjectType::File, ObjectType::DirMeta, ObjectType::DirTree]
+                .into_iter()
+                .map(|ty| reachable.iter().find(|o| o.ty == ty).copied().unwrap())
+                .collect();
+        // The ref `main` names `c2`.
+        objects.push(ObjectName::new(c2, ObjectType::Commit));
+        for object in objects {
+            let ty = object.ty;
+            let relative = Path::new("objects").join(object.loose_path(RepoMode::BareUser));
+            let path = repo_dir.join(&relative);
+            let permissions = std::fs::metadata(&path).unwrap().permissions();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            for delete in [false, true] {
+                let opts = FsckOptions {
+                    delete,
+                    ..FsckOptions::new()
+                };
+                match repo.fsck(&opts).await {
+                    Err(ostrya::Error::Io(e)) => {
+                        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+                        assert_eq!(
+                            e.to_string(),
+                            format!("{}: Permission denied", relative.display())
+                        );
+                    }
+                    other => panic!("{ty:?}, delete {delete}: {other:?}"),
+                }
+                assert!(path.exists(), "{ty:?}, delete {delete}: the object stays");
+                for commit in [c1, c2] {
+                    assert_eq!(
+                        repo.commit_state(&commit).await.unwrap(),
+                        ostrya::CommitState::Normal,
+                        "{ty:?}, delete {delete}"
+                    );
+                }
+            }
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+    });
+}
+
 #[test]
 fn fsck_add_tombstones_replaces_the_commit() {
     // `bare` records the owner of the source inode, which an unprivileged run

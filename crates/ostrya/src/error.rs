@@ -834,6 +834,23 @@ impl From<rustix::io::Errno> for Error {
     }
 }
 
+/// Returns an [`Error::Io`] with the kind of `err` and the message
+/// `<path>: <reason>`.
+///
+/// The reason is the text of `err` without a trailing ` (os error N)`.
+pub(crate) fn io_error(path: &std::path::Path, err: impl Into<std::io::Error>) -> Error {
+    let err = err.into();
+    let reason = err.to_string();
+    let reason = match reason.find(" (os error ") {
+        Some(cut) => &reason[..cut],
+        None => reason.as_str(),
+    };
+    Error::Io(std::io::Error::new(
+        err.kind(),
+        format!("{}: {reason}", path.display()),
+    ))
+}
+
 impl From<ostrya_core::ParseRefError> for Error {
     /// Maps a ref that fails the ref-name rule to [`Error::InvalidRefspec`]
     /// with the text of the ref.

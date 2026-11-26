@@ -1547,6 +1547,33 @@ repository does not configure gives the same abort. These rules hold for
 `cli-surface.md`, "P2", `pull`, and `cli-surface.md`, "P2", `pull-local`,
 record the port side.
 
+#### A source object that pull-local cannot read
+
+These records come from libostree 2026.4 on a Linux VM, observed on
+2026-11-26. The runs are as uid 1000, not as root, with
+`fs.protected_hardlinks` set to 1. The source `src` is the `bare-user`
+repository of `fsck`, "An object that the run cannot read": one regular
+content object `O` of its commit has the mode 0000.
+
+- `pull-local --repo=dst src main` into a `bare-user` destination exits 1:
+
+  ```
+  error: Importing O.file: Opening content object O: openat: Permission denied
+  ```
+
+  The destination gets no ref and no object in `objects/`. The link count of
+  `O` in the source goes from 1 to 2. So the tool links the object to a path
+  outside `objects/` of the destination, and then opens it.
+- The same pull into an `archive` destination exits 1:
+
+  ```
+  error: Opening content object O: openat: Permission denied
+  ```
+
+  The destination gets no ref and no object.
+
+`cli-surface.md`, "P2", `pull-local`, records the port side.
+
 #### Related commits in a pull
 
 The pulls in this subsection pull a commit C whose related-objects array names
@@ -5847,6 +5874,35 @@ whose checksum does not match.
 Each other run of the tool writes each finding plain. It closes with
 `error: Repository corruption encountered`, unless one of the three conditions
 ends it first.
+
+#### An object that the run cannot read
+
+These records come from libostree 2026.4 on a Linux VM, observed on
+2026-11-26. The runs are as uid 1000, not as root, with
+`fs.protected_hardlinks` set to 1. The repository is a `bare-user` repository
+with one commit `C` of two regular files and one symlink, 7 objects in all.
+One regular content object `O` has the mode 0000.
+
+- `fsck` exits 1. Standard output holds the four phase lines. Standard error
+  holds one line:
+
+  ```
+  error: In commits C: fsck content object O: Opening content object O: openat: Permission denied
+  ```
+
+- `fsck --all` exits 1. Standard output holds the four phase lines,
+  `fsck objects (1/7) 14%`, and `fsck objects (7/7) 100%`. Standard error
+  holds the same finding with no `error: ` prefix, then
+  `error: Repository corruption encountered`.
+- `fsck --delete` exits 1. Standard error holds the finding,
+  `Marking commit as partial: C`, and
+  `error: Repository corruption encountered`. The tool deletes `O` and writes
+  `state/C.commitpartial`.
+
+The runs without `--delete` keep `O` and write no `.commitpartial` marker. So
+the tool reads a content object that it cannot open as a corrupt object
+(`fsck`, "Where a run ends"). `cli-surface.md`, "P2", `fsck`, records the
+port side.
 
 #### The binding checks
 

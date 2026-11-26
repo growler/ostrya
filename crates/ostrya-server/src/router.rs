@@ -12,7 +12,7 @@ use ostrya::{ArchiveAnswer, ArchiveHead, ArchiveView, Repo};
 use crate::auth::{GroupAuth, peer_of};
 use crate::body::{ReceiveBody, ServeBody};
 use crate::endpoint::ReceiveEndpoint;
-use crate::event::StaleSummaries;
+use crate::event::{EventSink, StaleSummaries, report_read_failed};
 use crate::receive_auth::Refusal;
 use crate::refs::Listings;
 use crate::stall::Stall;
@@ -63,7 +63,8 @@ pub(crate) fn refused(refusal: Refusal) -> Response<ServeBody> {
 /// Returns the response to one request. The function records a stream body
 /// in `stall`, the deadline of its connection. `listings` holds the ref
 /// listings in flight in the server. `stale` records the stale summaries
-/// that the server reported.
+/// that the server reported, and holds the callback of the events of the
+/// server.
 ///
 /// With a receive endpoint, a request under its raw path prefix with a
 /// method other than `GET` and `HEAD` goes to the endpoint. A `GET` or a
@@ -75,8 +76,11 @@ pub(crate) fn refused(refusal: Refusal) -> Response<ServeBody> {
 /// Then `clients` identifies the client, and a refusal gets its response.
 /// Then a path that does not decode gets 404. The view answers with the read
 /// rights of the client. A stale summary gets 404, and `stale` reports it.
-/// A 200 and a 404 of `summary` and `summary.sig` carry
-/// `Cache-Control: private`, because the body depends on the client.
+/// An error of the view gets 500, and the function reports one
+/// [`ServerEvent::ReadFailed`](crate::ServerEvent::ReadFailed) with the
+/// method and the raw path of the request. A 200 and a 404 of `summary` and
+/// `summary.sig` carry `Cache-Control: private`, because the body depends on
+/// the client.
 pub(crate) async fn handle(
     view: &ArchiveView,
     repo: &Repo,
@@ -122,18 +126,20 @@ pub(crate) async fn handle(
     let Some(path) = decode_path(req.uri().path()) else {
         return empty(StatusCode::NOT_FOUND);
     };
+    let method = req.method().as_str();
+    let raw = req.uri().path();
     let response = if head {
         let answer = view.head(&path, &access).await;
         if matches!(answer, Ok(ArchiveHead::StaleSummary)) {
             stale.report(access.item());
         }
-        respond_head(answer)
+        respond_head(answer, stale.on_event(), method, raw)
     } else {
         let answer = view.get(&path, &access).await;
         if let Ok(ArchiveAnswer::StaleSummary { item }) = &answer {
             stale.report(item);
         }
-        respond(answer, stall)
+        respond(answer, stall, stale.on_event(), method, raw)
     };
     private_summary(&path, response)
 }
@@ -152,8 +158,16 @@ fn private_summary(path: &str, mut response: Response<ServeBody>) -> Response<Se
 }
 
 /// Returns the response for an answer of the view to a `GET`. A not-found
-/// and a refusal take one path, so their responses are the same bytes.
-fn respond(answer: ostrya::Result<ArchiveAnswer>, stall: &Arc<Stall>) -> Response<ServeBody> {
+/// and a refusal take one path, so their responses are the same bytes. An
+/// error gets 500, and the function reports it to `on_event` with `method`
+/// and `path`.
+fn respond(
+    answer: ostrya::Result<ArchiveAnswer>,
+    stall: &Arc<Stall>,
+    on_event: Option<&EventSink>,
+    method: &str,
+    path: &str,
+) -> Response<ServeBody> {
     let (len, body) = match answer {
         Ok(ArchiveAnswer::Bytes(bytes)) => (
             Some(bytes.len() as u64),
@@ -167,20 +181,33 @@ fn respond(answer: ostrya::Result<ArchiveAnswer>, stall: &Arc<Stall>) -> Respons
         ) => {
             return empty(StatusCode::NOT_FOUND);
         }
-        Err(_) => return empty(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => {
+            report_read_failed(on_event, method, path, &error);
+            return empty(StatusCode::INTERNAL_SERVER_ERROR);
+        }
     };
     with_length(Response::new(body), len)
 }
 
 /// Returns the response for an answer of the view to a `HEAD`. It has the
-/// status and the `Content-Length` that a `GET` gives, and no body.
-fn respond_head(answer: ostrya::Result<ArchiveHead>) -> Response<ServeBody> {
+/// status and the `Content-Length` that a `GET` gives, and no body. An error
+/// gets 500, and the function reports it to `on_event` with `method` and
+/// `path`.
+fn respond_head(
+    answer: ostrya::Result<ArchiveHead>,
+    on_event: Option<&EventSink>,
+    method: &str,
+    path: &str,
+) -> Response<ServeBody> {
     match answer {
         Ok(ArchiveHead::Found { len }) => with_length(Response::new(ServeBody::Empty), len),
         Ok(ArchiveHead::NotFound | ArchiveHead::Refused | ArchiveHead::StaleSummary) => {
             empty(StatusCode::NOT_FOUND)
         }
-        Err(_) => empty(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => {
+            report_read_failed(on_event, method, path, &error);
+            empty(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }
 
@@ -252,6 +279,7 @@ fn hex_digit(b: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use hyper::body::Body;
@@ -259,6 +287,7 @@ mod tests {
 
     use super::*;
     use crate::body::tests::frames;
+    use crate::event::ServerEvent;
 
     fn stall() -> Arc<Stall> {
         Stall::new(Duration::from_secs(3600))
@@ -284,7 +313,7 @@ mod tests {
     #[test]
     fn a_head_has_the_length_and_no_body() {
         for len in [Some(42), None] {
-            let response = respond_head(Ok(ArchiveHead::Found { len }));
+            let response = respond_head(Ok(ArchiveHead::Found { len }), None, "HEAD", "/x");
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(
                 response.headers().get(CONTENT_LENGTH),
@@ -295,7 +324,7 @@ mod tests {
             assert!(block_on(frames(body)).unwrap().is_empty());
         }
         let parts = |answer| {
-            let (parts, _) = respond_head(answer).into_parts();
+            let (parts, _) = respond_head(answer, None, "HEAD", "/x").into_parts();
             (parts.status, format!("{:?}", parts.headers))
         };
         assert_eq!(
@@ -313,7 +342,7 @@ mod tests {
     #[test]
     fn a_refusal_and_a_not_found_are_one_answer() {
         let parts = |answer| {
-            let response = respond(Ok(answer), &stall());
+            let response = respond(Ok(answer), &stall(), None, "GET", "/x");
             let (parts, body) = response.into_parts();
             (
                 parts.status,
@@ -325,13 +354,66 @@ mod tests {
         assert_eq!(refused, parts(ArchiveAnswer::NotFound));
         assert_eq!(refused.0, StatusCode::NOT_FOUND);
         assert!(refused.2.is_empty());
-        let error = respond(Err(ostrya::Error::InvalidFormat("x".into())), &stall());
+        let error = respond(
+            Err(ostrya::Error::InvalidFormat("x".into())),
+            &stall(),
+            None,
+            "GET",
+            "/x",
+        );
         assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// An error of the view gets 500 with an empty body for a `GET` and a
+    /// `HEAD`. Each reports one error event that names the method, the path,
+    /// and the error.
+    #[test]
+    fn an_error_gets_500_and_one_event() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let on_event: EventSink = Arc::new(move |event: &ServerEvent| {
+            sink.lock().unwrap().push(event.clone());
+        });
+        let denied =
+            || ostrya::Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let path = "/objects/ab/cd.filez";
+        let responses = [
+            respond(Err(denied()), &stall(), Some(&on_event), "GET", path),
+            respond_head(Err(denied()), Some(&on_event), "HEAD", path),
+        ];
+        for response in responses {
+            let (parts, body) = response.into_parts();
+            assert_eq!(parts.status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                parts.headers.get(CONTENT_LENGTH),
+                Some(&HeaderValue::from(0u64))
+            );
+            assert!(block_on(frames(body)).unwrap().is_empty());
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        for (event, method) in seen.iter().zip(["GET", "HEAD"]) {
+            assert!(!event.is_warning());
+            assert_eq!(
+                event,
+                &ServerEvent::ReadFailed {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                    error: denied().to_string(),
+                }
+            );
+        }
     }
 
     #[test]
     fn bytes_carry_their_length() {
-        let response = respond(Ok(ArchiveAnswer::Bytes(b"abc".to_vec())), &stall());
+        let response = respond(
+            Ok(ArchiveAnswer::Bytes(b"abc".to_vec())),
+            &stall(),
+            None,
+            "GET",
+            "/x",
+        );
         assert_eq!(
             response.headers().get(CONTENT_LENGTH),
             Some(&HeaderValue::from(3u64))

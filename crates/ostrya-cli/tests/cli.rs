@@ -41602,9 +41602,13 @@ fn commit_auto_update_summary_writes_the_summaries_of_the_auth_items() {
     assert!(stem.with_extension("access").exists());
     assert!(!stem.with_extension("sig").exists());
 
-    // `summary -u` writes the same summary of the auth item.
+    // `summary -u` writes the same summary of the auth item. The
+    // `last-modified` value is the time of each write, so it is masked.
     ostrya_repo(&repo, &["summary", "-u"]).ok();
-    assert_eq!(std::fs::read(&stem).unwrap(), item);
+    assert_eq!(
+        masked_summary(std::fs::read(&stem).unwrap()),
+        masked_summary(item)
+    );
 }
 
 /// The key group that `sign-summary` names signs the summary that `commit`
@@ -53009,7 +53013,12 @@ fn media_tree(mount: &Path) -> Vec<(String, char, u32, Vec<u8>)> {
 /// Returns the bytes of the summary of the media repository under `mount`,
 /// with zero bytes in place of the value of `ostree.summary.last-modified`.
 fn masked_media_summary(mount: &Path) -> Vec<u8> {
-    let mut bytes = std::fs::read(mount.join(".ostree/repo/summary")).unwrap();
+    masked_summary(std::fs::read(mount.join(".ostree/repo/summary")).unwrap())
+}
+
+/// Returns the summary `bytes` with zero bytes in place of the value of
+/// `ostree.summary.last-modified`.
+fn masked_summary(mut bytes: Vec<u8>) -> Vec<u8> {
     let summary = ostrya::Summary::parse(&bytes).unwrap();
     let Some(Value::U64(raw)) = summary.metadata_value("ostree.summary.last-modified") else {
         panic!("the summary has no last-modified value");
